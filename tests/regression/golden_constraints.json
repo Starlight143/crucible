@@ -1,0 +1,20 @@
+{
+  "_comment": "Golden constraints for cross-run regression testing.",
+  "_description": "Each entry defines expected value ranges / invariants for a completed pipeline run. Add entries here to build your regression baseline. See test_regression_runner.py for the constraint schema.",
+  "examples": [
+    {
+      "run_id": "EXAMPLE_RUN_ID",
+      "project_name": "ExampleProject",
+      "constraints": {
+        "score_min": 50,
+        "score_max": 100,
+        "risk_level_allowed": ["low", "medium", "high"],
+        "gate_decision_must_not_be": ["kill"],
+        "blocking_risks_max": 5,
+        "experiments_min": 1,
+        "has_consensus": true,
+        "has_direction": true
+      }
+    }
+  ]
+}

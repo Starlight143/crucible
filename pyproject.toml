@@ -1,0 +1,76 @@
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+extend-exclude = [
+    "OLD_version",
+    "saved_projects",
+    "skill_staging",
+]
+
+[tool.ruff.lint]
+select = [
+    "E",
+    "F",
+    "I",
+]
+ignore = [
+    "E501",
+]
+
+[tool.ruff.lint.isort]
+combine-as-imports = true
+
+[tool.ruff.lint.per-file-ignores]
+"crucible/modules/section_*.py" = [
+    "E402",
+    "E731",
+    "F401",
+    "F811",
+    "F821",
+    "F841",
+    "I001",
+]
+
+[tool.mypy]
+python_version = "3.10"
+files = [
+    "crucible/runtime_logging.py",
+    "crucible/resilience.py",
+    "crucible/web_research",
+    "tests/test_runtime_logging.py",
+    "tests/test_resilience.py",
+    "crucible/context_pressure.py",
+    "crucible/context_budget.py",
+    "crucible/telemetry.py",
+    "crucible/cancellation.py",
+    "crucible/progress.py",
+    "crucible/error_budget.py",
+    "crucible/cost_tracker.py",
+    "crucible/errors.py",
+    "crucible/hooks.py",
+    "crucible/streaming.py",
+    "crucible/run_correlation.py",
+    "crucible/output_validation.py",
+    "crucible/convergence_guard.py",
+    "crucible/feature_registry.py",
+    "crucible/_file_cache.py",
+    "crucible/features/report_exporter.py",
+    "crucible/features/notification_hooks.py",
+    "crucible/features/external_data_connectors.py",
+    "crucible/features/checkpoint.py",
+    "crucible/features/run_diff.py",
+    "crucible/features/run_registry.py",
+    "crucible/features/run_deduplication.py",
+    "crucible/features/portfolio_backtest.py",
+    "crucible/features/mlflow_sink.py",
+    "crucible/features/backtest_runner.py",
+]
+ignore_missing_imports = true
+check_untyped_defs = true
+warn_unused_ignores = true
+pretty = true
+follow_imports = "skip"
+exclude = "(^saved_projects/|^OLD_version/|^skill_staging/)"
+disallow_untyped_defs = false
+warn_return_any = false
+no_implicit_reexport = false

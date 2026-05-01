@@ -1,0 +1,24 @@
+.env
+openrouter_key.txt
+.crewai_local_appdata/
+**/.crewai_local_appdata/
+**/secret.key
+.pytest_cache/
+.ruff_cache/
+.tmp/
+.tmp_test/
+.tmp_direction_debug_test/
+.tmp_bandit.json
+.vscode/
+__pycache__/
+*.pyc
+saved_projects/
+nul
+write_probe.txt
+README - 複製.md
+.skill_staging/
+skill_staging/
+.claude/
+project_memory.jsonl
+run_registry.db
+.github/

@@ -1,0 +1,114 @@
+# ============================================================================
+# Crucible Review — Python Dependencies
+# ============================================================================
+# Install: pip install -r requirements.txt
+#
+# Packages marked "Optional" are imported with try/except and the system
+# degrades gracefully if they are absent.  Install them only when you enable
+# the corresponding feature flag.
+# ============================================================================
+
+# --- Core (always required) -------------------------------------------------
+crewai
+langchain-openai
+litellm
+pydantic
+httpx
+
+# --- Token counting / context budget ----------------------------------------
+# Used by context_budget.py and context_pressure.py for accurate token counts.
+tiktoken
+
+# --- .env loading (runtime configuration) -----------------------------------
+# Used by crucible/runtime_logging.py to honour CRUCIBLE_LOG_LEVEL
+# and other env vars defined in the project-root ``.env`` file at startup.
+# Optional — operators who export their env vars from the shell will see
+# the same behaviour as before if this package is absent (the runtime
+# falls back silently with try/except ImportError).
+python-dotenv
+
+# --- YAML parsing (project profile) -----------------------------------------
+pyyaml
+
+# --- Platform directory resolution ------------------------------------------
+appdirs
+
+# --- Optional — backtest runner data fetching --------------------------------
+# Install if using --backtest-runner
+yfinance
+ccxt
+
+# --- Optional — Bayesian hyperparameter optimisation -------------------------
+# Install if using BACKTEST_PARAM_SEARCH=bayesian
+optuna
+
+# --- Optional — PDF report export --------------------------------------------
+# Falls back to pure-stdlib writer if absent.
+fpdf2
+
+# --- Optional — PDF / Word document ingestion --------------------------------
+# Install if using --ingest-docs with PDF or DOCX files.
+pypdf
+python-docx
+
+# --- Optional — project memory (vector database) ----------------------------
+# Install if using --use-memory
+chromadb
+
+# --- Optional — semantic deduplication ---------------------------------------
+# Install if using ENHANCED_DEDUP_ENABLED=true
+scikit-learn
+
+# --- Optional — file system watch mode ---------------------------------------
+# Install if using the watch subcommand
+watchdog
+
+# --- Optional — MLflow experiment tracking -----------------------------------
+# Install if using MLFLOW_TRACKING_URI
+mlflow
+
+# --- Optional — v16.8 Quant Analytics Suite ----------------------------------
+# All fall back to pure-stdlib implementations if absent.
+scipy            # improves statistical significance tests (t-dist CDF, normal CDF)
+statsmodels      # used by factor_analyzer for OLS diagnostics if available
+pandas-datareader  # enables Fama-French factor data download (factor_analyzer --ff-data)
+quantstats       # tearsheet HTML rendering enhancement (falls back to pure Markdown)
+
+# --- Optional — distributed tracing / observability --------------------------
+# Install if using OTEL_EXPORTER_OTLP_ENDPOINT
+opentelemetry-api
+opentelemetry-sdk
+opentelemetry-exporter-otlp
+
+# --- Optional — web UI -------------------------------------------------------
+flask
+
+# --- Optional — v16.9 new features -------------------------------------------
+# scheduler.py: built-in APScheduler job scheduling
+APScheduler
+
+# redis_cache.py: Redis-backed research result cache
+redis
+
+# prometheus_exporter.py: push metrics to Prometheus Pushgateway
+prometheus_client
+
+# auth_manager.py: JWT authentication for WebUI
+PyJWT
+bcrypt
+
+# celery_worker.py: distributed task queue
+celery
+
+# chat_bot.py: Telegram and Discord bot interfaces
+python-telegram-bot
+discord.py
+
+# notion_export.py: Notion API integration
+# (uses stdlib urllib — no extra dep required)
+
+# trading_platform.py: Interactive Brokers adapter
+# ibapi  # install manually: pip install ibapi (not on PyPI by default)
+
+# type_coverage.py: type annotation analysis (mypy optional)
+# mypy  # install manually if TYPE_COVERAGE_RUN_MYPY=1
