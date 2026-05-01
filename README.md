@@ -78,7 +78,7 @@ Research Question / Project Path
 ### Install
 
 ```bash
-git clone https://github.com/YOUR_USERNAME/crucible.git
+git clone https://github.com/Starlight143/crucible.git
 cd crucible
 pip install -r requirements.txt
 ```
