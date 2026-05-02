@@ -1,3 +1,58 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "crucible"
+version = "1.0.0"
+description = "AI-native multi-agent research engine for quant, SaaS, agent, and scientific research workflows."
+readme = "README.md"
+requires-python = ">=3.10"
+license = "AGPL-3.0-or-later"
+license-files = ["LICENSE", "COMMERCIAL_LICENSE.md"]
+authors = [
+    { name = "Johnson Lai", email = "supervenus928@gmail.com" },
+]
+maintainers = [
+    { name = "Johnson Lai", email = "supervenus928@gmail.com" },
+]
+keywords = [
+    "multi-agent",
+    "llm",
+    "quant",
+    "research",
+    "codegen",
+    "agent",
+    "saas",
+    "openrouter",
+    "crewai",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Financial and Insurance Industry",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Office/Business :: Financial :: Investment",
+]
+
+[project.urls]
+Homepage = "https://github.com/Starlight143/crucible"
+Repository = "https://github.com/Starlight143/crucible"
+Issues = "https://github.com/Starlight143/crucible/issues"
+Changelog = "https://github.com/Starlight143/crucible/blob/main/CHANGELOG.md"
+"Commercial License" = "https://github.com/Starlight143/crucible/blob/main/COMMERCIAL_LICENSE.md"
+
+[tool.setuptools]
+packages = ["crucible", "crucible.modules", "crucible.features", "crucible.web_research"]
+include-package-data = true
+
 [tool.ruff]
 target-version = "py310"
 line-length = 100
