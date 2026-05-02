@@ -80,8 +80,10 @@ maintainer the right to relicense Contributions under both AGPL-3.0 and
 future commercial terms, while contributors retain their own copyright
 and can also use their own Contribution however they like.
 
-This is the same pattern used by projects such as MongoDB (pre-SSPL),
-Sentry, GitLab EE, Aiven, and many others.
+This is the same dual-license inbound pattern used by projects such as
+MongoDB (pre-SSPL), Sentry (pre-BSL), Aiven, and many others. (Note:
+GitLab uses an open-core model — separate CE and EE codebases — which
+is a different pattern from same-codebase dual licensing.)
 
 ---
 
