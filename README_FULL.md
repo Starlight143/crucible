@@ -1339,4 +1339,9 @@ For per-module responsibilities (pipeline sections, infrastructure, features, we
 
 ## License
 
-See [LICENSE](LICENSE) for details.
+Crucible is **dual-licensed**:
+
+- **Open source — [AGPL v3](LICENSE).** Free for projects that publish their source under AGPL, including any service that exposes Crucible over a network (AGPL-3.0 §13 — Remote Network Interaction).
+- **Commercial license** — required for closed-source distribution, proprietary SaaS that does not publish source, embedded use, or any deployment that cannot satisfy AGPL-3.0. Also required if you need indemnification, warranty, or SLA-backed support. See [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md).
+
+**Commercial inquiries: supervenus928@gmail.com**

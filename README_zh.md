@@ -426,3 +426,14 @@ crucible/
 ## 版本歷史
 
 見 [CHANGELOG.md](CHANGELOG.md)。
+
+---
+
+## 授權
+
+Crucible 採用 **雙重授權（dual license）**：
+
+- **開源使用 — [AGPL v3](LICENSE)。** 免費，但任何修改或部署（包含對外提供網路服務）都必須依 AGPL-3.0 §13（Remote Network Interaction）公開原始碼。
+- **商業授權** — 若你的情境屬於下列任一，必須取得商業授權：閉源產品散布、不公開原始碼的商用 SaaS、嵌入私有系統、需要技術支援 / 免責 / SLA 保固、或無法 / 不願遵守 AGPL-3.0。詳見 [COMMERCIAL_LICENSE.md](COMMERCIAL_LICENSE.md)。
+
+**商業授權聯絡：supervenus928@gmail.com**

@@ -1,3 +1,46 @@
+================================================================
+Crucible — Dual License Notice
+================================================================
+
+Crucible is dual-licensed. You must comply with ONE of the two
+licenses below.
+
+(1) OPEN SOURCE LICENSE
+    GNU Affero General Public License v3.0 (AGPL-3.0).
+    The full text of AGPL-3.0 follows this notice.
+
+    Note that AGPL-3.0 §13 ("Remote Network Interaction")
+    applies: if you modify Crucible and provide its functionality
+    to users over a network (SaaS, hosted service, internal
+    web service, etc.), you must offer the Corresponding Source
+    of your modified version to those users under AGPL-3.0.
+
+(2) COMMERCIAL LICENSE
+    A separate commercial license is available for use cases
+    that cannot, or do not wish to, comply with AGPL-3.0:
+
+      - shipping Crucible (or derivatives) as part of a
+        closed-source product;
+      - providing Crucible's functionality as a hosted /
+        SaaS service without releasing source;
+      - embedding Crucible into a system where AGPL copyleft
+        conflicts with internal IP or customer contracts;
+      - needing indemnification, warranty, or SLA-backed
+        support.
+
+    Commercial inquiries:  supervenus928@gmail.com
+    Details:               COMMERCIAL_LICENSE.md
+
+If you do not hold a signed commercial agreement, your use of
+Crucible is governed by AGPL-3.0 and all of its obligations
+apply.
+
+================================================================
+The full text of the GNU Affero General Public License v3.0
+follows below.
+================================================================
+
+
                     GNU AFFERO GENERAL PUBLIC LICENSE
                        Version 3, 19 November 2007
 
