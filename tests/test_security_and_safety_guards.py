@@ -1,18 +1,19 @@
 """
-tests/test_v16_9_68_audit_fixes.py
-==================================
-Regression tests for the v16.9.68 four-agent audit fixes (and the v16.9.67
-hardening that previously had no test coverage).  Each test asserts that a
-specific bug **stays fixed** — a future refactor that re-introduces the
+tests/test_security_and_safety_guards.py
+========================================
+Regression tests for security and safety guards across the trading platform,
+WebUI request validation, HTTP retry classification, deployment configuration,
+and convergence guard cancellation handling.  Each test asserts that a specific
+bug **stays fixed** — a future refactor that re-introduces the
 vulnerability/incorrectness will fail one of these tests.
 
 Coverage:
-    1.  trading_platform.paper_mode fail-closed (HIGH, v16.9.68)
-    2.  webui.app.api_run_signal stdin-injection rejection (MEDIUM, v16.9.68)
-    3.  webui.app._build_command stdin-injection rejection (MEDIUM, v16.9.67)
-    4.  http_retry.is_http_retryable HTTP 408 classification (MEDIUM, v16.9.67)
-    5.  gunicorn_config.loglevel allowlist (LOW, v16.9.68)
-    6.  convergence_guard treats OperationCancelledError as expected (LOW, v16.9.68)
+    1.  trading_platform.paper_mode fail-closed (HIGH)
+    2.  webui.app.api_run_signal stdin-injection rejection (MEDIUM)
+    3.  webui.app._build_command stdin-injection rejection (MEDIUM)
+    4.  http_retry.is_http_retryable HTTP 408 classification (MEDIUM)
+    5.  gunicorn_config.loglevel allowlist (LOW)
+    6.  convergence_guard treats OperationCancelledError as expected (LOW)
 """
 from __future__ import annotations
 
@@ -31,7 +32,7 @@ if str(_ROOT) not in sys.path:
 # ── 1. Trading platform: paper_mode fail-closed ──────────────────────────────
 
 class TestTradingPaperModeFailClosed(unittest.TestCase):
-    """v16.9.68 HIGH fix: TRADING_PAPER_MODE must default to paper (safe) on
+    """HIGH safety property: TRADING_PAPER_MODE must default to paper (safe) on
     any unknown / typo'd value; only an explicit off-token disables it."""
 
     def setUp(self) -> None:
@@ -79,7 +80,7 @@ class TestTradingPaperModeFailClosed(unittest.TestCase):
 # ── 2. WebUI signal endpoint: stdin-injection rejection ──────────────────────
 
 class TestApiRunSignalStdinInjection(unittest.TestCase):
-    """v16.9.68 MEDIUM fix: /api/run/<id>/signal must reject embedded newlines,
+    """MEDIUM hardening: /api/run/<id>/signal must reject embedded newlines,
     carriage returns, and null bytes — without this guard a single signal
     payload could inject multiple stdin answers."""
 
@@ -159,10 +160,10 @@ class TestApiRunSignalStdinInjection(unittest.TestCase):
         self.assertEqual(r.status_code, 400)
 
 
-# ── 3. WebUI _build_command: stdin-injection rejection (v16.9.67) ────────────
+# ── 3. WebUI _build_command: stdin-injection rejection ──────────────────────
 
 class TestBuildCommandStdinInjection(unittest.TestCase):
-    """v16.9.67 MEDIUM hardening: _build_command must reject newline / null /
+    """MEDIUM hardening: _build_command must reject newline / null /
     sentinel injections in the user-controlled fields."""
 
     @staticmethod
@@ -216,11 +217,11 @@ class TestBuildCommandStdinInjection(unittest.TestCase):
         self.assertTrue(stdin.startswith("2\n2\n"))
 
 
-# ── 4. HTTP 408 retry classification (v16.9.67) ──────────────────────────────
+# ── 4. HTTP 408 retry classification ─────────────────────────────────────────
 
 class TestHttpRetry408Classification(unittest.TestCase):
-    """v16.9.67 fix: HTTP 408 Request Timeout is a server-side transient
-    condition that RFC 7231 §6.5.7 explicitly classifies as retryable."""
+    """HTTP 408 Request Timeout is a server-side transient condition that
+    RFC 7231 §6.5.7 explicitly classifies as retryable."""
 
     def test_408_retryable(self):
         from crucible.http_retry import is_http_retryable
@@ -274,10 +275,10 @@ class TestHttpRetry408Classification(unittest.TestCase):
         self.assertFalse(is_http_retryable(HTTPStatusError("unauthorized")))
 
 
-# ── 5. Gunicorn loglevel allowlist (v16.9.68) ────────────────────────────────
+# ── 5. Gunicorn loglevel allowlist ──────────────────────────────────────────
 
 class TestGunicornLoglevelAllowlist(unittest.TestCase):
-    """v16.9.68 LOW fix: GUNICORN_LOG_LEVEL must whitelist Gunicorn-recognised
+    """LOW hardening: GUNICORN_LOG_LEVEL must whitelist Gunicorn-recognised
     levels.  Unknown values fall back to 'info' instead of crashing the worker
     boot with an opaque ConfigurationError."""
 
@@ -314,10 +315,10 @@ class TestGunicornLoglevelAllowlist(unittest.TestCase):
         self.assertEqual(self._resolve("   "), "info")
 
 
-# ── 6. ConvergenceGuard cancellation classification (v16.9.68) ───────────────
+# ── 6. ConvergenceGuard cancellation classification ─────────────────────────
 
 class TestConvergenceGuardCancellationExpected(unittest.TestCase):
-    """v16.9.68 LOW fix: cooperative cancellation (OperationCancelledError) must
+    """LOW hardening: cooperative cancellation (OperationCancelledError) must
     NOT be logged as an unexpected guard failure (WARNING level).  It is a
     caller-driven stop, not a guard violation."""
 
@@ -328,7 +329,7 @@ class TestConvergenceGuardCancellationExpected(unittest.TestCase):
             LoopConvergenceGuard,
         )
 
-        # Replay the __exit__ classification logic with the post-fix expected set
+        # Replay the __exit__ classification logic with the expected set
         _expected = (ConvergenceError, OperationCancelledError)
 
         # Cancellation → expected (info-level)
@@ -368,8 +369,8 @@ class TestConvergenceGuardCancellationExpected(unittest.TestCase):
                 pass
 
         # The "started" event is INFO (20), the "exited" event must also be INFO
-        # (20) — NOT WARNING (30).  After the fix, no WARNING-level log should
-        # appear from the convergence guard for a cancellation path.
+        # (20) — NOT WARNING (30).  No WARNING-level log should appear from the
+        # convergence guard for a cancellation path.
         self.assertNotIn(
             logging.WARNING, captured_levels,
             msg=f"Cancellation classified as unexpected (warning emitted): {captured_levels}",

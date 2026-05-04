@@ -1,4 +1,4 @@
-"""Regression tests for v16.9.71 CJK grounding fixes.
+"""Regression tests for CJK grounding in the Direction Debate stage.
 
 The Direction Debate phase historically failed with::
 
@@ -49,7 +49,8 @@ from crucible.modules.section_03_models_and_context import (
 
 class TestTokenizerCJK:
     def test_pure_chinese_claim_produces_tokens(self):
-        # Before v16.9.71 this returned set() — caller saw zero overlap.
+        # An ASCII-only tokenizer would return set() and the caller would
+        # see zero overlap; the CJK shingle pass must produce real tokens.
         tokens = _tokenize_for_grounding("使用ATR與布林帶寬度識別資金費率波動率區間切換")
         assert tokens, "Chinese-only claim must produce non-empty token set"
         # The full ASCII identifier survives the CJK pass.
@@ -228,7 +229,8 @@ class TestForceNoneDefenseInDepth:
     def test_zero_grounded_claims_with_many_citations_does_not_force_none(self):
         # The exact production scenario the user reported: 12 citations, 0
         # grounded_claims (because the synthesizer's structured arrays were
-        # empty).  v16.9.70 force-killed the judge here; v16.9.71 must not.
+        # empty).  The legacy gate force-killed the judge here; with
+        # citations >= 3 the gate must defer to the judge instead.
         ctx = self._ctx(citations=12, grounded_claims=0)
         force_none, reason, _ = _should_force_direction_none(
             self._decision(),

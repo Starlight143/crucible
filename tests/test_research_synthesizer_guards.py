@@ -1,6 +1,7 @@
-"""Regression tests for v16.9.72 four-agent log-audit fixes.
+"""Regression tests for research-synthesizer guards.
 
-Five distinct bugs surfaced by parallel audit of a 5607-line production log:
+Five distinct bugs that were surfaced by parallel audit of a long-running
+production log are pinned here so they cannot regress:
 
 1. **Pydantic checkpoint serialisation warning** — both
    ``_research_task_callback`` and ``_analyst_task_callback`` were
@@ -11,20 +12,20 @@ Five distinct bugs surfaced by parallel audit of a 5607-line production log:
    module-level functions with stable ``__qualname__``.
 
 2. **DEBUG-level third-party logger flood + stdout/stderr interleaving**
-   — the production log contained 71 ``DEBUG asyncio: Using proactor:
+   — production logs contained dozens of ``DEBUG asyncio: Using proactor:
    IocpProactor`` lines plus hundreds of ``DEBUG httpcore.http11``
    entries that raced with CrewAI's verbose ``Printer`` (the
    ``┌──── 🤖 Agent Started ────┐`` box-drawing output ended up
    physically interleaved with DEBUG records, producing corrupted lines
-   like ``┌─2026-04-27T... DEBUG openai._base_client: Sending HTTP
-   Request``).  ``runtime_logging.configure_logging`` now pins the noisy
-   loggers to WARNING.
+   like ``┌─...T... DEBUG openai._base_client: Sending HTTP Request``).
+   ``runtime_logging.configure_logging`` now pins the noisy loggers to
+   WARNING.
 
 3. **``_should_force_direction_none`` second branch**
    (``max(scores) <= 12 AND grounded_claims < 3``) — the same
-   under-counting problem fixed in v16.9.71 also affected this branch.
-   Now also defers to grounded_summary_claims and claim_attribution
-   counts.
+   under-counting problem the CJK grounding tests cover affected this
+   branch too.  It now also defers to grounded_summary_claims and
+   claim_attribution counts.
 
 4. **``provider_errors`` injected into ``key_risks``** —
    ``_build_fallback_research_context`` previously dumped raw HTTP error
@@ -292,11 +293,11 @@ class TestForceNoneSecondBranch:
 
     def test_weak_scores_with_attributions_does_not_force_none(self):
         comparator, audit = self._make_audit_with_low_scores()
-        # 5 citations, 0 grounded_claims (the v16.9.71 path already
+        # 5 citations, 0 grounded_claims (the citation-count branch already
         # handles citations>=3), but ALSO 4 claim_attributions emitted by
-        # the synthesizer's structured path.  Pre-fix, the second branch
-        # still fired because grounded_claims < 3.  Post-fix, we look at
-        # the whole structured-evidence picture.
+        # the synthesizer's structured path.  The second branch must now
+        # look at the whole structured-evidence picture rather than firing
+        # purely on grounded_claims < 3.
         ctx = self._ctx(
             citations=5,
             grounded_claims=0,

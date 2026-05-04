@@ -1,14 +1,14 @@
-"""Regression tests for v16.9.74 — POST /api/env hot-reload into ``os.environ``.
+"""Regression tests for POST /api/env hot-reload into ``os.environ``.
 
-User-reported gap. v16.9.73 fixed the *startup* load of ``.env``: when the
-WebUI boots, ``_load_dotenv_into_webui_process`` now populates
-``os.environ`` from the file before any reader runs.  Operators then
-flagged a separate hole: changing settings *via the WebUI* and clicking
-Save wrote the new values to ``.env`` on disk but the running process
-still held the previous values until the operator killed the WebUI and
-re-launched.  The next pipeline subprocess inherits ``os.environ`` from
-the WebUI parent (``_run_worker``'s ``_child_env = {**os.environ, ...}``)
-— so a Save without a restart had no observable effect.
+The WebUI startup load of ``.env`` (``_load_dotenv_into_webui_process``)
+populates ``os.environ`` from the file before any reader runs — but
+that fix on its own left a separate hole: changing settings *via the
+WebUI* and clicking Save wrote the new values to ``.env`` on disk but
+the running process still held the previous values until the operator
+killed the WebUI and re-launched.  The next pipeline subprocess inherits
+``os.environ`` from the WebUI parent (``_run_worker``'s
+``_child_env = {**os.environ, ...}``) — so a Save without a restart had
+no observable effect.
 
 This test module exercises the ``_apply_env_to_process`` hook that now
 mirrors saved key/values into ``os.environ`` immediately after each

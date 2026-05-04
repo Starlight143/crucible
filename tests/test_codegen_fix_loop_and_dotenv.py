@@ -1,6 +1,7 @@
-"""Regression tests for v16.9.73 user-reported bugs + audit-driven fixes.
+"""Regression tests for the codegen LLM-fix loop, ``.env`` propagation,
+WebUI agent-flow display, and Pearson-r NaN handling.
 
-User-reported bugs (issued in Chinese):
+Bugs pinned by these tests:
 
 1. **Quant-mode auto-backtest crashes on LLM-emitted SyntaxError and the
    round-1 LLM-fix loop fails to repair it** — the previous
@@ -9,22 +10,21 @@ User-reported bugs (issued in Chinese):
    *equally-broken* code (same ``SyntaxError: unterminated string
    literal`` class), the file would be overwritten with the broken
    replacement, the next subprocess call would fail again, and three
-   fix rounds would be burned with zero progress.  v16.9.73 adds a
-   hard ``compile()`` syntax gate plus deterministic JSON-escape
-   repair before writing.  The ``backtest_report.json`` failure path
-   was also tightened: the regex-based ``_parse_backtest_output`` no
-   longer scrapes phantom metrics out of a Python traceback after a
-   crashed subprocess; only fresh JSON files written *during this run*
-   are honoured.
+   fix rounds would be burned with zero progress.  A hard ``compile()``
+   syntax gate plus deterministic JSON-escape repair now run before
+   writing.  The ``backtest_report.json`` failure path was also
+   tightened: the regex-based ``_parse_backtest_output`` no longer
+   scrapes phantom metrics out of a Python traceback after a crashed
+   subprocess; only fresh JSON files written *during this run* are
+   honoured.
 
 2. **``.env`` DEBUG mode silently ignored by the WebUI** —
-   ``CRUCIBLE_LOG_LEVEL=DEBUG`` set in ``.env`` was never loaded
-   into the Python process because no module called
-   ``load_dotenv``.  v16.9.73 wires ``runtime_logging`` and
-   ``webui/app.py`` up to ``python-dotenv`` (when installed), with
-   the loader protected by a double-checked ``threading.Lock`` so two
-   threads cannot race the load (a real risk under Python 3.13+
-   free-threaded mode).
+   ``CRUCIBLE_LOG_LEVEL=DEBUG`` set in ``.env`` was never loaded into
+   the Python process because no module called ``load_dotenv``.  Both
+   ``runtime_logging`` and ``webui/app.py`` are now wired up to
+   ``python-dotenv`` (when installed), with the loader protected by a
+   double-checked ``threading.Lock`` so two threads cannot race the load
+   (a real risk under Python 3.13+ free-threaded mode).
 
 3. **WebUI agent flow display stuck after codegen** —
    ``codegen_kickoff_done`` previously only set ``self_check`` to
@@ -32,8 +32,6 @@ User-reported bugs (issued in Chinese):
    stuck showing ``active`` for the rest of the run.  Plus
    ``direction_feedback_start`` had no front-end mapping, so the graph
    appeared frozen during gate-driven debate refinement.  Both fixed.
-
-Audit-driven fixes (parallel 4-agent audit pass):
 
 4. **Pearson r NaN propagation** — both
    ``dynamic_correlation._pearson_r`` and
@@ -43,7 +41,7 @@ Audit-driven fixes (parallel 4-agent audit pass):
    intermediate yielded NaN (typically because the input series
    contained NaN values that propagated through the mean/covariance
    helpers), the clamp could leak NaN into downstream metric tables.
-   Now both helpers explicitly check ``math.isfinite(raw)`` and
+   Both helpers now explicitly check ``math.isfinite(raw)`` and
    short-circuit to ``0.0`` for non-finite results.
 """
 
@@ -69,9 +67,9 @@ from crucible import runtime_logging as rtl
 
 
 class TestValidatePythonSyntax:
-    """Verify the new compile-based syntax gate catches the bug class
-    that the v16.9.73 user log surfaced — unterminated string literals,
-    invalid escape sequences, mismatched brackets."""
+    """Verify the compile-based syntax gate catches the LLM-emitted bug
+    class — unterminated string literals, invalid escape sequences,
+    mismatched brackets."""
 
     def test_clean_code_returns_none(self) -> None:
         assert br._validate_python_syntax("x = 1\nprint(x)\n") is None
@@ -170,7 +168,7 @@ class TestExtractCodeBlock:
 
 
 class TestTryLLMFixSyntaxGate:
-    """Verify v16.9.73 hard syntax gate: a fix that introduces a fresh
+    """Verify the hard syntax gate: a fix that introduces a fresh
     ``SyntaxError`` is rejected as ``produced no valid code`` instead
     of being written to disk."""
 
@@ -222,7 +220,7 @@ class TestTryLLMFixSyntaxGate:
 
     def test_rejects_fix_identical_to_input(self, tmp_path: Path) -> None:
         # If the LLM returns the *same* code we already have, this would
-        # burn a round with no progress.  v16.9.73 short-circuits.
+        # burn a round with no progress; the helper short-circuits.
         original = "import os\nprint(os.getcwd())\n"
         entrypoint = self._write_entrypoint(tmp_path, original)
 
@@ -436,7 +434,7 @@ class TestDotenvLoaderToleratesMissingPackage:
 
 
 class TestAgentFlowEvMapHasCorrectMappings:
-    """The frontend evMap must contain the v16.9.73 fixes:
+    """The frontend evMap must contain the agent-flow display fixes:
     - ``codegen_kickoff_done`` → ``codegen_phase_done`` (not
       ``self_check`` → ``active``)
     - ``direction_feedback_start`` → ``dir_judge`` → ``active``

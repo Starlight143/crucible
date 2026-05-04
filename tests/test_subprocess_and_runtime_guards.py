@@ -1,26 +1,28 @@
 """
-tests/test_v16_9_69_audit_fixes.py
-==================================
-Regression tests for the v16.9.69 four-agent audit fixes.  Each test asserts
-that a specific bug **stays fixed** — a future refactor that re-introduces
-the vulnerability/incorrectness will fail one of these tests.
+tests/test_subprocess_and_runtime_guards.py
+===========================================
+Regression tests for subprocess timeout handling, fail-closed notifications,
+subnormal-divisor numerical guards, log-redaction precision, sandbox-executor
+honesty, and WebUI budget cap surfacing.  Each test asserts that a specific
+bug **stays fixed** — a future refactor that re-introduces the
+vulnerability/incorrectness will fail one of these tests.
 
 Coverage:
     1.  smoke_test.run_help has subprocess timeout and TimeoutExpired handling
-        (HIGH, v16.9.69)
+        (HIGH)
     2.  run_crucible_enhanced.notify_run_complete fail-closed on parse error
-        (HIGH, v16.9.69)
+        (HIGH)
     3.  features.dynamic_correlation.compute_pca subnormal-divisor guard on
-        total_variance (HIGH, v16.9.69)
+        total_variance (HIGH)
     4.  features.risk_attribution.compute_risk_attribution subnormal-divisor
-        guard on total_w (MEDIUM, v16.9.69)
+        guard on total_w (MEDIUM)
     5.  runtime_logging._SENSITIVE_KEY_FRAGMENTS no longer over-redacts
-        "author"/"authority" via bare "auth" substring (MEDIUM, v16.9.69)
+        "author"/"authority" via bare "auth" substring (MEDIUM)
     6.  features.sandbox_executor adds ``sandboxed`` field to its report and
-        sets it correctly per execution path (MEDIUM, v16.9.69)
+        sets it correctly per execution path (MEDIUM)
     7.  webui /api/budget/status returns ``daily_limit`` / ``soft_limit`` /
         ``max_total_tokens`` so the front-end budget bar can render the cap
-        (MEDIUM, v16.9.69)
+        (MEDIUM)
 """
 from __future__ import annotations
 
@@ -42,7 +44,7 @@ if str(_ROOT) not in sys.path:
 # ── 1. smoke_test.run_help: subprocess timeout & TimeoutExpired handling ─────
 
 class TestSmokeTestSubprocessTimeout(unittest.TestCase):
-    """v16.9.69 HIGH fix: a stuck import must not wedge CI — run_help must
+    """HIGH safety property: a stuck import must not wedge CI — run_help must
     pass an explicit timeout to subprocess.run and convert TimeoutExpired
     into an exit-code-124 CompletedProcess."""
 
@@ -101,14 +103,14 @@ class TestSmokeTestSubprocessTimeout(unittest.TestCase):
 # ── 2. run_crucible_enhanced: notify_run_complete fail-closed on parse error ─
 
 class TestNotifyRunCompleteFailClosed(unittest.TestCase):
-    """v16.9.69 HIGH fix: a corrupt analysis_result.json must NOT report
+    """HIGH safety property: a corrupt analysis_result.json must NOT report
     success=True to notify_run_complete — that would silently suppress the
     NOTIFY_ON_FAIL_ONLY=1 alert for a genuinely-failed run."""
 
     def _resolve_notify_success(self, *, file_present: bool, file_content: str | None) -> bool:
         """Replay the exact resolution logic from run_crucible_enhanced.cmd_run."""
         # Mirrors lines 1032-1043 of run_crucible_enhanced.py exactly.
-        _notify_success = False  # v16.9.69: fail-closed default
+        _notify_success = False  # fail-closed default
         if file_present:
             try:
                 _data = json.loads(file_content or "")
@@ -124,7 +126,7 @@ class TestNotifyRunCompleteFailClosed(unittest.TestCase):
         self.assertFalse(self._resolve_notify_success(file_present=False, file_content=None))
 
     def test_corrupt_json_is_failure(self):
-        """Truncated / unparseable JSON → not a success (was True pre-v16.9.69)."""
+        """Truncated / unparseable JSON → not a success."""
         self.assertFalse(self._resolve_notify_success(
             file_present=True, file_content='{"score": 87, "risk_lev'))
 
@@ -149,9 +151,9 @@ class TestNotifyRunCompleteFailClosed(unittest.TestCase):
 # ── 3. dynamic_correlation: subnormal-divisor guard on total_variance ────────
 
 class TestDynamicCorrelationSubnormalGuard(unittest.TestCase):
-    """v16.9.69 HIGH fix: PCA's total_variance ≤ 0 check admitted IEEE 754
-    subnormals which divided into eigenvalues to produce explained-variance
-    ratios on the order of 1e+300."""
+    """HIGH safety property: PCA's total_variance ≤ 0 check must reject IEEE 754
+    subnormals — without the guard they divide into eigenvalues to produce
+    explained-variance ratios on the order of 1e+300."""
 
     def test_normal_input_returns_components(self):
         from crucible.features.dynamic_correlation import _pca_pure_python as compute_pca
@@ -193,10 +195,10 @@ class TestDynamicCorrelationSubnormalGuard(unittest.TestCase):
             [-eps, -eps, -eps],
         ]
         out = compute_pca(matrix, n_components=2)
-        # Pre-fix: would return components with explained_variance_ratio ≈ 1e+0
-        # to 1e+300 garbage.  Post-fix: guard rejects, returns [].
-        # Either we get [] (preferred), or we get components that don't have
-        # explosive ratios.  Assert no inf / no >1.0001 ratios.
+        # Without the guard this would return components with
+        # explained_variance_ratio ≈ 1e+0 to 1e+300 garbage; with the guard
+        # in place either we get [] (preferred), or components that don't
+        # have explosive ratios.  Assert no inf / no >1.0001 ratios.
         for c in out:
             self.assertTrue(0.0 <= c.explained_variance_ratio <= 1.0 + 1e-6,
                             f"PCA leaked subnormal-divided ratio {c.explained_variance_ratio}")
@@ -205,8 +207,9 @@ class TestDynamicCorrelationSubnormalGuard(unittest.TestCase):
 # ── 4. risk_attribution: subnormal-divisor guard on total_w ──────────────────
 
 class TestRiskAttributionSubnormalGuard(unittest.TestCase):
-    """v16.9.69 MEDIUM fix: weight normalisation guarded only by ``total_w <= 0``
-    admitted subnormals which produced normalised weights on the order of 1e+300."""
+    """MEDIUM safety property: weight normalisation guarded only by ``total_w <= 0``
+    admits subnormals which then produce normalised weights on the order of 1e+300.
+    The strict ``not (total_w > 1e-14)`` form rejects them."""
 
     def test_normal_weights_return_result(self):
         from crucible.features.risk_attribution import compute_component_var as compute_risk_attribution
@@ -253,9 +256,9 @@ class TestRiskAttributionSubnormalGuard(unittest.TestCase):
 # ── 5. runtime_logging: "auth" no longer over-redacts "author" ───────────────
 
 class TestRuntimeLoggingAuthFragment(unittest.TestCase):
-    """v16.9.69 MEDIUM fix: the bare "auth" fragment was substring-matching
-    benign field names like "author" / "authority" / "authored_by".  Replaced
-    with more specific markers."""
+    """MEDIUM precision property: the bare "auth" fragment used to substring-match
+    benign field names like "author" / "authority" / "authored_by".  The
+    sensitive-key fragments now use more specific markers."""
 
     def test_authorization_still_redacted(self):
         from crucible import runtime_logging
@@ -281,8 +284,8 @@ class TestRuntimeLoggingAuthFragment(unittest.TestCase):
             "authored_by": "bob",
             "authentic_count": 42,
         })
-        # Pre-fix: all four were "***REDACTED***".
-        # Post-fix: none of them match the more specific markers.
+        # The benign "author"-family field names must NOT match the
+        # sensitive-key markers — they pass through verbatim.
         self.assertEqual(out["author"], "alice@example.com")
         self.assertEqual(out["authority"], "primary")
         self.assertEqual(out["authored_by"], "bob")
@@ -304,7 +307,7 @@ class TestRuntimeLoggingAuthFragment(unittest.TestCase):
 # ── 6. sandbox_executor: ``sandboxed`` field correctness ─────────────────────
 
 class TestSandboxExecutorSandboxedField(unittest.TestCase):
-    """v16.9.69 MEDIUM fix: report now carries ``sandboxed: bool`` so the
+    """MEDIUM observability property: report carries ``sandboxed: bool`` so the
     operator can tell whether real isolation was applied.  False for the
     Windows-no-docker fallback even when the run succeeds."""
 
@@ -341,7 +344,7 @@ class TestSandboxExecutorSandboxedField(unittest.TestCase):
     def test_report_has_sandboxed_field_in_fallback(self):
         report = self._run_with_docker_state(docker_ok=False)
         self.assertIn("sandboxed", report,
-                      "v16.9.69: sandbox_execution_report.json must include sandboxed:")
+                      "sandbox_execution_report.json must include sandboxed:")
         self.assertFalse(report["sandboxed"],
                          "fallback path must report sandboxed=False")
         self.assertFalse(report["docker_available"])
@@ -350,9 +353,10 @@ class TestSandboxExecutorSandboxedField(unittest.TestCase):
 # ── 7. /api/budget/status returns operator-configured caps ───────────────────
 
 class TestBudgetStatusReturnsCaps(unittest.TestCase):
-    """v16.9.69 MEDIUM fix: front-end reads ``data.daily_limit`` to render the
-    budget cap badge / progress fill.  Backend now surfaces the configured
-    BUDGET_HARD_COST_LIMIT / BUDGET_SOFT_COST_LIMIT / BUDGET_MAX_TOTAL_TOKENS."""
+    """MEDIUM UI-contract property: front-end reads ``data.daily_limit`` to
+    render the budget cap badge / progress fill.  Backend surfaces the
+    configured BUDGET_HARD_COST_LIMIT / BUDGET_SOFT_COST_LIMIT /
+    BUDGET_MAX_TOTAL_TOKENS."""
 
     @classmethod
     def setUpClass(cls) -> None:
