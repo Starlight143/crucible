@@ -1,7 +1,41 @@
 # Changelog
 
 All notable changes to this project are documented in this file.
-Versioning follows [Semantic Versioning](https://semver.org/). The first public release will be **v1.0.0**.
+Versioning follows [Semantic Versioning](https://semver.org/). The first public release was **v1.0.0**.
+
+---
+
+## [v1.0.1] — 2026-05-04
+
+### Changed
+- **Test-suite naming hygiene**: Removed pre-1.0 internal version tags from test
+  filenames and docstrings so the test layout reflects what each module covers,
+  not which audit batch produced it. Test discovery, collection rules, and
+  assertion logic are unchanged — only filenames and human-readable comments
+  were touched. Renames (tracked via `git mv` to preserve history):
+  - `tests/test_v16_9_68_audit_fixes.py` → `tests/test_security_and_safety_guards.py`
+  - `tests/test_v16_9_69_audit_fixes.py` → `tests/test_subprocess_and_runtime_guards.py`
+  - `tests/test_v16_9_71_cjk_grounding.py` → `tests/test_cjk_grounding.py`
+  - `tests/test_v16_9_72_audit_fixes.py` → `tests/test_research_synthesizer_guards.py`
+  - `tests/test_v16_9_73_audit_fixes.py` → `tests/test_codegen_fix_loop_and_dotenv.py`
+  - `tests/test_v16_9_74_env_hot_reload.py` → `tests/test_env_hot_reload.py`
+- **Pre-1.0 version tags scrubbed** from incidental docstrings/comments in
+  `tests/test_http_clients.py`, `tests/test_crucible_runtime.py`, and
+  `tests/test_resilience.py`. Production source files retain their inline
+  historical annotations untouched (no behaviour change).
+
+### Validation
+- Full pytest suite: 1821 passed, 5 skipped.
+- `crucible/smoke_test.py`: all 5 checks pass.
+- `run_crucible.py --self-check`: OK.
+
+---
+
+## [v1.0.0] — 2026-05-04
+
+### Added
+- First public release. See README and feature documentation for the full
+  capability surface.
 
 ---
 

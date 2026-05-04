@@ -137,7 +137,7 @@ class TestHttpClients(unittest.TestCase):
 
 
 class TestSearchHelpers(unittest.TestCase):
-    """Cover the helpers introduced in v16.9.46."""
+    """Cover the librarian search helpers."""
 
     def test_grep_app_skips_cjk_queries(self) -> None:
         from crucible.modules.section_04_web_research_and_direction import (

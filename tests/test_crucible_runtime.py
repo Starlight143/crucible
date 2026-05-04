@@ -3619,9 +3619,9 @@ class TestCrucibleCrewRuntime(unittest.TestCase):
             globals_dict["ACTIVE_OPENAI_COMPAT_PROVIDER"] = "alibaba_coding_plan"
             globals_dict["ACTIVE_OPENAI_COMPAT_API_KEY"] = "sk-sp-stale-alibaba-key"
             try:
-                # v16.9.46: load_api_key now raises RuntimeError (was sys.exit)
-                # so pipeline checkpoints/telemetry can flush and callers can
-                # fall back to a different provider rather than being killed.
+                # load_api_key raises RuntimeError (not sys.exit) so pipeline
+                # checkpoints/telemetry can flush and callers can fall back
+                # to a different provider rather than being killed.
                 with self.assertRaises(RuntimeError):
                     runtime.load_api_key("openrouter")
             finally:

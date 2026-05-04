@@ -194,10 +194,10 @@ class TestResilience(unittest.TestCase):
         )
 
     def test_body_read_failures_classified_as_transient(self) -> None:
-        """Mid-response body-read failures must retry (v16.9.48).
+        """Mid-response body-read failures must retry.
 
-        Before v16.9.48, an OpenRouter 200 OK response whose chunked-gzip
-        body was truncated by Cloudflare raised httpx.ReadError /
+        Without this classification, an OpenRouter 200 OK response whose
+        chunked-gzip body was truncated by Cloudflare raised httpx.ReadError /
         requests.exceptions.ChunkedEncodingError, which matched NO
         transient marker and was re-raised as a fatal error, killing the
         pipeline with exit code 1.
