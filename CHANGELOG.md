@@ -5,6 +5,27 @@ Versioning follows [Semantic Versioning](https://semver.org/). The first public 
 
 ---
 
+## [v1.0.2] — 2026-05-06
+
+### Fixed
+- **WebUI long-session freeze** (`webui/templates/index.html`): four independent
+  leaks that progressively froze the WebUI on multi-hour runs.
+  - Terminal DOM trimmed symmetrically with `sess.lines` (cap 5 000); previously
+    DOM nodes accumulated forever while the array was capped.
+  - `visibilitychange` handler reopens any `EventSource` killed by background-tab
+    throttling (Chrome Memory Saver, OS sleep) on tab refocus.
+  - `pagehide` handler closes all `EventSource` connections on tab close so
+    server-side SSE generators release immediately instead of waiting 30 min.
+  - `showPage()` clears `_ABState.pollTimer` when navigating away from the
+    A/B-test page; `_initABTest()` re-arms it on return.
+
+### Validation
+- pytest: 1825 passed, 1 skipped.
+- `crucible/smoke_test.py`: 5/5 OK.
+- `run_crucible.py --self-check`: OK.
+
+---
+
 ## [v1.0.1] — 2026-05-04
 
 ### Changed

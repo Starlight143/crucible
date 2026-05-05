@@ -1687,6 +1687,17 @@ function showPage(name) {
   pageEl.classList.add('active');
   const navEl = document.querySelector(`[data-page="${name}"]`);
   if (navEl) navEl.classList.add('active');
+  // Stop the AB-test 4-second poll when the user navigates elsewhere so
+  // a forgotten AB session does not keep hitting /api/ab-test/<id> in
+  // the background indefinitely (every poll allocates request/response
+  // objects that pile up under Chrome's tab-throttling).  The timer is
+  // restarted by _initABTest() when the user comes back and runs another
+  // comparison.  `typeof` guard keeps this safe if showPage somehow
+  // fires before the _ABState const is evaluated.
+  if (name !== 'abtest' && typeof _ABState !== 'undefined' && _ABState && _ABState.pollTimer) {
+    clearInterval(_ABState.pollTimer);
+    _ABState.pollTimer = null;
+  }
   const m = PAGE_META[name];
   if (!m) return;  // no meta defined for this page
   document.getElementById('topbar-title').textContent = m.title;
@@ -2468,6 +2479,24 @@ function _appendLine(sessId, text, cls = '') {
   div.className = 'term-line' + (cls ? ' ' + cls : '');
   div.textContent = text;
   t.insertBefore(div, cursor);
+  // Symmetric DOM trim: cap the on-screen `.term-line` node count to
+  // mirror the in-memory sess.lines cap above.  Without this the active
+  // terminal accumulates one <div> per streamed line forever — multi-hour
+  // pipelines / overnight backtests grow the DOM into the tens of
+  // thousands of children, layout/paint slows to a crawl, and Chrome's
+  // Memory Saver eventually discards the tab so the user comes back to
+  // a frozen page.  The cap is enforced by removing the OLDEST line
+  // (firstElementChild) until the count matches `_MAX_TERM_LINES`; the
+  // trailing `.term-cursor` span is preserved so the next insertBefore
+  // still has its anchor.
+  const cursorPresent = cursor != null;
+  let lineCount = t.childElementCount - (cursorPresent ? 1 : 0);
+  while (lineCount > _MAX_TERM_LINES) {
+    const first = t.firstElementChild;
+    if (!first || first === cursor) break;
+    t.removeChild(first);
+    lineCount--;
+  }
   t.scrollTop = t.scrollHeight;
 }
 
@@ -4975,6 +5004,42 @@ async function testWebhook() {
 
   // Load webhook status on startup
   loadWebhookStatus();
+
+  // ─── Page lifecycle handlers ────────────────────────────────────────
+  // When the tab is closed (or the user navigates the WHOLE window
+  // away) explicitly close every open EventSource so the server-side
+  // SSE generator unblocks immediately via GeneratorExit instead of
+  // sitting in time.sleep() until the 30-min idle timeout fires.  This
+  // keeps long-lived Flask workers from holding orphaned generators
+  // when users open/close the WebUI repeatedly.
+  window.addEventListener('pagehide', () => {
+    Object.keys(State._evtSources).forEach(sessId => {
+      try { State._evtSources[sessId].close(); } catch (_) {}
+    });
+  });
+
+  // When the tab becomes visible again after being backgrounded, the
+  // browser may have silently killed the EventSource socket (Chrome's
+  // Memory Saver, OS sleep, mobile Safari tab discard, aggressive
+  // proxies).  EventSource.readyState === 2 (CLOSED) on a still-running
+  // session means the user is staring at a "frozen" terminal — the SSE
+  // onerror handler ALREADY scheduled a reconnect, but only after a
+  // multi-second backoff, and the watchdog only fires after 10 minutes
+  // of total silence.  Force an immediate reconnect on visibility
+  // change so the user sees fresh output the moment they refocus the
+  // tab.  No-op for sessions whose state is already terminal.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible') return;
+    Object.keys(State._evtSources).forEach(sessId => {
+      const es = State._evtSources[sessId];
+      if (!es || es.readyState !== 2) return;  // 2 === CLOSED
+      const sess = _getSession(sessId);
+      if (!sess || !sess.run_id) return;
+      if (sess.status === 'running' || sess.status === 'starting') {
+        _streamSession(sessId);
+      }
+    });
+  });
 })();
 
 // ─── Global tooltip (event delegation on [data-tooltip]) ──────────────────────
