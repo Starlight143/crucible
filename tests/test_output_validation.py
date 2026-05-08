@@ -103,7 +103,7 @@ class TestExtractJson:
 
     def test_brace_in_string_value_parsed_correctly(self) -> None:
         """
-        Regression (v16.0.11): the backward brace-scan in stage-3 did not track
+        Regression: the backward brace-scan in stage-3 did not track
         string context.  A '}' or '{' inside a JSON string value corrupted the
         depth counter, causing the scanner to mis-detect the JSON boundary and
         return None instead of the correct dict.

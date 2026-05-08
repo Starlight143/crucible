@@ -1,5 +1,5 @@
-# Auto-generated from OLD_version/crucible_v14.py.
-# Import-based section module. Do not edit manually; regenerate from V14.
+# Auto-generated section module — do not edit manually.
+# Regenerate via ``python -m crucible.generate``.
 from __future__ import annotations
 
 import threading

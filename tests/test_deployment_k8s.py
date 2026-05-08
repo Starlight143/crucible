@@ -103,7 +103,7 @@ class TestGenerateHelmTemplates(unittest.TestCase):
 
     def test_service_template_guarded_by_enabled(self) -> None:
         """
-        Regression (v16.0.10): service.yaml was missing the
+        Regression: service.yaml was missing the
         {{- if .Values.service.enabled }} guard, causing Helm render failures
         for headless deployments where service.type/port/targetPort are absent
         from values.yaml.  The guard must be present.
@@ -116,7 +116,7 @@ class TestGenerateHelmTemplates(unittest.TestCase):
 
     def test_helm_values_headless_has_enabled_false_and_no_port_fields(self) -> None:
         """
-        Regression (v16.0.10): headless values.yaml must have service.enabled: false
+        Regression: headless values.yaml must have service.enabled: false
         and must NOT define service.type/port/targetPort (those fields are only
         safe to reference when service.enabled: true).
         """
@@ -127,7 +127,7 @@ class TestGenerateHelmTemplates(unittest.TestCase):
 
     def test_helm_values_web_has_enabled_true(self) -> None:
         """
-        Regression (v16.0.10): web-framework values.yaml must include
+        Regression: web-framework values.yaml must include
         service.enabled: true so the {{- if .Values.service.enabled }} guard
         in service.yaml renders the Service resource correctly.
         """

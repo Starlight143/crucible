@@ -224,7 +224,7 @@ class TestAlphaVantageConnector:
 
     def test_fetch_intraday_filters_empty_rows(self):
         """
-        Regression (v16.0.8): malformed CSV may yield bare [] rows from csv.reader.
+        Regression: malformed CSV may yield bare [] rows from csv.reader.
         Before the fix, the sort key `r[0] if r else ""` kept empty rows at the
         front of the output, causing IndexError on callers that access row[0].
         After the fix, empty rows are filtered out before sorting.
@@ -432,7 +432,7 @@ class TestCoinGeckoConnector:
 
     def test_fetch_ohlcv_accumulates_hourly_volumes_into_daily_total(self):
         """
-        Regression (v16.0.4): vol_map[d] = str(val) overwrote the last hourly
+        Regression: vol_map[d] = str(val) overwrote the last hourly
         volume instead of summing them.  After the fix, hourly volume entries for
         the same calendar date are summed (100 + 200 + 300 = 600.0).
         """
@@ -462,7 +462,7 @@ class TestCoinGeckoConnector:
 
     def test_fetch_ohlcv_null_volume_entry_is_skipped(self):
         """
-        Regression (v16.0.8): CoinGecko may return [ts, null] in total_volumes.
+        Regression: CoinGecko may return [ts, null] in total_volumes.
         float(None) raises TypeError; the entry must be silently skipped so that
         other entries for the same day are still accumulated correctly.
         """
@@ -491,7 +491,7 @@ class TestCoinGeckoConnector:
 
     def test_fetch_ohlcv_null_market_cap_entry_is_skipped(self):
         """
-        Regression (v16.0.8): CoinGecko may return [ts, null] in market_caps.
+        Regression: CoinGecko may return [ts, null] in market_caps.
         str(None) = 'None' must NOT be stored; the entry must be skipped so that
         a subsequent valid market-cap entry overwrites the slot cleanly.
         """
@@ -518,7 +518,7 @@ class TestCoinGeckoConnector:
 
     def test_fetch_ohlcv_missing_market_cap_default_is_float_format(self):
         """
-        Regression (v16.0.8): when no market_cap data exists for a date, the
+        Regression: when no market_cap data exists for a date, the
         default must be '0.0' (matching volume's str(float) format), not '0'.
         """
         base_ts = 1_672_531_200_000
@@ -600,7 +600,7 @@ class TestFredConnector:
 
     def test_fetch_series_omits_api_key_when_unconfigured(self):
         """
-        Regression (v16.0.4): when no FRED api_key is configured the URL must NOT
+        Regression: when no FRED api_key is configured the URL must NOT
         include an api_key parameter at all.  Previously the code passed the
         literal string "demo" as the key, which caused unexpected 400 errors on
         anonymous requests because FRED does not accept "demo" as a valid key.

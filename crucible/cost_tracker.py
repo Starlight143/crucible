@@ -46,18 +46,17 @@ Usage::
 from __future__ import annotations
 
 import contextlib
-import os
 import threading
 import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 if __package__ == "crucible":
-    from .runtime_logging import get_logger, log_event
     from .cancellation import OperationCancelledError
+    from .runtime_logging import get_logger, log_event
 else:  # pragma: no cover
-    from runtime_logging import get_logger, log_event  # type: ignore[no-redef]
     from cancellation import OperationCancelledError  # type: ignore[no-redef]
+    from runtime_logging import get_logger, log_event  # type: ignore[no-redef]
 
 LOGGER = get_logger(__name__)
 
@@ -68,20 +67,18 @@ _DEFAULT_INPUT_PRICE_PER_M = 0.50   # USD per 1 M input tokens
 _DEFAULT_OUTPUT_PRICE_PER_M = 1.50  # USD per 1 M output tokens
 
 
+try:
+    from . import _env
+except ImportError:  # pragma: no cover - script-mode fallback
+    import _env  # type: ignore[no-redef]
+
+
 def _env_float(name: str, default: float) -> float:
-    try:
-        v = os.environ.get(name, "")
-        return float(v) if v.strip() else default
-    except (ValueError, TypeError):
-        return default
+    return _env.env_float(name, default)
 
 
 def _env_int(name: str, default: int) -> int:
-    try:
-        v = os.environ.get(name, "")
-        return int(v) if v.strip() else default
-    except (ValueError, TypeError):
-        return default
+    return _env.env_int(name, default)
 
 
 def _usd_per_token(price_per_million: float) -> float:

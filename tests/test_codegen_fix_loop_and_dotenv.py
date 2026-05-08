@@ -439,35 +439,39 @@ class TestAgentFlowEvMapHasCorrectMappings:
       ``self_check`` → ``active``)
     - ``direction_feedback_start`` → ``dir_judge`` → ``active``
     - ``codegen_phase_done`` state handler exists in the for-loop
+
+    v1.0.3: the WebUI's <script> block was extracted to a sidecar file at
+    ``webui/static/js/app.js``; this fixture now reads that file instead of
+    ``index.html``.
     """
 
     @pytest.fixture(scope="class")
-    def index_html(self) -> str:
+    def webui_js(self) -> str:
         path = (
             Path(__file__).resolve().parent.parent
-            / "webui" / "templates" / "index.html"
+            / "webui" / "static" / "js" / "app.js"
         )
         return path.read_text(encoding="utf-8")
 
-    def test_codegen_kickoff_done_maps_to_phase_done(self, index_html: str) -> None:
+    def test_codegen_kickoff_done_maps_to_phase_done(self, webui_js: str) -> None:
         # Old (buggy): /codegen_kickoff_done/i, 'self_check', 'active'
         # New: /codegen_kickoff_done/i, null, 'codegen_phase_done'
-        assert "'codegen_phase_done'" in index_html
+        assert "'codegen_phase_done'" in webui_js
         # The buggy mapping (kickoff_done → self_check active) must be gone.
         assert (
             "[/codegen_kickoff_done/i,                             'self_check', 'active'      ]"
-            not in index_html
+            not in webui_js
         )
 
-    def test_direction_feedback_start_mapped(self, index_html: str) -> None:
+    def test_direction_feedback_start_mapped(self, webui_js: str) -> None:
         # The bug was that direction_feedback_start had no mapping at all.
-        assert "/direction_feedback_start/i" in index_html
-        assert "/direction_feedback_failed/i" in index_html
+        assert "/direction_feedback_start/i" in webui_js
+        assert "/direction_feedback_failed/i" in webui_js
 
-    def test_codegen_phase_done_state_handler_exists(self, index_html: str) -> None:
+    def test_codegen_phase_done_state_handler_exists(self, webui_js: str) -> None:
         # The state handler block that closes stage-8 nodes and
         # activates self_check.
-        assert "state === 'codegen_phase_done'" in index_html
+        assert "state === 'codegen_phase_done'" in webui_js
 
 
 # ════════════════════════════════════════════════════════════════════════════

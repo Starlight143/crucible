@@ -5,3 +5,5 @@ mypy
 bandit
 pip-audit
 pytest
+pytest-xdist
+pytest-cov

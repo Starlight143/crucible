@@ -43,7 +43,6 @@ Usage::
 from __future__ import annotations
 
 import math
-import os
 import threading
 from typing import Any, Dict, Optional
 
@@ -331,17 +330,15 @@ class ContextWindowMonitor:
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
+try:
+    from . import _env
+except ImportError:  # pragma: no cover - script-mode fallback
+    import _env  # type: ignore[no-redef]
+
+
 def _env_int(name: str, default: int) -> int:
-    try:
-        v = os.environ.get(name, "")
-        return int(v) if v.strip() else default
-    except (ValueError, TypeError):
-        return default
+    return _env.env_int(name, default)
 
 
 def _env_float(name: str, default: float) -> float:
-    try:
-        v = os.environ.get(name, "")
-        return float(v) if v.strip() else default
-    except (ValueError, TypeError):
-        return default
+    return _env.env_float(name, default)

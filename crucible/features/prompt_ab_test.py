@@ -73,12 +73,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
+try:
+    from .. import _env
+except ImportError:  # pragma: no cover - script-mode fallback
+    import _env  # type: ignore[no-redef]
+
+
 def _env_int(name: str, default: int) -> int:
-    try:
-        v = os.environ.get(name, "")
-        return int(v) if v.strip() else default
-    except (ValueError, TypeError):
-        return default
+    return _env.env_int(name, default)
 
 
 AB_TEST_TIMEOUT: int = _env_int("AB_TEST_TIMEOUT", 3600)

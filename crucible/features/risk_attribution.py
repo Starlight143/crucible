@@ -27,23 +27,22 @@ logger = logging.getLogger(__name__)
 
 # ── Env helpers ───────────────────────────────────────────────────────────────
 
+try:
+    from .. import _env
+except ImportError:  # pragma: no cover - script-mode fallback
+    import _env  # type: ignore[no-redef]
+
+
 def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, ""))
-    except (ValueError, TypeError):
-        return default
+    return _env.env_int(name, default)
 
 
 def _env_float(name: str, default: float) -> float:
-    try:
-        val = float(os.environ.get(name, ""))
-        return val if math.isfinite(val) else default
-    except (ValueError, TypeError):
-        return default
+    return _env.env_float(name, default, finite_only=True)
 
 
 def _env_str(name: str, default: str) -> str:
-    return os.environ.get(name, "").strip() or default
+    return _env.env_str(name, default)
 
 
 # ── Mode isolation ─────────────────────────────────────────────────────────────
@@ -254,8 +253,8 @@ def compute_component_var(
     # weights=[5e-325, ...]), which divided into each weight at line 257
     # produces normalised weights on the order of 1e+300 and propagates into
     # the portfolio-variance quadratic form below, breaking every
-    # component-VaR / contribution_pct downstream.  Project-standard threshold
-    # (CLAUDE.md "數值正確性通用規則"): require ``> 1e-14``.
+    # component-VaR / contribution_pct downstream.  Project-standard threshold:
+    # require ``> 1e-14``.
     total_w = sum(weights)
     if not (total_w > 1e-14):
         result.errors.append("Weights sum to <= 0 (or below subnormal threshold 1e-14)")

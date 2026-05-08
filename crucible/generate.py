@@ -70,8 +70,8 @@ SECTIONS = [
 ]
 
 
-MODULE_HEADER = """# Auto-generated from OLD_version/crucible_v14.py.
-# Import-based section module. Do not edit manually; regenerate from V14.
+MODULE_HEADER = """# Auto-generated section module — do not edit manually.
+# Regenerate via ``python -m crucible.generate``.
 from __future__ import annotations
 """
 
@@ -261,7 +261,7 @@ def _build_module_content(index: int, lines: list[str]) -> str:
 
 def _build_modules_init() -> str:
     lines = [
-        '"""Import-based section modules generated from OLD_version/crucible_v14.py."""',
+        '"""Import-based section modules — auto-generated; do not edit by hand."""',
         "",
     ]
     lines.append("__all__ = [")
@@ -275,7 +275,7 @@ def _build_modules_init() -> str:
 
 def main() -> None:
     if not SOURCE_FILE.is_file():
-        raise FileNotFoundError(f"Legacy V14 source not found: {SOURCE_FILE}")
+        raise FileNotFoundError(f"Legacy source not found: {SOURCE_FILE}")
 
     source_text = SOURCE_FILE.read_text(encoding="utf-8")
     lines = source_text.splitlines(keepends=True)
@@ -285,7 +285,7 @@ def main() -> None:
     manifest_lines = [
         "# crucible section manifest",
         "",
-        f"Source: {SOURCE_FILE.relative_to(ROOT).as_posix()}",
+        "Module-by-module breakdown of `crucible/modules/`:",
         "",
     ]
 
@@ -296,8 +296,7 @@ def main() -> None:
         rendered_files[MODULES_DIR / section["module_file"]] = module_content
 
         manifest_lines.append(
-            f"- `{section['module_file']}`: "
-            f"lines {section['start']}-{section['end']} | {section['description']}"
+            f"- `{section['module_file']}`: {section['description']}"
         )
 
     rendered_files[MODULES_DIR / "__init__.py"] = _build_modules_init()

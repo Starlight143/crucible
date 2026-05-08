@@ -6,6 +6,8 @@ import sys
 import tempfile
 import unittest
 
+import pytest
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
@@ -139,6 +141,7 @@ class TestAuditDependencies(unittest.TestCase):
             self.assertTrue(report.errors, "expected at least one error message")
             self.assertIn("No requirements.txt", report.errors[0])
 
+    @pytest.mark.slow
     def test_persists_report(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             # Create requirements.txt

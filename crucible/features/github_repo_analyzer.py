@@ -59,28 +59,24 @@ except ImportError:  # pragma: no cover
 
 _GITHUB_API = "https://api.github.com"
 
+try:
+    from .. import _env
+except ImportError:  # pragma: no cover - script-mode fallback
+    import _env  # type: ignore[no-redef]
+
+
 def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, ""))
-    except (ValueError, TypeError):
-        return default
+    return _env.env_int(name, default)
 
 def _env_float(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name, ""))
-    except (ValueError, TypeError):
-        return default
+    return _env.env_float(name, default)
 
 _TIMEOUT: float = _env_float("GITHUB_ANALYZER_TIMEOUT", 15.0)
 _MAX_RETRIES: int = _env_int("GITHUB_ANALYZER_MAX_RETRIES", 2)
 
 
 def _env_float_gh(name: str, default: float) -> float:
-    try:
-        v = os.environ.get(name, "")
-        return max(0.0, float(v.strip())) if v.strip() else default
-    except (ValueError, TypeError):
-        return default
+    return _env.env_float(name, default, clamp_min=0.0)
 
 
 _CACHE_TTL: float = _env_float_gh("GITHUB_ANALYZER_CACHE_TTL", 3600.0)

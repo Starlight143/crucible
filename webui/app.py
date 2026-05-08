@@ -35,6 +35,7 @@ import socket
 import sqlite3
 import subprocess
 import sys
+import logging
 import tempfile
 import threading
 import time
@@ -46,6 +47,14 @@ from pathlib import Path
 from typing import Any
 
 from flask import Flask, Response, jsonify, render_template, request, stream_with_context
+
+# ─── Logger ────────────────────────────────────────────────────────────────────
+# Used to record otherwise-silent ``except Exception: pass`` swallows at DEBUG
+# level so that operators investigating mysterious behaviour (e.g. "the
+# dashboard didn't update") can see the swallowed traceback in
+# ``CRUCIBLE_LOG_LEVEL=DEBUG`` mode without changing the swallow's
+# user-visible semantics (still recovers gracefully on the happy path).
+LOGGER = logging.getLogger("crucible.webui")
 
 # ─── Schema version ────────────────────────────────────────────────────────────
 
@@ -60,8 +69,8 @@ SAVED_PROJECTS_DIR = PROJECT_ROOT / "saved_projects"
 ENHANCED_RUNNER    = PROJECT_ROOT / "run_crucible_enhanced.py"
 
 
-# v16.9.73: load ``.env`` into ``os.environ`` so the WebUI process honours
-# the same env vars the spawned ``run_crucible.py`` subprocess
+# Load ``.env`` into ``os.environ`` so the WebUI process honours the same env
+# vars the spawned ``run_crucible.py`` subprocess
 # already does (via ``crucible/runtime_logging._load_dotenv_once``).
 # Without this, settings like ``CRUCIBLE_LOG_LEVEL=DEBUG`` set via the
 # WebUI's "Environment Variables" panel were saved to ``.env`` but never
@@ -176,7 +185,7 @@ def _cleanup_all_runs() -> None:
                 try:
                     proc.terminate()
                 except Exception:
-                    pass
+                    LOGGER.debug("atexit terminate failed for run", exc_info=True)
 
 
 # ─── .env helpers ──────────────────────────────────────────────────────────────
@@ -254,12 +263,12 @@ def _save_env(data: dict[str, str]) -> None:
         raise
 
 
-# v16.9.74: hot-reload of saved .env values into the running WebUI process.
+# Hot-reload of saved .env values into the running WebUI process.
 #
-# Background. v16.9.73 fixed the import-time load of ``.env`` so the initial
-# WebUI launch sees the right values.  The user then surfaced a second gap:
-# after editing settings *via the WebUI* and clicking Save, the in-process
-# ``os.environ`` still held the previous values until the operator killed
+# Background. The import-time ``.env`` load (see ``runtime_logging``) covers the
+# initial WebUI launch.  The remaining gap was: after editing settings *via the
+# WebUI* and clicking Save, the in-process ``os.environ`` still held the
+# previous values until the operator killed
 # the WebUI and started it again.  In particular, the next spawned
 # ``run_crucible.py`` subprocess inherits ``os.environ`` from the
 # WebUI parent (see ``_run_worker``'s ``_child_env = {**os.environ, ...}``)
@@ -482,7 +491,7 @@ def _build_command(payload: dict[str, Any]) -> tuple[list[str], str]:
         "multilang_codegen":     "--multilang-codegen",
         "post_chat":             "--post-chat",
         "agent_metrics":         "--agent-metrics",
-        # v16.8 Quant Analytics Suite
+        # Quant Analytics Suite
         "quant_analytics":       "--quant-analytics",
         "walk_forward":          "--walk-forward",
         "significance_test":     "--significance-test",
@@ -551,9 +560,9 @@ def _build_command(payload: dict[str, Any]) -> tuple[list[str], str]:
         ("librarian_model",       "--librarian-model"),
         ("primary_model",         "--primary-model"),
         ("direction_judge_model", "--direction-judge-model"),
-        # v16.8 Quant Analytics string options
+        # Quant Analytics string options
         ("regime_method",         "--regime-method"),
-        # v16.9 Feature Bundle
+        # Feature Bundle
         ("v169_features",         "--v169-features"),
     ]:
         if flags.get(flag_key):
@@ -605,16 +614,43 @@ def _read_json_file(path: Path) -> dict[str, Any] | None:
                 return None
             return _apply_schema_compat(data)
     except Exception:
-        pass
+        LOGGER.debug("[webui] swallowed exception", exc_info=True)
     return None
 
 
 # ─── SQLite run index ───────────────────────────────────────────────────────────
+#
+# v1.0.3: Thread-local connection cache.  Previously every API route opened a
+# new ``sqlite3.connect`` on each request, which under Flask's multi-threaded
+# dev server (and gunicorn worker pool) re-executed all the schema-bootstrap
+# DDL on every call — wasted work plus per-call connection overhead.  The
+# cache below scopes one connection per worker thread; idempotent
+# ``CREATE TABLE IF NOT EXISTS`` / ``ALTER TABLE`` statements still run once
+# per thread to bootstrap the schema, but every subsequent request reuses
+# the warm connection.
+#
+# SQLite connections are explicitly **not** thread-safe (the underlying
+# ``sqlite3`` module raises ``ProgrammingError`` on cross-thread reuse), so
+# ``threading.local()`` is the correct primitive: each worker thread gets its
+# own independent connection.  WAL mode lets concurrent readers and a single
+# writer make progress, and ``busy_timeout=20s`` on each connection absorbs
+# transient lock contention.
+#
+# ``conn.close()`` is no longer called by request handlers — connections
+# survive for the lifetime of the worker thread and are reaped at process
+# exit by the ``atexit`` hook below.  Tests that need a clean slate can call
+# :func:`_reset_db_threadlocal` between cases.
 
-def _ensure_db() -> sqlite3.Connection:
-    """Open (creating if necessary) the SQLite run index database."""
-    _RUN_INDEX_DIR.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(_RUN_INDEX_DB), timeout=10)
+_DB_TLS = threading.local()
+
+
+def _bootstrap_db_schema(conn: sqlite3.Connection) -> None:
+    """Run idempotent DDL on a freshly-opened connection.
+
+    Called once per thread (from :func:`_ensure_db` on first use).  Every
+    statement here must be safe to re-run if a future thread inherits an
+    already-bootstrapped database file.
+    """
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA busy_timeout=20000")
     conn.execute("""
@@ -665,9 +701,64 @@ def _ensure_db() -> sqlite3.Connection:
             error_msg   TEXT
         )
     """)
-
     conn.commit()
+
+
+def _ensure_db() -> sqlite3.Connection:
+    """Return the per-thread SQLite connection, opening + bootstrapping on first use.
+
+    Subsequent calls within the same thread return the cached connection
+    without re-running DDL.  Callers must **not** ``conn.close()`` the
+    returned object — it is shared with future requests on the same worker
+    thread and is closed at interpreter shutdown.
+    """
+    cached: sqlite3.Connection | None = getattr(_DB_TLS, "conn", None)
+    if cached is not None:
+        return cached
+    _RUN_INDEX_DIR.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(_RUN_INDEX_DB), timeout=10)
+    try:
+        _bootstrap_db_schema(conn)
+    except Exception:
+        # If bootstrap fails do not cache the half-initialised handle — the
+        # next request will retry from scratch on a fresh connection.
+        try:
+            conn.close()
+        except Exception:
+            LOGGER.debug("[webui] swallowed exception", exc_info=True)
+        raise
+    _DB_TLS.conn = conn
     return conn
+
+
+def _reset_db_threadlocal() -> None:
+    """Close + drop the cached thread-local connection (test fixture helper).
+
+    Production code should never call this — connections live for the
+    thread's full lifetime.  Tests that swap out ``_RUN_INDEX_DB`` between
+    cases need a clean handle, hence the public helper.
+    """
+    cached: sqlite3.Connection | None = getattr(_DB_TLS, "conn", None)
+    if cached is None:
+        return
+    try:
+        cached.close()
+    except Exception:
+        LOGGER.debug("[webui] swallowed exception", exc_info=True)
+    if hasattr(_DB_TLS, "conn"):
+        del _DB_TLS.conn
+
+
+@atexit.register
+def _close_db_at_exit() -> None:
+    """Close the bootstrap thread's connection cleanly at interpreter exit.
+
+    Worker-thread connections held in their own ``threading.local`` slots
+    are closed by the OS when the threads terminate; we only get the
+    main / current-thread slot here.  Best-effort — failures must never
+    block process shutdown.
+    """
+    _reset_db_threadlocal()
 
 
 def _extract_run_row(d: Path) -> dict[str, Any]:
@@ -835,9 +926,9 @@ def _sync_run_index() -> None:
                         try:
                             _record_run_cost(float(row["cost"]), conn=conn)
                         except Exception:
-                            pass
+                            LOGGER.debug("[webui] swallowed exception", exc_info=True)
                 except Exception:
-                    pass  # Skip this run; continue syncing others
+                    LOGGER.debug("[webui] swallowed exception", exc_info=True)  # Skip this run; continue syncing others
 
             # Delete rows for directories that no longer exist
             stale = set(existing.keys()) - set(dirs.keys())
@@ -855,10 +946,8 @@ def _sync_run_index() -> None:
             try:
                 conn.rollback()
             except Exception:
-                pass
+                LOGGER.debug("[webui] swallowed exception", exc_info=True)
             raise
-        finally:
-            conn.close()
         _last_sync_time = time.time()
     except Exception:
         # Non-fatal: fall back to filesystem scan.
@@ -887,22 +976,21 @@ def _record_run_cost(cost: float, conn: sqlite3.Connection | None = None) -> Non
     own_conn = conn is None
     if own_conn:
         conn = _ensure_db()
-    try:
-        conn.execute(
-            """
-            INSERT INTO budget_daily (date, total_cost, run_count)
-            VALUES (?, ?, 1)
-            ON CONFLICT(date) DO UPDATE SET
-                total_cost = total_cost + excluded.total_cost,
-                run_count  = run_count  + 1
-            """,
-            (today, float(cost)),
-        )
-        if own_conn:
-            conn.commit()
-    finally:
-        if own_conn:
-            conn.close()
+    conn.execute(
+        """
+        INSERT INTO budget_daily (date, total_cost, run_count)
+        VALUES (?, ?, 1)
+        ON CONFLICT(date) DO UPDATE SET
+            total_cost = total_cost + excluded.total_cost,
+            run_count  = run_count  + 1
+        """,
+        (today, float(cost)),
+    )
+    if own_conn:
+        # v1.0.3: connection is now thread-local-cached; we keep the commit
+        # here for the *own_conn* branch since callers in the supplied-conn
+        # branch are still expected to commit at their own checkpoint.
+        conn.commit()
 
 
 # ─── Filesystem helpers ───────────────────────────────────────────────────────
@@ -931,29 +1019,26 @@ def _scan_saved_runs(
     try:
         _sync_run_index()
         conn = _ensure_db()
-        try:
-            clauses: list[str] = []
-            params: list[Any] = []
-            if query:
-                clauses.append("run_id LIKE ?")
-                params.append(f"%{query}%")
-            if mode:
-                clauses.append("LOWER(mode) = ?")
-                params.append(mode.lower())
-            where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-            rows = conn.execute(
-                f"""
-                SELECT run_id, mtime, cost, tokens, quality, mode, provider, timestamp,
-                       has_backtest, sharpe, drawdown, total_return
-                FROM runs
-                {where}
-                ORDER BY mtime DESC
-                LIMIT ?
-                """,
-                params + [limit],
-            ).fetchall()
-        finally:
-            conn.close()
+        clauses: list[str] = []
+        params: list[Any] = []
+        if query:
+            clauses.append("run_id LIKE ?")
+            params.append(f"%{query}%")
+        if mode:
+            clauses.append("LOWER(mode) = ?")
+            params.append(mode.lower())
+        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = conn.execute(
+            f"""
+            SELECT run_id, mtime, cost, tokens, quality, mode, provider, timestamp,
+                   has_backtest, sharpe, drawdown, total_return
+            FROM runs
+            {where}
+            ORDER BY mtime DESC
+            LIMIT ?
+            """,
+            params + [limit],
+        ).fetchall()
 
         result: list[dict[str, Any]] = []
         for row in rows:
@@ -1045,8 +1130,8 @@ def api_set_env():
         _save_env(data)
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
-    # v16.9.74: hot-reload the saved values into this process's os.environ
-    # so the change takes effect without a WebUI restart.  Subsequent
+    # Hot-reload the saved values into this process's os.environ so the
+    # change takes effect without a WebUI restart.  Subsequent
     # subprocess spawns inherit os.environ via ``_child_env``, so the
     # next pipeline run picks up the new settings immediately.  We do
     # this *after* ``_save_env`` succeeds so a failed file write never
@@ -1253,11 +1338,11 @@ def _run_worker(run_id: str, cmd: list[str], stdin_text: str) -> None:
             try:
                 proc.stdin.close()
             except Exception:
-                pass
+                LOGGER.debug("[webui] swallowed exception", exc_info=True)
             try:
                 proc.stdout.close()
             except Exception:
-                pass
+                LOGGER.debug("[webui] swallowed exception", exc_info=True)
 
 
 # ── Run management ────────────────────────────────────────────────────────────
@@ -1464,7 +1549,7 @@ def api_kill_run(run_id: str):
         try:
             proc_to_kill.terminate()
         except Exception:
-            pass
+            LOGGER.debug("[webui] swallowed exception", exc_info=True)
     return jsonify({"success": True})
 
 
@@ -1904,7 +1989,7 @@ def api_run_signal(run_id: str):
     # could inject multiple stdin answers in a single signal call (one per
     # embedded \n), bypassing the per-prompt awaiting_input gate and confusing
     # pipeline state. This mirrors the same guard applied in _build_command
-    # (v16.9.67) for the project_path / idea inputs.  Length capped at 4096
+    # for the project_path / idea inputs.  Length capped at 4096
     # to prevent a single signal from monopolising the pipe buffer.
     if any(ch in text for ch in ("\n", "\r", "\x00")):
         return jsonify({"error": "text must not contain newline or null bytes"}), 400
@@ -2280,7 +2365,7 @@ def api_backtest_chart(run_id: str):
                             except (TypeError, ValueError):
                                 pass
         except Exception:
-            pass
+            LOGGER.debug("[webui] swallowed exception", exc_info=True)
         if equity_curve:
             break
 
@@ -2504,7 +2589,7 @@ def api_budget_status():
     }
 
     The three ``*_limit`` fields are surfaced so the front-end budget bar can
-    render the configured cap (v16.9.69 alignment fix — previously the UI read
+    render the configured cap (UI<->backend alignment: previously the UI read
     ``data.daily_limit`` but the backend only returned the aggregates, leaving
     the cap badge / progress fill as dead UI).  ``null`` means "no cap set".
     """
@@ -2513,23 +2598,21 @@ def api_budget_status():
 
     try:
         conn = _ensure_db()
-        try:
-            def _agg(where: str, param: str) -> dict[str, Any]:
-                row = conn.execute(
-                    f"SELECT COALESCE(SUM(total_cost),0), COALESCE(SUM(run_count),0) "
-                    f"FROM budget_daily WHERE {where}",
-                    (param,),
-                ).fetchone()
-                return {"cost": round(float(row[0]), 6), "run_count": int(row[1])}
 
-            today_data    = _agg("date = ?", today_str)
-            month_data    = _agg("date LIKE ?", month_str + "%")
-            all_time_row  = conn.execute(
-                "SELECT COALESCE(SUM(total_cost),0), COALESCE(SUM(run_count),0) FROM budget_daily"
+        def _agg(where: str, param: str) -> dict[str, Any]:
+            row = conn.execute(
+                f"SELECT COALESCE(SUM(total_cost),0), COALESCE(SUM(run_count),0) "
+                f"FROM budget_daily WHERE {where}",
+                (param,),
             ).fetchone()
-            all_time_data = {"cost": round(float(all_time_row[0]), 6), "run_count": int(all_time_row[1])}
-        finally:
-            conn.close()
+            return {"cost": round(float(row[0]), 6), "run_count": int(row[1])}
+
+        today_data    = _agg("date = ?", today_str)
+        month_data    = _agg("date LIKE ?", month_str + "%")
+        all_time_row  = conn.execute(
+            "SELECT COALESCE(SUM(total_cost),0), COALESCE(SUM(run_count),0) FROM budget_daily"
+        ).fetchone()
+        all_time_data = {"cost": round(float(all_time_row[0]), 6), "run_count": int(all_time_row[1])}
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
@@ -2615,20 +2698,17 @@ def _send_notification_with_retry(
         try:
             with _webhook_history_lock:
                 conn = _ensure_db()
-                try:
-                    conn.execute(
-                        """
-                        INSERT INTO webhook_history (ts, url, status_code, success, attempt, error_msg)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                        """,
-                        (ts, url, status_code if status_code != -1 else None,
-                         1 if attempt_success else 0, attempt, error_msg),
-                    )
-                    conn.commit()
-                finally:
-                    conn.close()
+                conn.execute(
+                    """
+                    INSERT INTO webhook_history (ts, url, status_code, success, attempt, error_msg)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    """,
+                    (ts, url, status_code if status_code != -1 else None,
+                     1 if attempt_success else 0, attempt, error_msg),
+                )
+                conn.commit()
         except Exception:
-            pass  # DB write failure must not abort the retry loop
+            LOGGER.debug("[webui] swallowed exception", exc_info=True)  # DB write failure must not abort the retry loop
 
         if attempt_success:
             success = True
@@ -2676,17 +2756,14 @@ def api_webhook_history():
     """
     try:
         conn = _ensure_db()
-        try:
-            rows = conn.execute(
-                """
-                SELECT id, ts, url, status_code, success, attempt, error_msg
-                FROM webhook_history
-                ORDER BY ts DESC
-                LIMIT 50
-                """
-            ).fetchall()
-        finally:
-            conn.close()
+        rows = conn.execute(
+            """
+            SELECT id, ts, url, status_code, success, attempt, error_msg
+            FROM webhook_history
+            ORDER BY ts DESC
+            LIMIT 50
+            """
+        ).fetchall()
     except Exception as exc:
         return jsonify({"error": str(exc)}), 500
 
@@ -2705,7 +2782,7 @@ def api_webhook_history():
     return jsonify({"history": history})
 
 
-# ─── v16.9 Feature 11: Multi-project comparison ───────────────────────────────
+# ─── Feature: Multi-project comparison ────────────────────────────────────────
 
 @app.route("/api/v169/compare")
 def api_v169_compare():
@@ -2800,7 +2877,7 @@ def api_v169_compare():
     return jsonify({"runs": runs_data, "summary": summary})
 
 
-# ─── v16.9 Feature 12: Prometheus metrics endpoint ───────────────────────────
+# ─── Feature: Prometheus metrics endpoint ─────────────────────────────────────
 
 @app.route("/api/v169/metrics")
 def api_v169_metrics():
@@ -2846,7 +2923,7 @@ def api_v169_metrics():
         return Response(f"# Error generating metrics: {exc}\n", mimetype="text/plain")
 
 
-# ─── v16.9 Feature 13: Grafana dashboard download ────────────────────────────
+# ─── Feature: Grafana dashboard download ──────────────────────────────────────
 
 @app.route("/api/v169/grafana-dashboard")
 def api_v169_grafana_dashboard():

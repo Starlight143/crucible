@@ -242,6 +242,9 @@ class HookRegistry:
                 lock = self._stage_locks[stage]
         if not hooks:
             return []
+        # When ``hooks`` is non-empty, the registry block above guarantees
+        # ``lock`` is set — assert it here so mypy can narrow ``Optional``.
+        assert lock is not None
 
         use_timeout = hook_timeout_seconds is not None and hook_timeout_seconds > 0
 

@@ -34,32 +34,23 @@ _log = logging.getLogger(__name__)
 
 # ── Env helpers ───────────────────────────────────────────────────────────────
 
+try:
+    from .. import _env
+except ImportError:  # pragma: no cover - script-mode fallback
+    import _env  # type: ignore[no-redef]
+
+
 def _env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name, "").strip().lower()
-    if raw in ("1", "true", "yes", "on"):
-        return True
-    if raw in ("0", "false", "no", "off"):
-        return False
-    return default
+    return _env.env_bool(name, default)
 
 def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, ""))
-    except (ValueError, TypeError):
-        return default
+    return _env.env_int(name, default)
 
 def _env_float(name: str, default: float) -> float:
-    import math as _math
-    try:
-        val = float(os.environ.get(name, ""))
-    except (ValueError, TypeError):
-        return default
-    # Reject NaN and Inf — they propagate silently into configs and break
-    # threshold comparisons (e.g. z_threshold=NaN makes everything False).
-    return val if _math.isfinite(val) else default
+    return _env.env_float(name, default, finite_only=True)
 
 def _env_str(name: str, default: str) -> str:
-    return os.environ.get(name, default)
+    return _env.env_str_passthrough(name, default)
 
 
 # ── Data models ───────────────────────────────────────────────────────────────
@@ -169,7 +160,7 @@ def _pearson_r(x: List[float], y: List[float]) -> float:
     if not (sx > 1e-14) or not (sy > 1e-14):
         return 0.0
     raw = cov / (sx * sy)
-    # v16.9.73: NaN-aware clamp — same fix as dynamic_correlation.py.
+    # NaN-aware clamp — same pattern as dynamic_correlation.py.
     # The naive ``max(-1, min(1, nan))`` is order-sensitive in Python
     # and can silently leak NaN into the correlation result when an
     # intermediate ``_covariance`` / ``_mean`` propagates NaN from a

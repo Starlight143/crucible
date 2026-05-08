@@ -1,5 +1,5 @@
-# Auto-generated from OLD_version/crucible_v14.py.
-# Import-based section module. Do not edit manually; regenerate from V14.
+# Auto-generated section module — do not edit manually.
+# Regenerate via ``python -m crucible.generate``.
 from __future__ import annotations
 
 from . import section_00_bootstrap_and_utils as _prev_00
@@ -964,7 +964,7 @@ def _tokenize_for_grounding(text: str) -> Set[str]:
        URLs, indicator codes, etc.  Behaviour is unchanged from older
        releases so that English / mixed-language runs keep their existing
        grounding scores.
-    2. CJK shingles (added in v16.9.71): Chinese / Japanese / Korean text
+    2. CJK shingles: Chinese / Japanese / Korean text
        has no whitespace word boundaries, so the ASCII regex above produces
        an empty set for any pure-CJK claim.  Without this pass a Traditional
        Chinese run produced ``grounded_claims=0`` for every Chinese claim,
@@ -2766,14 +2766,13 @@ def _github_api_headers(*, accept: str) -> Dict[str, str]:
 
 
 def _search_github_repositories(query: str) -> List[ResearchCitation]:
-    # v16.9.72: skip entirely when no GITHUB_TOKEN is configured.  The
+    # Skip entirely when no GITHUB_TOKEN is configured.  The
     # ``/search/repositories`` endpoint allows anonymous calls but the
     # quota is only **10 req/hr** (vs 30 req/min when authenticated), and
     # a single librarian run easily exhausts it — every subsequent
     # repo-search call returns 403 ``rate limit exceeded`` and the
-    # transport error string previously polluted ``key_risks`` (see fix
-    # #4 in v16.9.72).  Mirroring the guard already in
-    # :func:`_search_github_code`.
+    # transport error string would otherwise pollute ``key_risks``.
+    # Mirrors the guard already in :func:`_search_github_code`.
     if not _resolve_github_token():
         return []
     # The GitHub Repositories API does not support web-search-style `site:`
@@ -3336,8 +3335,8 @@ def _build_fallback_research_context(
     summary_bits = _dedupe_text_items(snippet_samples, limit=3) or [
         "No external evidence retrieved; downstream debate should treat unknowns as high-risk."
     ]
-    # v16.9.72: previously we populated ``key_risks`` from
-    # ``provider_errors.values()`` — that meant raw HTTP error strings
+    # ``key_risks`` is intentionally NOT sourced from
+    # ``provider_errors.values()`` — doing so would inject raw HTTP error strings
     # (e.g. ``"Client error '429 Too Many Requests'…"``,
     # ``"Circuit breaker '…' is open after 3 failures."``) were injected as
     # product-level risks and read verbatim by every downstream debate
@@ -4400,9 +4399,9 @@ def _should_force_direction_none(
         for unknown in list(item.decision_critical_unknowns or []):
             if unknown not in gap_info["critical_unknowns"]:
                 gap_info["critical_unknowns"].append(unknown)
-    # v16.9.72 defence-in-depth: the legacy condition fired whenever
-    # ``max(scores) <= 12 AND grounded_claims < 3`` — but ``grounded_claims``
-    # comes from the ASCII-grounding tokenizer counter in
+    # Defence-in-depth: a naive ``max(scores) <= 12 AND grounded_claims < 3``
+    # condition would under-count, because ``grounded_claims`` comes from the
+    # ASCII-grounding tokenizer counter in
     # ``_stabilize_research_context``, which under-counts when the
     # synthesizer produced ``claim_attributions`` directly (the structured
     # attribution path bypasses the tokenizer counter).  Treat any of
@@ -4827,10 +4826,9 @@ def _research_task_callback(task_output: Any) -> None:
 
     Defined at module scope (not as a closure inside
     :func:`build_research_swarm_crew`) so pydantic can serialise the Crew
-    object during checkpointing — the legacy closure form emitted
+    object during checkpointing — a closure form would emit
     ``UserWarning: function callbacks cannot be serialized and will
-    prevent checkpointing`` on every research kickoff (regression
-    introduced in v16.9.70, fixed in v16.9.72).
+    prevent checkpointing`` on every research kickoff.
     """
     try:
         task_name = ""
@@ -4960,7 +4958,7 @@ def build_research_swarm_crew(
     # module scope (NOT a closure) so that pydantic's checkpoint
     # serialiser can pickle the Crew — closures emit
     # `function callbacks cannot be serialized and will prevent
-    # checkpointing` (UserWarning, see v16.9.72 fix).
+    # checkpointing` (UserWarning).
     crew = Crew(
         agents=[
             agents["market_research"],

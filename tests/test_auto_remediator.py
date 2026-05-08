@@ -94,7 +94,7 @@ class TestIsValidPython(unittest.TestCase):
 
 class TestSyntaxErrorDetail(unittest.TestCase):
     """
-    Regression (v16.0.9): test_generator._syntax_error_detail captures and
+    Regression: test_generator._syntax_error_detail captures and
     returns the SyntaxError message so error reports include the actual error
     instead of a generic "has persistent syntax errors" string.
     """
@@ -293,7 +293,7 @@ class TestRemediateRun(unittest.TestCase):
 
 class TestValidationIssueNoRetry(unittest.TestCase):
     """
-    Regression (v16.0.9): validation issues were re-collected from the same
+    Regression: validation issues were re-collected from the same
     stale JSON every round, causing the same files to be re-patched up to
     max_rounds times even after the issues were already addressed.
 
@@ -340,7 +340,7 @@ class TestValidationIssueNoRetry(unittest.TestCase):
 
     def test_severity_normalization_consistent(self) -> None:
         """
-        Regression (v16.0.9): _collect_validation_issues used .lower() while
+        Regression: _collect_validation_issues used .lower() while
         _collect_security_issues used .upper() for severity comparison.
         Now both use .upper(). Both 'HIGH' and 'high' inputs must be collected.
         """

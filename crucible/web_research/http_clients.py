@@ -8,12 +8,12 @@ from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 import httpx
 
 if __package__ == "crucible.web_research":
-    from ..resilience import execute_with_retry
     from ..http_retry import is_http_retryable
+    from ..resilience import execute_with_retry
     from ..runtime_logging import get_logger
 else:  # pragma: no cover - direct script fallback
-    from resilience import execute_with_retry  # type: ignore[no-redef]
     from http_retry import is_http_retryable  # type: ignore[no-redef]
+    from resilience import execute_with_retry  # type: ignore[no-redef]
     from runtime_logging import get_logger  # type: ignore[no-redef]
 
 LOGGER = get_logger(__name__)

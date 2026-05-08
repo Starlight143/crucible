@@ -32,8 +32,8 @@ prompt_ab_test           – Prompt A/B testing: compare two pipeline variant ou
 external_data_connectors – External market data connectors (Alpha Vantage, CoinGecko, FRED).
 run_deduplication        – Semantic run deduplication via TF-IDF cosine similarity.
 
-v16.2.1 additions
------------------
+Extended modules
+----------------
 document_ingestion       – RAG-style injection of local PDF/Markdown/TXT/DOCX files
                            into pipeline research context.
 github_repo_analyzer     – Deep GitHub repository analysis (README, issues, PRs, commits)
@@ -49,8 +49,8 @@ prompt_version_tracker   – SQLite-backed prompt version registry with per-run 
 agent_metrics            – Agent performance metrics dashboard: aggregates historical
                            run quality stats per project with sparkline scores.
 
-v16.6.1 additions
------------------
+Portfolio + tracking modules
+----------------------------
 portfolio_backtest       – Portfolio-level backtesting: combine multiple strategy runs
                            into a weighted portfolio and compute aggregate risk metrics
                            (Sharpe, Sortino, Calmar, max drawdown, correlation matrix).
@@ -88,7 +88,7 @@ __all__ = [
     "prompt_ab_test",
     "external_data_connectors",
     "run_deduplication",
-    # v16.2.1
+    # Extended modules
     "document_ingestion",
     "github_repo_analyzer",
     "project_profile",
@@ -96,7 +96,7 @@ __all__ = [
     "multilang_codegen",
     "prompt_version_tracker",
     "agent_metrics",
-    # v16.6.1
+    # Portfolio + tracking
     "portfolio_backtest",
     "mlflow_sink",
     "backtest_runner",

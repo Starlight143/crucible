@@ -125,6 +125,7 @@ class TestWithHttpRetryDecorator:
 
         assert fn() == "result"
 
+    @pytest.mark.slow
     def test_retries_transient_error(self):
         call_count = [0]
 

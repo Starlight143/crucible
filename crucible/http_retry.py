@@ -43,7 +43,6 @@ from __future__ import annotations
 
 import functools
 import json as _json
-import os
 from dataclasses import dataclass
 from typing import Any, Callable, Optional, Tuple, Type
 
@@ -67,23 +66,21 @@ _DEFAULT_TIMEOUT_SECONDS = 30
 _DEFAULT_MAX_BYTES = 2 * 1024 * 1024   # 2 MB
 
 
+try:
+    from . import _env
+except ImportError:  # pragma: no cover - script-mode fallback
+    import _env  # type: ignore[no-redef]
+
+
 def _env_int(name: str, default: int) -> int:
-    try:
-        v = os.environ.get(name, "")
-        # Do not clamp to max(1, ...) here: callers that require positive values
-        # (e.g. max_attempts) clamp independently.  Clamping unconditionally blocks
-        # 0 as a valid "no-limit" or "disabled" env override (e.g. max_bytes=0).
-        return int(v) if v.strip() else default
-    except (ValueError, TypeError):
-        return default
+    # Do not clamp to >=1 here: callers that require positive values clamp
+    # independently. Allowing 0 preserves "no-limit" / disabled overrides
+    # such as max_bytes=0.
+    return _env.env_int(name, default)
 
 
 def _env_float(name: str, default: float) -> float:
-    try:
-        v = os.environ.get(name, "")
-        return float(v) if v.strip() else default
-    except (ValueError, TypeError):
-        return default
+    return _env.env_float(name, default)
 
 
 # ── Retry predicate ───────────────────────────────────────────────────────────
@@ -284,7 +281,7 @@ def safe_get(
         When True, parse response as JSON and return the decoded object.
     """
     try:
-        import httpx  # type: ignore
+        import httpx
     except ImportError:  # pragma: no cover
         LOGGER.warning("safe_get: httpx not installed — install httpx to use safe_get.")
         return None
@@ -343,7 +340,7 @@ def safe_post(
     Falls back to ``None`` on permanent failure.
     """
     try:
-        import httpx  # type: ignore
+        import httpx
     except ImportError:  # pragma: no cover
         LOGGER.warning("safe_post: httpx not installed.")
         return None

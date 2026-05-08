@@ -1,5 +1,5 @@
-# Auto-generated from OLD_version/crucible_v14.py.
-# Import-based section module. Do not edit manually; regenerate from V14.
+# Auto-generated section module — do not edit manually.
+# Regenerate via ``python -m crucible.generate``.
 from __future__ import annotations
 import argparse
 import ast
@@ -675,46 +675,34 @@ def fmt_limit(value: Optional[int]) -> str:
     return "unlimited" if value is None else str(value)
 
 
+# v1.0.3: ``_env`` is the project-wide centralised env-parsing module.
+# This file is loaded under three different module-resolution shapes
+# (regular package import, runtime-loader exec, script-mode entrypoint), so
+# the import has to tolerate all three:
+#   1. Normal package: ``from .. import _env`` succeeds.
+#   2. Script-mode (``python crucible/__main__.py``): no parent package, so
+#      relative imports raise ``ImportError``.  Fall back to a top-level
+#      ``crucible._env`` lookup once ``crucible/`` is on ``sys.path``.
+#   3. Runtime-loader exec (``module_runtime`` synthesises ``crucible``
+#      from individual section files): the ``crucible`` package is already
+#      registered, so ``importlib.import_module`` resolves cleanly.
+try:
+    from .. import _env  # type: ignore[no-redef]
+except ImportError:  # pragma: no cover - script-mode fallback
+    import importlib
+    _env = importlib.import_module("crucible._env")  # type: ignore[no-redef]
+
+
 def _env_int(name: str, default: Optional[int]) -> Optional[int]:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    raw = raw.strip()
-    if not raw:
-        return default
-    if raw.lower() in ("none", "null", "unlimited", "inf", "infinite"):
-        return None
-    try:
-        return int(raw)
-    except ValueError:
-        return default
+    return _env.env_optional_int(name, default)
 
 
 def _env_float(name: str, default: Optional[float]) -> Optional[float]:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    raw = raw.strip()
-    if not raw:
-        return default
-    if raw.lower() in ("none", "null", "unlimited", "inf", "infinite"):
-        return None
-    try:
-        return float(raw)
-    except ValueError:
-        return default
+    return _env.env_optional_float(name, default)
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    raw = raw.strip().lower()
-    if raw in ("1", "true", "yes", "y", "on"):
-        return True
-    if raw in ("0", "false", "no", "n", "off"):
-        return False
-    return default
+    return _env.env_bool(name, default, extended=True)
 
 
 def _resolve_env_setting(

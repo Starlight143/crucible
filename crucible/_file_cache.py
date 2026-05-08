@@ -51,12 +51,14 @@ from typing import Dict, Optional, Tuple, Union
 _DEFAULT_MAX_ENTRIES = 128
 
 
+try:
+    from . import _env
+except ImportError:  # pragma: no cover - script-mode fallback
+    import _env  # type: ignore[no-redef]
+
+
 def _env_int(name: str, default: int) -> int:
-    try:
-        v = os.environ.get(name, "")
-        return max(1, int(v)) if v.strip() else default
-    except (ValueError, TypeError):
-        return default
+    return _env.env_int(name, default, clamp_min=1)
 
 
 # ── Cache entry ───────────────────────────────────────────────────────────────

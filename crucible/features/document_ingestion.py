@@ -70,11 +70,14 @@ except ImportError:
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 
+try:
+    from .. import _env
+except ImportError:  # pragma: no cover - script-mode fallback
+    import _env  # type: ignore[no-redef]
+
+
 def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, ""))
-    except (ValueError, TypeError):
-        return default
+    return _env.env_int(name, default)
 
 
 _MAX_DOC_CHARS: int = _env_int("DOCUMENT_INGESTION_MAX_CHARS", 8_000)

@@ -188,7 +188,7 @@ class TestExtractJsonFromResponse(unittest.TestCase):
 
     def test_brace_in_string_value_parsed_correctly(self) -> None:
         """
-        Regression (v16.0.11): the forward brace-scan fallback did not track
+        Regression: the forward brace-scan fallback did not track
         string context.  A '}' or '{' inside a JSON string value corrupted the
         depth counter, causing mis-detection of the JSON boundary and a
         spurious json.JSONDecodeError → returning None instead of the dict.
@@ -623,7 +623,7 @@ class TestAdversarialReview(unittest.TestCase):
 
 class TestAdversarialVerdictPreserved(unittest.TestCase):
     """
-    Regression (v16.0.11): the verdict returned by _adversarial_review() was
+    Regression: the verdict returned by _adversarial_review() was
     discarded with '_'.  IndependentValidationReport had no adversarial_verdict
     field, so an LLM "fail" judgment was silently dropped even when all individual
     findings were medium/low severity, causing the overall_verdict to stay at
@@ -903,7 +903,7 @@ class TestValidateRun(unittest.TestCase):
 
 class TestPytestPythonPath(unittest.TestCase):
     """
-    Regression (v16.0.9): _run_pytest_suite passed run_dir to _make_safe_env()
+    Regression: _run_pytest_suite passed run_dir to _make_safe_env()
     instead of run_dir/code/, so PYTHONPATH did not include the generated code
     root.  Tests that import from sibling modules failed with ModuleNotFoundError
     when no conftest.py was present to add the path manually.

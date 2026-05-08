@@ -58,11 +58,14 @@ from typing import Any, Dict, List, Optional
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
+try:
+    from .. import _env
+except ImportError:  # pragma: no cover - script-mode fallback
+    import _env  # type: ignore[no-redef]
+
+
 def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, ""))
-    except (ValueError, TypeError):
-        return default
+    return _env.env_int(name, default)
 
 
 _CONTEXT_CHARS: int = _env_int("POST_CHAT_CONTEXT_CHARS", 12_000)

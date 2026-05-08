@@ -1,5 +1,5 @@
-# Auto-generated from OLD_version/crucible_v14.py.
-# Import-based section module. Do not edit manually; regenerate from V14.
+# Auto-generated section module — do not edit manually.
+# Regenerate via ``python -m crucible.generate``.
 from __future__ import annotations
 
 from . import section_00_bootstrap_and_utils as _prev_00
@@ -232,10 +232,10 @@ def _analyst_task_callback(task_output: Any) -> None:
 
     Defined at module scope (not as a closure inside
     :func:`build_analysis_crew`) so pydantic can serialise the Crew
-    object during checkpointing — the legacy closure form emitted
+    object during checkpointing — a closure form would emit
     ``UserWarning: function callbacks cannot be serialized and will
-    prevent checkpointing`` on every analysis kickoff.  Fixed in v16.9.72
-    along with the symmetric ``_research_task_callback`` in
+    prevent checkpointing`` on every analysis kickoff.  Symmetric with
+    ``_research_task_callback`` in
     :mod:`crucible.modules.section_04_web_research_and_direction`.
     """
     try:
@@ -322,8 +322,7 @@ def build_analysis_crew(
         # closure here) so pydantic's checkpoint serialiser can pickle the
         # Crew object \u2014 closures emit `UserWarning: function callbacks
         # cannot be serialized and will prevent checkpointing` on every
-        # crew kickoff (regression introduced in v16.9.70 by the
-        # symmetric research-swarm callback, fixed in v16.9.72).
+        # crew kickoff.
         task_callback=_analyst_task_callback,
     )
     prompt_hashes = _compute_task_prompt_hashes(

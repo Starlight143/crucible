@@ -4,6 +4,8 @@ import sys
 import unittest
 from unittest import mock
 
+import pytest
+
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
@@ -174,6 +176,7 @@ class TestResilience(unittest.TestCase):
         self.assertEqual(DEFAULT_KICKOFF_RETRY_ATTEMPTS, 20)
         self.assertEqual(DEFAULT_KICKOFF_RETRY_BACKOFF_SECONDS, 2.0)
 
+    @pytest.mark.slow
     def test_kickoff_crew_with_retry_uses_attached_policy(self) -> None:
         crew = _FakeCrew()
         result = kickoff_crew_with_retry(crew)

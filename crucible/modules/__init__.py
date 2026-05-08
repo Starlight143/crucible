@@ -1,4 +1,4 @@
-"""Import-based section modules generated from OLD_version/crucible_v14.py."""
+"""Import-based section modules — auto-generated; do not edit by hand."""
 
 __all__ = [
     "section_00_bootstrap_and_utils",

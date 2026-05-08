@@ -67,7 +67,7 @@ watchdog
 # Install if using MLFLOW_TRACKING_URI
 mlflow
 
-# --- Optional — v16.8 Quant Analytics Suite ----------------------------------
+# --- Optional — Quant Analytics Suite ----------------------------------------
 # All fall back to pure-stdlib implementations if absent.
 scipy            # improves statistical significance tests (t-dist CDF, normal CDF)
 statsmodels      # used by factor_analyzer for OLS diagnostics if available
@@ -83,7 +83,7 @@ opentelemetry-exporter-otlp
 # --- Optional — web UI -------------------------------------------------------
 flask
 
-# --- Optional — v16.9 new features -------------------------------------------
+# --- Optional — extended feature modules -------------------------------------
 # scheduler.py: built-in APScheduler job scheduling
 APScheduler
 

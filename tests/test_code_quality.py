@@ -282,7 +282,7 @@ class TestAnalyseCodeQuality(unittest.TestCase):
 
 class TestParamCountComprehensive(unittest.TestCase):
     """
-    Regression (v16.0.10): param_count only counted len(node.args.args),
+    Regression: param_count only counted len(node.args.args),
     which is positional/positional-or-keyword arguments only.  Functions
     that express complexity via *args, keyword-only, or **kwargs parameters
     were under-counted, producing false-negative param threshold warnings.

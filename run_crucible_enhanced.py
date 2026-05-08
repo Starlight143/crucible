@@ -28,7 +28,7 @@ Extends the core pipeline with:
   - Run comparison                (compare subcommand)
   - Post-process existing run     (postprocess subcommand)
   - Prompt A/B testing            (abtest subcommand)
-  - v16.9 feature bundle          (--v169-features LIST)
+  - Feature bundle                (--v169-features LIST)
 
 When called WITHOUT a subcommand all arguments are forwarded to the original
 ``run_crucible.py`` pipeline unchanged (fully backward-compatible).
@@ -63,12 +63,20 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import List, Optional
+
+# Module logger used to record otherwise-silent ``except Exception: pass``
+# swallows at DEBUG level — operators investigating mysterious recoveries
+# (e.g. "the analysis result was empty") can trace the swallowed traceback
+# under ``CRUCIBLE_LOG_LEVEL=DEBUG`` without the swallow's user-visible
+# semantics changing on the happy path.
+LOGGER = logging.getLogger("crucible.runner")
 
 # Ensure the package root is importable regardless of CWD
 _REPO_ROOT = Path(__file__).resolve().parent
@@ -133,42 +141,26 @@ def _try_get_llm():
 # ── Environment variable helpers ─────────────────────────────────────────────
 # These allow the documented ENHANCED_* env vars to override argparse defaults.
 
-def _env_bool(var: str, default: bool) -> bool:
-    """Read a boolean env var.  Falsy values: ``0``, ``false``, ``no``, ``off``.
+from crucible import _env
 
-    An empty string (``VAR=``) is treated as *unset* and returns *default*.
+
+def _env_bool(var: str, default: bool) -> bool:
+    """Read a boolean env var (whitelist: ``1/true/yes/on`` vs ``0/false/no/off``).
+
+    Empty / missing / unrecognised values fall back to *default* (no silent
+    coercion to truthy).
     """
-    val = os.environ.get(var)
-    if val is None:
-        return default
-    val = val.strip().lower()
-    if not val:
-        return default
-    if val in ("1", "true", "yes", "on"):
-        return True
-    if val in ("0", "false", "no", "off"):
-        return False
-    # Unrecognised value (likely a typo) — fall back to default rather than
-    # silently treating it as truthy (CLAUDE.md whitelist rule).
-    return default
+    return _env.env_bool(var, default)
 
 
 def _env_int(var: str, default: int) -> int:
     """Read an integer env var, returning *default* when absent or invalid."""
-    try:
-        v = os.environ.get(var, "")
-        return int(v) if v.strip() else default
-    except (ValueError, TypeError):
-        return default
+    return _env.env_int(var, default)
 
 
 def _env_float(var: str, default: float) -> float:
     """Read a float env var, returning *default* when absent or invalid."""
-    try:
-        v = os.environ.get(var, "")
-        return float(v) if v.strip() else default
-    except (ValueError, TypeError):
-        return default
+    return _env.env_float(var, default)
 
 
 # ── Subprocess feature-flag forwarding helper ─────────────────────────────────
@@ -202,7 +194,7 @@ def _build_feature_flag_args(args: argparse.Namespace) -> "list[str]":
     _b("deployment_artifacts",   "--deployment-artifacts",   default=True)
     _b("use_memory",             "--use-memory",             default=True)
     _b("independent_validation", "--independent-validation", default=False)
-    # ── v16.2.1 feature flags ────────────────────────────────────────────────
+    # ── Extended feature flags ───────────────────────────────────────────────
     _b("backtest_runner",   "--backtest-runner",   default=False)
     _b("ingest_docs",       "--ingest-docs",       default=False)
     _s("ingest_docs_dir",   "--ingest-docs-dir")
@@ -211,7 +203,7 @@ def _build_feature_flag_args(args: argparse.Namespace) -> "list[str]":
     _s("multilang_langs",   "--multilang-langs")
     _b("agent_metrics",     "--agent-metrics",     default=False)
     _b("lockfile_gen",      "--lockfile-gen",       default=False)
-    # ── v16.8 quant analytics suite ─────────────────────────────────────────
+    # ── Quant analytics suite ────────────────────────────────────────────────
     _b("quant_analytics",    "--quant-analytics",    default=False)
     _b("walk_forward",       "--walk-forward",       default=True)
     _b("significance_test",  "--significance-test",  default=True)
@@ -224,11 +216,11 @@ def _build_feature_flag_args(args: argparse.Namespace) -> "list[str]":
     _b("risk_attribution",   "--risk-attribution",   default=False)
     _b("cointegration",      "--cointegration",      default=False)
     _b("dynamic_correlation","--dynamic-correlation",default=False)
-    # ── v16.7 per-stage model overrides ─────────────────────────────────────
+    # ── Per-stage model overrides ────────────────────────────────────────────
     _s("librarian_model",       "--librarian-model")
     _s("primary_model",         "--primary-model")
     _s("direction_judge_model", "--direction-judge-model")
-    # ── v16.9 Feature Bundle ─────────────────────────────────────────────────
+    # ── Feature Bundle ───────────────────────────────────────────────────────
     _s("v169_features",         "--v169-features")
 
     return cmd
@@ -261,7 +253,7 @@ _ENHANCED_FLAGS = {
     "--external-symbols",
     "--external-start",
     "--external-end",
-    # v16.2.1 additions
+    # Extended features
     "--ingest-docs", "--no-ingest-docs",
     "--ingest-docs-dir",
     "--github-repo",
@@ -270,11 +262,11 @@ _ENHANCED_FLAGS = {
     "--post-chat", "--no-post-chat",
     "--agent-metrics", "--no-agent-metrics",
     "--prompt-version-label",
-    # v16.7 per-stage model overrides
+    # Per-stage model overrides
     "--librarian-model",
     "--primary-model",
     "--direction-judge-model",
-    # v16.8 quant analytics suite
+    # Quant analytics suite
     "--quant-analytics", "--no-quant-analytics",
     "--walk-forward", "--no-walk-forward",
     "--significance-test", "--no-significance-test",
@@ -286,11 +278,11 @@ _ENHANCED_FLAGS = {
     "--tearsheet", "--no-tearsheet",
     "--signal-analysis", "--no-signal-analysis",
     "--risk-attribution", "--no-risk-attribution",
-    # v16.8 remaining features
+    # Quant analytics — remaining
     "--cointegration", "--no-cointegration",
     "--dynamic-correlation", "--no-dynamic-correlation",
     "--lockfile-gen", "--no-lockfile-gen",
-    # v16.9 feature bundle
+    # Feature bundle
     "--v169-features",
 }
 # Flags in this set accept a value argument (next token)
@@ -301,18 +293,18 @@ _ENHANCED_VALUE_FLAGS = {
     "--external-symbols",
     "--external-start",
     "--external-end",
-    # v16.2.1 additions
+    # Extended features
     "--ingest-docs-dir",
     "--github-repo",
     "--multilang-langs",
     "--prompt-version-label",
-    # v16.7 per-stage model overrides
+    # Per-stage model overrides
     "--librarian-model",
     "--primary-model",
     "--direction-judge-model",
-    # v16.8 quant analytics suite (value-taking flags)
+    # Quant analytics suite (value-taking flags)
     "--regime-method",
-    # v16.9
+    # Feature bundle
     "--v169-features",
 }
 
@@ -594,7 +586,7 @@ def _run_postprocessing(run_dir: str, args: argparse.Namespace) -> None:
         except Exception as exc:
             print(f"[Backtest] Failed: {exc}", file=sys.stderr, flush=True)
 
-    # ── v16.8 Quant Analytics Suite ──────────────────────────────────────────
+    # ── Quant Analytics Suite ────────────────────────────────────────────────
 
     # Walk-Forward Validation + Statistical Significance (combined)
     quant_analytics = getattr(args, "quant_analytics", False)
@@ -1004,7 +996,7 @@ def _run_postprocessing(run_dir: str, args: argparse.Namespace) -> None:
                     with open(_ar_path, "r", encoding="utf-8") as _fh:
                         _analysis = json.load(_fh)
                 except Exception:
-                    pass
+                    LOGGER.debug("[runner] swallowed exception", exc_info=True)
             _risks = list(_analysis.get("blocking_risks") or [])
             tracker.record_run_score(
                 version_id=vid,
@@ -1027,8 +1019,8 @@ def _run_postprocessing(run_dir: str, args: argparse.Namespace) -> None:
             # Derive actual pipeline success from analysis_result.json so that
             # NOTIFY_ON_FAIL_ONLY=1 works correctly.  A run is considered
             # successful when a score ≥ 50 was produced and the risk level is
-            # not "critical".  v16.9.69: fail-closed on parse error — a missing
-            # or unparseable analysis_result.json is itself a failure signal,
+            # not "critical".  Fail-closed on parse error — a missing or
+            # unparseable analysis_result.json is itself a failure signal,
             # so the safer default is success=False (this is consistent with
             # the only consumer that cares about the boolean: NOTIFY_ON_FAIL_ONLY,
             # where the user wants to be alerted when something went wrong).
@@ -1060,8 +1052,8 @@ def _run_postprocessing(run_dir: str, args: argparse.Namespace) -> None:
         except Exception as exc:
             print(f"[Notify] Failed: {exc}", file=sys.stderr, flush=True)
 
-    # ── v16.9 Feature Bundle ─────────────────────────────────────────────────
-    # Accepts a comma-separated list of v16.9 feature names, e.g.:
+    # ── Feature Bundle ───────────────────────────────────────────────────────
+    # Accepts a comma-separated list of feature names, e.g.:
     #   --v169-features model_cascade,semantic_cache,citation_verifier
     # or via env var: V169_FEATURES=model_cascade,prometheus_exporter
     _v169_raw = (
@@ -1070,7 +1062,7 @@ def _run_postprocessing(run_dir: str, args: argparse.Namespace) -> None:
     ).strip()
     if _v169_raw:
         _v169_enabled = [f.strip() for f in _v169_raw.split(",") if f.strip()]
-        # All v16.9 feature modules — import them so @register() decorators run
+        # All bundled feature modules — import them so @register() decorators run
         _V169_MODULES = [
             "model_cascade", "semantic_cache", "few_shot_injector",
             "global_knowledge_base", "llm_quality_scorer",
@@ -1091,7 +1083,7 @@ def _run_postprocessing(run_dir: str, args: argparse.Namespace) -> None:
             try:
                 _importlib.import_module(f"crucible.features.{_mod}")
             except ImportError as _ie:
-                print(f"[v16.9] Could not import {_mod}: {_ie}", file=sys.stderr, flush=True)
+                print(f"[features] Could not import {_mod}: {_ie}", file=sys.stderr, flush=True)
         try:
             from crucible.feature_registry import (
                 run_features as _run_v169,
@@ -1099,7 +1091,7 @@ def _run_postprocessing(run_dir: str, args: argparse.Namespace) -> None:
                 format_results as _fmt169,
             )
             _v169_config = _FC169(llm=_shared_llm, args=args, env=dict(os.environ))
-            print(f"[v16.9] Running features: {', '.join(_v169_enabled)}", flush=True)
+            print(f"[features] Running: {', '.join(_v169_enabled)}", flush=True)
             _v169_results = _run_v169(
                 run_dir,
                 enabled_features=_v169_enabled,
@@ -1107,7 +1099,7 @@ def _run_postprocessing(run_dir: str, args: argparse.Namespace) -> None:
             )
             print(_fmt169(_v169_results), flush=True)
         except Exception as _v169_exc:
-            print(f"[v16.9] Feature pipeline failed: {_v169_exc}", file=sys.stderr, flush=True)
+            print(f"[features] Feature pipeline failed: {_v169_exc}", file=sys.stderr, flush=True)
 
     # Post-analysis interactive Q&A (must be last — blocks until user exits)
     post_chat = getattr(args, "post_chat", False)
@@ -1317,7 +1309,7 @@ def cmd_run(args: argparse.Namespace) -> None:
                         flush=True,
                     )
             except Exception:
-                pass
+                LOGGER.debug("[runner] swallowed exception", exc_info=True)
 
         # Per-stage model overrides: inject as env vars so the core CLI
         # resolver picks them up regardless of which LLM provider is active.
@@ -1388,7 +1380,7 @@ def cmd_run(args: argparse.Namespace) -> None:
                 from crucible.features.interactive_mode import cleanup_interactive_context
                 cleanup_interactive_context(_interactive_context_path)
             except Exception:
-                pass
+                LOGGER.debug("[runner] swallowed exception", exc_info=True)
         # Remove the three workspace-local context files created before the run.
         # These are only written if the feature was active; the path variables
         # are None if the file was never created.
@@ -1473,7 +1465,7 @@ def cmd_batch(args: argparse.Namespace) -> None:
             str(Path(__file__).resolve()),
             "run",
         ]
-        # Forward all feature flags (v16.2.1 / v16.7 / v16.8) via shared helper
+        # Forward all feature flags via shared helper
         cmd.extend(_build_feature_flag_args(args))
 
         print(
@@ -1743,7 +1735,7 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="DATE",
         help="End date for --external-data in YYYY-MM-DD format (default: today).",
     )
-    # v16.2.1: document ingestion
+    # Document ingestion
     run_p.add_argument(
         "--ingest-docs",
         action=argparse.BooleanOptionalAction,
@@ -1757,7 +1749,7 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="DIR",
         help="Directory of documents to inject (PDF/MD/TXT/DOCX).",
     )
-    # v16.2.1: GitHub repo analysis
+    # GitHub repo analysis
     run_p.add_argument(
         "--github-repo",
         dest="github_repo",
@@ -1765,7 +1757,7 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="URL",
         help="GitHub repository URL to analyse and inject as research context.",
     )
-    # v16.2.1: multi-language codegen
+    # Multi-language codegen
     run_p.add_argument(
         "--multilang-codegen",
         action=argparse.BooleanOptionalAction,
@@ -1779,21 +1771,21 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="LANGS",
         help="Comma-separated target languages for --multilang-codegen (default: typescript,go).",
     )
-    # v16.2.1: post-analysis chat
+    # Post-analysis chat
     run_p.add_argument(
         "--post-chat",
         action=argparse.BooleanOptionalAction,
         default=_env_bool("ENHANCED_POST_CHAT", False),
         help="Start interactive Q&A about the analysis after the run completes (default: off).",
     )
-    # v16.2.1: agent metrics
+    # Agent metrics
     run_p.add_argument(
         "--agent-metrics",
         action=argparse.BooleanOptionalAction,
         default=_env_bool("ENHANCED_AGENT_METRICS", False),
         help="Compute and display agent performance metrics after the run (default: off).",
     )
-    # v16.2.1: prompt version tracking
+    # Prompt version tracking
     run_p.add_argument(
         "--prompt-version-label",
         dest="prompt_version_label",
@@ -1801,7 +1793,7 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="LABEL",
         help="Prompt version label to record the run's quality score against.",
     )
-    # v16.7: per-stage model overrides
+    # Per-stage model overrides
     run_p.add_argument(
         "--librarian-model",
         dest="librarian_model",
@@ -1837,7 +1829,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "the core pipeline starts."
         ),
     )
-    # v16.8: quant analytics suite
+    # Quant analytics suite
     run_p.add_argument(
         "--quant-analytics",
         action=argparse.BooleanOptionalAction,
@@ -1908,7 +1900,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=_env_bool("ENHANCED_RISK_ATTRIBUTION", False),
         help="Compute component VaR and marginal VaR risk attribution for the run (default: off).",
     )
-    # v16.8 remaining features
+    # Quant analytics — remaining features
     run_p.add_argument(
         "--cointegration",
         action=argparse.BooleanOptionalAction,
@@ -1927,14 +1919,14 @@ def _build_parser() -> argparse.ArgumentParser:
         default=_env_bool("ENHANCED_LOCKFILE_GEN", False),
         help="Generate pyproject.toml + pinned requirements.txt for generated code (default: off).",
     )
-    # v16.9: feature bundle
+    # Feature bundle
     run_p.add_argument(
         "--v169-features",
         dest="v169_features",
         default=os.environ.get("V169_FEATURES", ""),
         metavar="FEATURES",
         help=(
-            "Comma-separated list of v16.9 post-processing features to run. "
+            "Comma-separated list of post-processing features to run. "
             "Available: model_cascade, semantic_cache, few_shot_injector, "
             "global_knowledge_base, llm_quality_scorer, options_analyzer, "
             "alt_data_connectors, market_stream, trading_platform, scheduler, "
@@ -1992,7 +1984,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=_env_bool("ENHANCED_INDEPENDENT_VALIDATION", False),
     )
-    # v16.7 per-stage model overrides (kept consistent with run subcommand)
+    # Per-stage model overrides (kept consistent with run subcommand)
     watch_p.add_argument(
         "--librarian-model",
         dest="librarian_model",
@@ -2014,7 +2006,7 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="MODEL_ID",
         help="Override the direction-judge model ID for triggered runs.",
     )
-    # v16.2.1 feature flags (forwarded to each triggered run)
+    # Extended feature flags (forwarded to each triggered run)
     watch_p.add_argument("--backtest-runner", action=argparse.BooleanOptionalAction,
                          default=_env_bool("ENHANCED_BACKTEST_RUNNER", False))
     watch_p.add_argument("--ingest-docs", action=argparse.BooleanOptionalAction,
@@ -2031,7 +2023,7 @@ def _build_parser() -> argparse.ArgumentParser:
                          default=_env_bool("ENHANCED_AGENT_METRICS", False))
     watch_p.add_argument("--lockfile-gen", action=argparse.BooleanOptionalAction,
                          default=_env_bool("ENHANCED_LOCKFILE_GEN", False))
-    # v16.8 quant analytics suite (forwarded to each triggered run)
+    # Quant analytics suite (forwarded to each triggered run)
     watch_p.add_argument("--quant-analytics", action=argparse.BooleanOptionalAction,
                          default=_env_bool("ENHANCED_QUANT_ANALYTICS", False))
     watch_p.add_argument("--walk-forward", action=argparse.BooleanOptionalAction,
@@ -2096,7 +2088,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=_env_bool("ENHANCED_PROJECT_MEMORY", True),
         help="Persist and load project memory across batch runs (default: on).",
     )
-    # v16.7 per-stage model overrides (kept consistent with run subcommand)
+    # Per-stage model overrides (kept consistent with run subcommand)
     batch_p.add_argument(
         "--librarian-model",
         dest="librarian_model",
@@ -2118,7 +2110,7 @@ def _build_parser() -> argparse.ArgumentParser:
         metavar="MODEL_ID",
         help="Override the direction-judge model ID for each batch run.",
     )
-    # v16.2.1 feature flags (forwarded to each project run)
+    # Extended feature flags (forwarded to each project run)
     batch_p.add_argument("--backtest-runner", action=argparse.BooleanOptionalAction,
                          default=_env_bool("ENHANCED_BACKTEST_RUNNER", False))
     batch_p.add_argument("--ingest-docs", action=argparse.BooleanOptionalAction,
@@ -2135,7 +2127,7 @@ def _build_parser() -> argparse.ArgumentParser:
                          default=_env_bool("ENHANCED_AGENT_METRICS", False))
     batch_p.add_argument("--lockfile-gen", action=argparse.BooleanOptionalAction,
                          default=_env_bool("ENHANCED_LOCKFILE_GEN", False))
-    # v16.8 quant analytics suite (forwarded to each project run)
+    # Quant analytics suite (forwarded to each project run)
     batch_p.add_argument("--quant-analytics", action=argparse.BooleanOptionalAction,
                          default=_env_bool("ENHANCED_QUANT_ANALYTICS", False))
     batch_p.add_argument("--walk-forward", action=argparse.BooleanOptionalAction,
@@ -2257,7 +2249,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=False,
     )
-    # v16.2.1 additions for postprocess
+    # Extended additions for postprocess
     pp_p.add_argument(
         "--multilang-codegen",
         action=argparse.BooleanOptionalAction,
@@ -2286,7 +2278,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=_env_bool("ENHANCED_POST_CHAT", False),
         help="Start interactive Q&A about the analysis after post-processing (default: off).",
     )
-    # v16.8: quant analytics for postprocess subcommand
+    # Quant analytics for postprocess subcommand
     pp_p.add_argument(
         "--quant-analytics",
         action=argparse.BooleanOptionalAction,
@@ -2343,7 +2335,7 @@ def _build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=_env_bool("ENHANCED_RISK_ATTRIBUTION", False),
     )
-    # v16.8 remaining features
+    # Quant analytics — remaining features
     pp_p.add_argument(
         "--cointegration",
         action=argparse.BooleanOptionalAction,
@@ -2359,14 +2351,14 @@ def _build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=_env_bool("ENHANCED_LOCKFILE_GEN", False),
     )
-    # v16.9 Feature Bundle for postprocess subcommand
+    # Feature Bundle for postprocess subcommand
     pp_p.add_argument(
         "--v169-features",
         dest="v169_features",
         default=os.environ.get("V169_FEATURES", ""),
         metavar="FEATURES",
         help=(
-            "Comma-separated list of v16.9 post-processing features to run. "
+            "Comma-separated list of post-processing features to run. "
             "Example: --v169-features model_cascade,prometheus_exporter"
         ),
     )

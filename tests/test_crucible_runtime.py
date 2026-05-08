@@ -8,6 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import pytest
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -1008,6 +1010,7 @@ class TestCrucibleCrewRuntime(unittest.TestCase):
         )
         self.assertIsNone(none_p)
 
+    @pytest.mark.slow
     def test_codegen_lenient_output_env_var_defaults_on_and_can_be_disabled(
         self,
     ) -> None:
@@ -1270,6 +1273,7 @@ class TestCrucibleCrewRuntime(unittest.TestCase):
             ["main.py", "requirements.txt"],
         )
 
+    @pytest.mark.slow
     def test_codegen_never_terminate_env_vars_default_on_and_can_be_disabled(
         self,
     ) -> None:
@@ -2150,6 +2154,7 @@ class TestCrucibleCrewRuntime(unittest.TestCase):
         self.assertTrue(merged)
         self.assertIn("util.py", merged[0].get("fixed", []))
 
+    @pytest.mark.slow
     def test_codegen_retry_env_vars_default_and_can_be_disabled(self) -> None:
         """``CODEGEN_MANIFEST_RETRY_MAX_ATTEMPTS``,
         ``CODEGEN_BATCH_RETRY_MAX_ATTEMPTS``, and
@@ -2257,6 +2262,7 @@ class TestCrucibleCrewRuntime(unittest.TestCase):
                     scope="mvp",
                 )
 
+    @pytest.mark.slow
     def test_codegen_token_env_vars_fall_back_to_default_on_invalid_input(
         self,
     ) -> None:

@@ -8,16 +8,16 @@ import os
 import sys
 import threading
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterator
+from typing import Any, Dict, Iterator, Optional
 
 # Keys whose values are redacted in structured log fields.
 # Match is case-insensitive substring: "api_key" matches "OPENAI_API_KEY".
 #
-# v16.9.69: replaced the bare "auth" fragment with more specific markers
-# ("auth_token", "auth_key") because a substring match on "auth" silently
-# redacted benign audit-trail field names like "author", "authority",
-# "authored_by", "authentic_count".  The bare key "auth" itself is still
-# redacted via the _SENSITIVE_KEY_EXACT set below.
+# Use specific markers ("auth_token", "auth_key") rather than a bare "auth"
+# fragment, because a substring match on "auth" would silently redact benign
+# audit-trail field names like "author", "authority", "authored_by",
+# "authentic_count".  The bare key "auth" itself is still redacted via the
+# _SENSITIVE_KEY_EXACT set below.
 _SENSITIVE_KEY_FRAGMENTS: frozenset[str] = frozenset({
     "api_key", "apikey", "token", "password", "passwd", "secret",
     "bearer", "authorization", "auth_token", "auth_key", "credential",
@@ -54,7 +54,7 @@ def _redact_fields(fields: dict) -> dict:
     return result
 
 
-_LOG_CONTEXT: contextvars.ContextVar[Dict[str, Any]] = contextvars.ContextVar(
+_LOG_CONTEXT: contextvars.ContextVar[Optional[Dict[str, Any]]] = contextvars.ContextVar(
     "crucible_log_context", default=None
 )
 _CONFIGURED = False
@@ -72,16 +72,13 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return default
 
 
-# v16.9.73: ``.env`` was *never* loaded at runtime — neither
-# ``run_crucible.py``, ``launch_webui.py``, nor any module called
-# ``load_dotenv``.  That meant operators who set ``CRUCIBLE_LOG_LEVEL=DEBUG``
-# in ``.env`` (per the documented WebUI Env Vars panel and ``README.md``
-# table) were silently downgraded to ``INFO`` because the env var was
-# never read into ``os.environ``.  We now load ``.env`` exactly once,
-# *before* any helper that consults ``os.environ`` for log level / quiet
-# flags, and we stay completely silent if ``python-dotenv`` is not
-# installed (the package is optional — operators who export their env
-# vars from the shell stay on the same code path as before).
+# Load ``.env`` exactly once, *before* any helper that consults ``os.environ``
+# for log level / quiet flags.  Without this, operators who set
+# ``CRUCIBLE_LOG_LEVEL=DEBUG`` in ``.env`` (per the WebUI Env Vars panel and
+# ``README.md`` table) would be silently downgraded to ``INFO`` because the env
+# var would never be read into ``os.environ``.  Stays completely silent if
+# ``python-dotenv`` is not installed (the package is optional — operators who
+# export their env vars from the shell stay on the same code path as before).
 _DOTENV_LOADED: bool = False
 _DOTENV_LOAD_LOCK: threading.Lock = threading.Lock()
 
@@ -96,8 +93,8 @@ def _load_dotenv_once() -> None:
     this never silently rewrites a value the operator chose to set
     explicitly via ``export VAR=value`` before launching the run.
 
-    v16.9.73 audit follow-up: protected by ``_DOTENV_LOAD_LOCK`` so two
-    threads racing through this function (a real possibility under
+    Protected by ``_DOTENV_LOAD_LOCK`` so two threads racing through this
+    function (a real possibility under
     Python 3.13+ free-threaded mode where the GIL no longer linearises
     them) cannot both call ``load_dotenv`` simultaneously and produce a
     half-applied env state.  Under CPython 3.12 with the GIL this is
@@ -121,7 +118,7 @@ def _load_dotenv_once() -> None:
         if _DOTENV_LOADED:
             return
         try:
-            from dotenv import load_dotenv  # type: ignore[import-not-found]
+            from dotenv import load_dotenv
         except Exception:
             # ``python-dotenv`` not installed — degrade silently.  Mark
             # the load complete so future calls hit the fast path; the
@@ -229,7 +226,7 @@ class StructuredFormatter(logging.Formatter):
 # Third-party loggers that emit DEBUG floods at our default INFO level
 # whenever a downstream library (CrewAI verbose mode, LiteLLM, …) calls
 # `logging.basicConfig(level=DEBUG)` or otherwise raises the global level.
-# A v16.9.72 production capture showed ~71 ``DEBUG asyncio: Using proactor:
+# A real production capture showed ~71 ``DEBUG asyncio: Using proactor:
 # IocpProactor`` lines plus hundreds of ``DEBUG httpcore.http11`` /
 # ``DEBUG openai._base_client`` lines — these flood the WebUI terminal
 # AND race with CrewAI's verbose Printer (whose ``┌──── 🤖 Agent Started

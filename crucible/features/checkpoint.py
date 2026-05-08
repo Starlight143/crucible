@@ -356,6 +356,7 @@ class CheckpointManager:
             # If we have a non-PENDING persisted_state we trust it over the meta
             # (a set_state(FAILED) call after checkpointing must not be silently
             # overwritten with COMPLETED by the meta file's hard-coded value).
+            effective_state: StageState
             if persisted_state != StageState.PENDING:
                 effective_state = persisted_state
             else:

@@ -61,26 +61,17 @@ from typing import Any, Dict, List, Optional, Set
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
+try:
+    from .. import _env
+except ImportError:  # pragma: no cover - script-mode fallback
+    import _env  # type: ignore[no-redef]
+
+
 def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, ""))
-    except (ValueError, TypeError):
-        return default
+    return _env.env_int(name, default)
 
 def _env_bool(name: str, default: bool) -> bool:
-    val = os.environ.get(name)
-    if val is None:
-        return default
-    val = val.strip().lower()
-    if not val:
-        return default
-    if val in ("1", "true", "yes", "on"):
-        return True
-    if val in ("0", "false", "no", "off"):
-        return False
-    # Whitelist mode — unrecognised values fall back to default (CLAUDE.md rule)
-    # rather than being silently treated as truthy.
-    return default
+    return _env.env_bool(name, default)
 
 
 _MAX_FILES: int = max(1, _env_int("MULTILANG_MAX_FILES", 10))

@@ -5,15 +5,14 @@ from ._temp_runtime import ensure_writable_temp_root
 
 ensure_writable_temp_root()
 
-# v16.9.73: import ``runtime_logging`` first so its module-level
-# ``_load_dotenv_once()`` populates ``os.environ`` from ``.env`` *before*
-# any downstream module reads env vars at import time (e.g.
-# ``backtest_runner.BACKTEST_TIMEOUT = _env_int(...)``).  Without this,
-# ``CRUCIBLE_LOG_LEVEL=DEBUG`` set in ``.env`` was silently ignored
-# because no caller invoked ``load_dotenv`` before logging was first
-# configured.  Importing the module is enough — module-level code runs
-# the loader.  The ``# noqa: F401`` flag tells linters this is an
-# intentional side-effect import.
+# Import ``runtime_logging`` first so its module-level ``_load_dotenv_once()``
+# populates ``os.environ`` from ``.env`` *before* any downstream module reads
+# env vars at import time (e.g. ``backtest_runner.BACKTEST_TIMEOUT =
+# _env_int(...)``).  Without this, ``CRUCIBLE_LOG_LEVEL=DEBUG`` set in
+# ``.env`` would be silently ignored because no caller would have invoked
+# ``load_dotenv`` before logging was first configured.  Importing the module
+# is enough — module-level code runs the loader.  The ``# noqa: F401`` flag
+# tells linters this is an intentional side-effect import.
 from . import runtime_logging  # noqa: F401  side-effect: loads .env
 
 from .analysis import build_analysis_crew, build_codegen_crew, build_crew

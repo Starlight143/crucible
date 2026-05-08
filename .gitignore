@@ -22,3 +22,4 @@ skill_staging/
 project_memory.jsonl
 run_registry.db
 .github/
+.gitignore

@@ -142,64 +142,66 @@ _JSON_BLOCK_RE = re.compile(
 )
 
 
-def extract_json(raw: Any) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
-    """
-    Attempt to extract a JSON dict from *raw* (str, dict, or CrewOutput-like).
+def _coerce_to_str(raw: Any) -> Optional[str]:
+    """Best-effort conversion of *raw* to a string for JSON extraction.
 
-    Returns
-    -------
-    Tuple[Optional[dict], Optional[str]]
-        (parsed_dict, error_message)
-        On success: (dict, None).  On failure: (None, error_message).
+    Returns ``None`` when the source has no string-like content to scan
+    (which the caller treats as "Empty output").
     """
-    # Already a dict
-    if isinstance(raw, dict):
-        return raw, None
-
-    # Try .raw attribute (CrewAI CrewOutput)
-    raw_str: Optional[str] = None
     if hasattr(raw, "raw"):
-        raw_str = str(raw.raw)
-    elif isinstance(raw, str):
-        raw_str = raw
-    else:
-        raw_str = str(raw)
+        return str(raw.raw)
+    if isinstance(raw, str):
+        return raw
+    return str(raw)
 
-    if not raw_str or not raw_str.strip():
-        return None, "Empty output"
 
-    # 1. Try direct JSON parse
-    stripped = raw_str.strip()
-    if stripped.startswith("{") or stripped.startswith("["):
-        try:
-            parsed = json.loads(stripped)
-            if isinstance(parsed, dict):
-                return parsed, None
-            return None, f"JSON root is {type(parsed).__name__}, expected dict"
-        except json.JSONDecodeError:
-            pass  # fall through to block extraction
+def _try_direct_json(
+    stripped: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[str], bool]:
+    """Strategy 1 — entire string is a JSON document.
 
-    # 2. Try markdown JSON code block
+    Returns ``(dict, None, True)`` on a structurally valid dict, ``(None,
+    type-mismatch-message, True)`` when the root is the wrong type
+    (``list``/``str``/``int``…), or ``(None, None, False)`` to indicate the
+    caller should fall through to the next strategy.
+    """
+    if not (stripped.startswith("{") or stripped.startswith("[")):
+        return None, None, False
+    try:
+        parsed = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None, None, False  # fall through to next strategy
+    if isinstance(parsed, dict):
+        return parsed, None, True
+    return None, f"JSON root is {type(parsed).__name__}, expected dict", True
+
+
+def _try_markdown_block(raw_str: str) -> Optional[Dict[str, Any]]:
+    """Strategy 2 — extract a fenced ``json`` (or unlabelled ```` ``` ```` ) block."""
     match = _JSON_BLOCK_RE.search(raw_str)
-    if match:
-        try:
-            parsed = json.loads(match.group(1))
-            if isinstance(parsed, dict):
-                return parsed, None
-        except json.JSONDecodeError:
-            pass
+    if match is None:
+        return None
+    try:
+        parsed = json.loads(match.group(1))
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
-    # 3. Single-pass forward scan that tracks both brace depth and string
-    #    context.  Only a '{' encountered at depth 0 begins a new OUTERMOST
-    #    candidate block — nested '{' characters (depth > 0) cannot start an
-    #    independent JSON object.  Backward scanning is unreliable when string
-    #    values contain '{' or '}' characters: those characters corrupt a naive
-    #    depth counter (e.g. '{"key": "a}b"}' trips the backward scanner at the
-    #    inner '}', causing a boundary mis-detection and a spurious
-    #    json.JSONDecodeError).  A single forward pass with string-context
-    #    tracking avoids this class of false-parse-failure entirely while still
-    #    returning the LAST valid outermost JSON dict (matching the original
-    #    intent of the backward scan).
+
+def _scan_outermost_json(raw_str: str) -> Optional[Dict[str, Any]]:
+    """Strategy 3 — single forward pass tracking brace depth and string context.
+
+    Only a ``{`` encountered at depth 0 begins a new OUTERMOST candidate
+    block — nested ``{`` characters (depth > 0) cannot start an independent
+    JSON object.  Backward scanning is unreliable when string values contain
+    ``{`` or ``}`` characters: those characters corrupt a naive depth counter
+    (e.g. ``{"key": "a}b"}`` trips the backward scanner at the inner ``}``,
+    causing a boundary mis-detection and a spurious ``json.JSONDecodeError``).
+    A single forward pass with string-context tracking avoids this class of
+    false-parse-failure entirely while still returning the **last** valid
+    outermost JSON dict — preserving the original intent of the backward
+    scan that this function replaced.
+    """
     best_parsed: Optional[Dict[str, Any]] = None
     scan_depth = 0
     in_string = False
@@ -215,31 +217,72 @@ def extract_json(raw: Any) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
                 escape_next = True
             elif ch == '"':
                 in_string = False
-        else:
-            if ch == '"':
-                in_string = True
-            elif ch == "{":
-                if scan_depth == 0:
-                    outer_start = i   # start of a new outermost candidate
-                scan_depth += 1
-            elif ch == "}":
-                # Clamp to zero: an extra '}' in malformed JSON must not push
-                # scan_depth negative, which would cause the next '{' to set
-                # outer_start at depth 0 (triggering a false capture start)
-                # instead of depth 1, and then never find its matching '}'.
-                if scan_depth > 0:
-                    scan_depth -= 1
-                if scan_depth == 0 and outer_start != -1:
-                    try:
-                        parsed = json.loads(raw_str[outer_start : i + 1])
-                        if isinstance(parsed, dict):
-                            best_parsed = parsed
-                    except json.JSONDecodeError:
-                        pass
-                    outer_start = -1
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            if scan_depth == 0:
+                outer_start = i  # start of a new outermost candidate
+            scan_depth += 1
+        elif ch == "}":
+            # Clamp to zero: an extra '}' in malformed JSON must not push
+            # scan_depth negative, which would cause the next '{' to set
+            # outer_start at depth 0 (triggering a false capture start)
+            # instead of depth 1, and then never find its matching '}'.
+            if scan_depth > 0:
+                scan_depth -= 1
+            if scan_depth == 0 and outer_start != -1:
+                try:
+                    parsed = json.loads(raw_str[outer_start : i + 1])
+                    if isinstance(parsed, dict):
+                        best_parsed = parsed
+                except json.JSONDecodeError:
+                    pass
+                outer_start = -1
 
-    if best_parsed is not None:
-        return best_parsed, None
+    return best_parsed
+
+
+def extract_json(raw: Any) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """
+    Attempt to extract a JSON dict from *raw* (str, dict, or CrewOutput-like).
+
+    Returns
+    -------
+    Tuple[Optional[dict], Optional[str]]
+        (parsed_dict, error_message)
+        On success: (dict, None).  On failure: (None, error_message).
+
+    Strategy order (delegates to private helpers above):
+
+    1. ``raw`` is already a dict — return immediately.
+    2. Direct ``json.loads`` of the whole string.
+    3. ``json`` markdown code block.
+    4. Forward-scan for the last outermost ``{...}`` substring that parses.
+    """
+    if isinstance(raw, dict):
+        return raw, None
+
+    raw_str = _coerce_to_str(raw)
+    if not raw_str or not raw_str.strip():
+        return None, "Empty output"
+
+    parsed, type_error, hit = _try_direct_json(raw_str.strip())
+    if hit:
+        if parsed is not None:
+            return parsed, None
+        # Type-mismatch terminates extraction — emulating the original
+        # behaviour where a non-dict root short-circuits before strategies
+        # 2 and 3 are tried.
+        return None, type_error
+
+    md_parsed = _try_markdown_block(raw_str)
+    if md_parsed is not None:
+        return md_parsed, None
+
+    scan_parsed = _scan_outermost_json(raw_str)
+    if scan_parsed is not None:
+        return scan_parsed, None
 
     return None, f"No JSON dict found in output (len={len(raw_str)})"
 

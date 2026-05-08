@@ -40,19 +40,18 @@ _LOGGER = logging.getLogger(__name__)
 # ── Environment helpers ───────────────────────────────────────────────────────
 
 
+try:
+    from .. import _env
+except ImportError:  # pragma: no cover - script-mode fallback
+    import _env  # type: ignore[no-redef]
+
+
 def _env_str(name: str, default: str) -> str:
-    return os.environ.get(name, "").strip() or default
+    return _env.env_str(name, default)
 
 
 def _env_float(name: str, default: float) -> float:
-    try:
-        v = os.environ.get(name, "")
-        if not v.strip():
-            return default
-        val = float(v)
-        return val if math.isfinite(val) else default
-    except (ValueError, TypeError):
-        return default
+    return _env.env_float(name, default, finite_only=True)
 
 
 _DEFAULT_REBALANCE_PERIOD: str = _env_str("PORTFOLIO_REBALANCE_PERIOD", "monthly")
@@ -287,7 +286,7 @@ def _align_curves(
         last_val: float = 1.0
         for ts in all_ts:
             if ts in curve_dict:
-                last_val = curve_dict[ts] / first_eq  # type: ignore[operator]
+                last_val = curve_dict[ts] / first_eq
             series.append(last_val)
         aligned.append(series)
 

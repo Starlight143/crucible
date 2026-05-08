@@ -36,24 +36,22 @@ logger = logging.getLogger(__name__)
 
 # ── Env helpers ───────────────────────────────────────────────────────────────
 
+try:
+    from .. import _env
+except ImportError:  # pragma: no cover - script-mode fallback
+    import _env  # type: ignore[no-redef]
+
+
 def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, ""))
-    except (ValueError, TypeError):
-        return default
+    return _env.env_int(name, default)
 
 
 def _env_str(name: str, default: str) -> str:
-    return os.environ.get(name, "").strip() or default
+    return _env.env_str(name, default)
 
 
 def _env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name, "").strip().lower()
-    if raw in ("1", "true", "yes", "on"):
-        return True
-    if raw in ("0", "false", "no", "off"):
-        return False
-    return default
+    return _env.env_bool(name, default)
 
 
 # ── Mode isolation (tearsheet works for all modes) ────────────────────────────

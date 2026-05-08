@@ -46,12 +46,12 @@ Usage::
 from __future__ import annotations
 
 import hashlib
-import os
 import time
 import warnings
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Dict, Optional
+
 
 if __package__ == "crucible":
     from .runtime_logging import get_logger, log_event
@@ -65,11 +65,18 @@ else:  # pragma: no cover
 # module is absent (e.g. partial installations / older test fixtures).
 try:
     if __package__ == "crucible":
-        from .cancellation import OperationCancelledError  # noqa: F401
+        from .cancellation import OperationCancelledError as _OperationCancelledError
     else:  # pragma: no cover
-        from cancellation import OperationCancelledError  # type: ignore[no-redef]  # noqa: F401
+        from cancellation import (  # type: ignore[no-redef]
+            OperationCancelledError as _OperationCancelledError,
+        )
 except ImportError:  # pragma: no cover
-    OperationCancelledError = None  # type: ignore[assignment]
+    _OperationCancelledError = None  # type: ignore[assignment,misc]
+
+# Module-level alias retained for backwards compatibility — historically the
+# bare ``OperationCancelledError`` symbol was imported into this module's
+# namespace and looked up via ``globals().get(...)`` in ``__exit__``.
+OperationCancelledError = _OperationCancelledError
 
 LOGGER = get_logger(__name__)
 
@@ -81,32 +88,23 @@ _DEFAULT_STALE_THRESHOLD = 5        # warn after N identical signatures
 _DEFAULT_STALE_RAISES = False       # warn-only by default
 
 
+try:
+    from . import _env
+except ImportError:  # pragma: no cover - script-mode fallback
+    import _env  # type: ignore[no-redef]
+
+
 def _env_int(name: str, default: int) -> int:
-    try:
-        v = os.environ.get(name, "")
-        # Allow 0 — callers use 0 to disable caps (e.g. CONVERGENCE_MAX_ITERATIONS=0).
-        return max(0, int(v)) if v.strip() else default
-    except (ValueError, TypeError):
-        return default
+    # Allow 0 — callers use 0 to disable caps (e.g. CONVERGENCE_MAX_ITERATIONS=0).
+    return _env.env_int(name, default, clamp_min=0)
 
 
 def _env_float(name: str, default: float) -> float:
-    try:
-        v = os.environ.get(name, "")
-        return float(v) if v.strip() else default
-    except (ValueError, TypeError):
-        return default
+    return _env.env_float(name, default)
 
 
 def _env_bool(name: str, default: bool) -> bool:
-    raw = str(os.environ.get(name, "") or "").strip().lower()
-    if not raw:
-        return default
-    if raw in {"1", "true", "yes", "on"}:
-        return True
-    if raw in {"0", "false", "no", "off"}:
-        return False
-    return default
+    return _env.env_bool(name, default)
 
 
 # ── Exceptions ────────────────────────────────────────────────────────────────

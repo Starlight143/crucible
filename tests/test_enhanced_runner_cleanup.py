@@ -1,4 +1,4 @@
-"""Regression tests for cmd_run interactive-context cleanup leak (v16.0.7).
+"""Regression tests for cmd_run interactive-context cleanup leak.
 
 Bug: _interactive_context_path was not cleaned up when cmd_run exited via:
   1. Early return after user cancels a dedup-check prompt
@@ -204,7 +204,7 @@ class TestCmdRunCleanupOnEarlyReturn:
 
 
 # ---------------------------------------------------------------------------
-# cmd_batch timeout env-var override (v16.0.8)
+# cmd_batch timeout env-var override
 # ---------------------------------------------------------------------------
 
 class TestCmdBatchTimeout:
@@ -212,7 +212,7 @@ class TestCmdBatchTimeout:
 
     def test_batch_timeout_respects_env_var(self, monkeypatch, tmp_path):
         """
-        Regression (v16.0.8): cmd_batch used a hardcoded timeout=3600 with no
+        Regression: cmd_batch used a hardcoded timeout=3600 with no
         override mechanism.  After the fix, ENHANCED_BATCH_TIMEOUT is respected.
         """
         import subprocess

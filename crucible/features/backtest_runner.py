@@ -90,24 +90,22 @@ _PARAM_RNG_LOCK: threading.Lock = threading.Lock()
 # ── Configuration ────────────────────────────────────────────────────────────
 
 
+try:
+    from .. import _env
+except ImportError:  # pragma: no cover - script-mode fallback
+    import _env  # type: ignore[no-redef]
+
+
 def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, ""))
-    except (ValueError, TypeError):
-        return default
+    return _env.env_int(name, default)
 
 
 def _env_float(name: str, default: float) -> float:
-    try:
-        val = float(os.environ.get(name, ""))
-        # Reject NaN/Inf so no non-finite value ever becomes a module constant.
-        return val if math.isfinite(val) else default
-    except (ValueError, TypeError):
-        return default
+    return _env.env_float(name, default, finite_only=True)
 
 
 def _env_str(name: str, default: str) -> str:
-    return os.environ.get(name, "").strip() or default
+    return _env.env_str(name, default)
 
 
 BACKTEST_TIMEOUT = _env_int("BACKTEST_TIMEOUT", 120)
@@ -1647,8 +1645,8 @@ def _read_metrics_from_result_file(
 ) -> Optional["BacktestMetrics"]:
     """Return parsed metrics from a JSON result file written by *this* run.
 
-    v16.9.73: companion to ``_purge_stale_result_files`` for the failure
-    branch.  Returns ``None`` (NOT a default-zero ``BacktestMetrics``) when:
+    Companion to ``_purge_stale_result_files`` for the failure branch.
+    Returns ``None`` (NOT a default-zero ``BacktestMetrics``) when:
 
     - No result file exists.
     - The result file's mtime is older than ``written_after_wall`` (wall-
@@ -1703,13 +1701,13 @@ def _read_metrics_from_result_file(
 def _purge_stale_result_files(code_dir: str) -> None:
     """Remove any leftover result JSONs from previous subprocess runs.
 
-    v16.9.73: previously, when a backtest succeeded once and then failed on a
+    Without this purge, when a backtest succeeded once and then failed on a
     later combo / fix-round, ``_parse_backtest_output()`` would still find the
     successful run's ``backtest_results.json`` on disk and report its metrics
-    as if the failed run had produced them.  That made ``success=False``
+    as if the failed run had produced them.  That would make ``success=False``
     reports carry ghost metrics from a sibling run, which downstream
-    analytics (the analyst crew, the tearsheet, the cost model) treated as
-    legitimate.  Deleting these files before each subprocess execution
+    analytics (the analyst crew, the tearsheet, the cost model) would treat
+    as legitimate.  Deleting these files before each subprocess execution
     guarantees the parser only sees what *this* run actually wrote.
     """
     for fname in ("backtest_results.json", "results.json", "output.json"):
@@ -1738,13 +1736,13 @@ def _run_backtest_subprocess(
     from the subprocess environment to prevent credential leakage from
     LLM-generated code.
 
-    v16.9.73 changes:
-    - Pre-flight syntax check: before launching ``python entrypoint``, run
-      ``compile()`` over the file.  When the LLM-generated entrypoint has a
-      syntax error (e.g. unterminated string literal), reporting the error
-      directly skips the ~1 s subprocess startup cost and yields a
-      stderr message in the exact format ``_try_llm_fix`` expects, instead
-      of a Python traceback header that can mislead the fix prompt.
+    Pre-flight protections:
+    - Syntax check: before launching ``python entrypoint``, run ``compile()``
+      over the file.  When the LLM-generated entrypoint has a syntax error
+      (e.g. unterminated string literal), reporting the error directly
+      skips the ~1 s subprocess startup cost and yields a stderr message
+      in the exact format ``_try_llm_fix`` expects, instead of a Python
+      traceback header that can mislead the fix prompt.
     - Stale result-file purge: see ``_purge_stale_result_files`` doc.
 
     Returns (returncode, stdout, stderr).
@@ -2168,15 +2166,16 @@ def _validate_python_syntax(code: str, filename: str = "<llm_fix>") -> Optional[
         return f"line {lineno}: {msg}" if lineno else str(msg)
 
 
-# v16.9.73: pure-Python repair pass for LLM-fix responses that arrive with
-# JSON-style escape sequences instead of real control characters.  Some
-# providers (notably reasoning-class models running under STRICT_JSON) emit
-# ``\\n`` as a literal backslash + n inside the code body, which causes
-# ``compile()`` to fail with ``SyntaxError: unexpected character after line
-# continuation character``.  Section_01 already handles this for the codegen
-# bundle pipeline; the backtest fix loop did not — so a single mis-escape in
-# the LLM-suggested fix would burn a whole round and eventually fall through
-# with ``LLM fix round N produced no valid code.``
+# Pure-Python repair pass for LLM-fix responses that arrive with JSON-style
+# escape sequences instead of real control characters.  Some providers
+# (notably reasoning-class models running under STRICT_JSON) emit ``\\n`` as a
+# literal backslash + n inside the code body, which causes ``compile()`` to
+# fail with ``SyntaxError: unexpected character after line continuation
+# character``.  Section_01 already handles this for the codegen bundle
+# pipeline; this function applies the same repair to the backtest fix loop —
+# without it, a single mis-escape in the LLM-suggested fix would burn a whole
+# round and eventually fall through with ``LLM fix round N produced no valid
+# code.``
 def _deterministic_repair_llm_code(code: str) -> str:
     if not code:
         return code
@@ -2240,10 +2239,10 @@ def _try_llm_fix(
     re-emitted an unterminated string literal), the file would be
     overwritten with equally-broken code, the next subprocess call would
     crash again, and the loop would burn a whole round per iteration with
-    no progress.  v16.9.73 validates with ``compile()`` before writing —
-    any SyntaxError in the proposed fix counts as ``produced no valid
-    code`` so the loop falls through to the failure path immediately
-    instead of dragging out three rounds of broken code.
+    no progress.  ``compile()`` is run on the proposed fix before writing —
+    any SyntaxError counts as ``produced no valid code`` so the loop falls
+    through to the failure path immediately instead of dragging out three
+    rounds of broken code.
     """
     try:
         with open(entrypoint, "r", encoding="utf-8") as fh:
@@ -2275,19 +2274,19 @@ def _try_llm_fix(
     if not fixed_code or len(fixed_code.strip()) < 20:
         return False
 
-    # v16.9.73: deterministic escape / fence repair before validation.  Some
-    # providers re-emit the suggested code with JSON-style ``\n`` literals
-    # rather than real newlines; the section_01 unescape helper handles the
-    # codegen bundle but the backtest fix path was never wired up to it.
+    # Deterministic escape / fence repair before validation.  Some providers
+    # re-emit the suggested code with JSON-style ``\n`` literals rather than
+    # real newlines; the section_01 unescape helper handles the codegen
+    # bundle and the same repair is applied here for the backtest fix path.
     fixed_code = _deterministic_repair_llm_code(fixed_code)
 
-    # v16.9.73: hard syntax gate.  Any SyntaxError in the proposed fix
-    # short-circuits to False so the round counts as "no valid code".
+    # Hard syntax gate.  Any SyntaxError in the proposed fix short-circuits
+    # to False so the round counts as "no valid code".
     syntax_err = _validate_python_syntax(fixed_code, entrypoint)
     if syntax_err is not None:
         return False
 
-    # v16.9.73: refuse to write a "fix" that is identical to the current
+    # Refuse to write a "fix" that is identical to the current
     # broken code — that just burns the next round without changing
     # anything.  The original code may itself fail compile (the very
     # reason we are in the fix loop), so the comparison is done against
@@ -2314,7 +2313,7 @@ def _try_llm_fix(
 def _extract_code_block(text: str) -> str:
     """Extract Python code from markdown-fenced or raw response.
 
-    v16.9.73: handle the two common LLM "almost-correct" response shapes:
+    Handles the two common LLM "almost-correct" response shapes:
     1. Forgotten closing ``` ``` ``` fence — match anything from the opener
        until end-of-string and strip the trailing fence if it is present
        on the very last line.
@@ -2603,8 +2602,8 @@ def run_backtest_pipeline(
             "Results may not be meaningful."
         )
 
-    # v16.9.73: monotonic timestamp captured at the start of this pipeline
-    # invocation.  Used by ``_read_metrics_from_result_file`` in the failure
+    # Monotonic timestamp captured at the start of this pipeline invocation.
+    # Used by ``_read_metrics_from_result_file`` in the failure
     # branch to discriminate between a fresh result file written by *this*
     # subprocess (mtime newer than this anchor) and a stale file left over
     # from a previous successful run inside the same code_dir (mtime older).
@@ -2717,12 +2716,11 @@ def run_backtest_pipeline(
             f"Backtest failed with exit code {returncode}. "
             f"stderr: {(stderr or '')[:500]}"
         )
-        # v16.9.73: fail-loud.  Previously this branch parsed partial output
-        # via ``_parse_backtest_output(stdout, stderr, code_dir)`` so a
-        # crashed run could still report regex-extracted "metrics" pulled
-        # from a stack-trace string ("Sharpe ratio: 0.0", etc.) — those
-        # phantom numbers were then carried into the analyst report and
-        # consumed by downstream LLM agents as if they were real backtest
+        # Fail-loud: do NOT parse partial output via
+        # ``_parse_backtest_output(stdout, stderr, code_dir)`` from a crashed
+        # run, because the regex would extract "metrics" from stack-trace
+        # strings ("Sharpe ratio: 0.0", etc.) and downstream LLM agents
+        # would consume those phantom numbers as if they were real backtest
         # data.  When the subprocess returncode is non-zero, the most
         # honest answer is "no metrics".  Result-file lookups still happen
         # via the JSON-only path below, gated on a fresh-write timestamp,

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 import random
 import re
 import threading
@@ -9,11 +8,15 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterable, Optional, Tuple, Type
 
 if __package__ == "crucible":
-    from .runtime_logging import get_logger, log_event
+    from . import _env
     from .cancellation import OperationCancelledError as _OperationCancelledError
+    from .runtime_logging import get_logger, log_event
 else:  # pragma: no cover - direct script fallback
+    import _env  # type: ignore[no-redef]
+    from cancellation import (  # type: ignore[no-redef]
+        OperationCancelledError as _OperationCancelledError,
+    )
     from runtime_logging import get_logger, log_event  # type: ignore[no-redef]
-    from cancellation import OperationCancelledError as _OperationCancelledError  # type: ignore[no-redef]
 
 LOGGER = get_logger(__name__)
 
@@ -206,19 +209,11 @@ def _compute_backoff_seconds(
 
 
 def _env_int(name: str, default: int) -> int:
-    try:
-        v = os.environ.get(name, "")
-        return int(v.strip()) if v.strip() else default
-    except (ValueError, TypeError):
-        return default
+    return _env.env_int(name, default)
 
 
 def _env_float(name: str, default: float) -> float:
-    try:
-        v = os.environ.get(name, "")
-        return float(v.strip()) if v.strip() else default
-    except (ValueError, TypeError):
-        return default
+    return _env.env_float(name, default)
 
 
 def _resolve_kickoff_retry_defaults(

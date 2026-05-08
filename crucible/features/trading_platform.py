@@ -559,8 +559,8 @@ def generate_trading_platform(run_dir: str) -> Dict[str, Any]:
     # files use this flag to gate place_order(); if a typo/unknown value silently
     # flipped paper_mode to False the generated code would submit *real* orders
     # against *real* funds. Only an explicit, recognised "off" token disables it.
-    # Per CLAUDE.md (高風險系統加強 + env-bool whitelist): unknown values must
-    # default to the SAFE side, which here is paper_mode=True.
+    # Project-wide env-bool whitelist policy: unknown values default to the SAFE
+    # side, which here is paper_mode=True.
     paper_mode_raw = os.environ.get('TRADING_PAPER_MODE', 'true').strip().lower()
     paper_mode = paper_mode_raw not in ('0', 'false', 'no', 'off')
 

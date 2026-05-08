@@ -33,31 +33,23 @@ _log = logging.getLogger(__name__)
 
 # ── Env helpers ───────────────────────────────────────────────────────────────
 
+try:
+    from .. import _env
+except ImportError:  # pragma: no cover - script-mode fallback
+    import _env  # type: ignore[no-redef]
+
+
 def _env_bool(name: str, default: bool) -> bool:
-    raw = os.environ.get(name, "").strip().lower()
-    if raw in ("1", "true", "yes", "on"):
-        return True
-    if raw in ("0", "false", "no", "off"):
-        return False
-    return default
+    return _env.env_bool(name, default)
 
 def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, ""))
-    except (ValueError, TypeError):
-        return default
+    return _env.env_int(name, default)
 
 def _env_float(name: str, default: float) -> float:
-    import math as _math
-    try:
-        val = float(os.environ.get(name, ""))
-    except (ValueError, TypeError):
-        return default
-    # Reject NaN and Inf to prevent them propagating into correlation configs.
-    return val if _math.isfinite(val) else default
+    return _env.env_float(name, default, finite_only=True)
 
 def _env_str(name: str, default: str) -> str:
-    return os.environ.get(name, default)
+    return _env.env_str_passthrough(name, default)
 
 
 # ── Data models ───────────────────────────────────────────────────────────────
@@ -125,7 +117,7 @@ def _pearson_r(x: List[float], y: List[float]) -> float:
     if not (sx > 1e-14) or not (sy > 1e-14):
         return 0.0
     raw = num / (sx * sy)
-    # v16.9.73: NaN-aware clamp.  ``max(-1, min(1, nan))`` is
+    # NaN-aware clamp.  ``max(-1, min(1, nan))`` is
     # order-dependent in Python (``min(1.0, nan) == 1.0`` but
     # ``min(nan, 1.0) == nan``) so the previous one-line clamp could
     # silently leak NaN into downstream metric tables when *any*
@@ -355,8 +347,7 @@ def _pca_pure_python(
     # which divided into eigenvalues at line 361 would produce ratios on the
     # order of 1e+300 and contaminate every PCAComponent.explained_variance_ratio
     # plus the cumulative-variance sum used downstream.  Project-standard
-    # threshold (CLAUDE.md "數值正確性通用規則"): require a strictly normal
-    # divisor ``> 1e-14``.
+    # threshold: require a strictly normal divisor ``> 1e-14``.
     total_variance = sum(cov[i][i] for i in range(n_features))
     if not (total_variance > 1e-14):
         return []

@@ -65,18 +65,18 @@ from typing import Any, Dict, List, Optional
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
+try:
+    from .. import _env
+except ImportError:  # pragma: no cover - script-mode fallback
+    import _env  # type: ignore[no-redef]
+
+
 def _env_float(name: str, default: float) -> float:
-    try:
-        return float(os.environ.get(name, ""))
-    except (ValueError, TypeError):
-        return default
+    return _env.env_float(name, default)
 
 
 def _env_int(name: str, default: int) -> int:
-    try:
-        return int(os.environ.get(name, ""))
-    except (ValueError, TypeError):
-        return default
+    return _env.env_int(name, default)
 
 
 DEDUP_SIMILARITY_THRESHOLD: float = _env_float("DEDUP_SIMILARITY_THRESHOLD", 0.85)
