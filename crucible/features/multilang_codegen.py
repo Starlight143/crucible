@@ -59,6 +59,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
+from crucible.output_validation import strip_reasoning_blocks
+
 # ── Configuration ─────────────────────────────────────────────────────────────
 
 try:
@@ -334,6 +336,10 @@ def _invoke_llm_translation(llm: Any, prompt: str) -> str:
 
 def _strip_code_fences(text: str) -> str:
     """Remove leading/trailing markdown code fences."""
+    # Reasoning-model defence: strip <think>/<reasoning>/… blocks first so
+    # the chain-of-thought (which can include its own fenced examples in
+    # other languages) cannot leak into the translated source file.
+    text = strip_reasoning_blocks(text or "")
     lines = text.strip().splitlines()
     if not lines:
         return text

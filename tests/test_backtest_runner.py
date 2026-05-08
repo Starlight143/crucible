@@ -406,6 +406,22 @@ class TestExtractCodeBlock(unittest.TestCase):
         code = _extract_code_block(text)
         self.assertIn("import os", code)
 
+    def test_think_block_with_fenced_decoy_stripped(self) -> None:
+        """Reasoning models (DeepSeek-V4, GLM-5.1, …) emit chain-of-thought
+        inside ``<think>...</think>``; a long fenced example inside the
+        think block would otherwise win the longest-match heuristic and
+        the real fix would be discarded."""
+        decoy = "\n".join(["# decoy"] * 50)
+        actual = "import os\nprint('real fix')"
+        text = (
+            f"<think>I might try:\n```python\n{decoy}\n```\n"
+            f"but actually here is the fix.</think>\n"
+            f"```python\n{actual}\n```"
+        )
+        code = _extract_code_block(text)
+        self.assertEqual(code, actual)
+        self.assertNotIn("decoy", code)
+
 
 class TestCountCsvRows(unittest.TestCase):
     def test_counts_rows(self) -> None:

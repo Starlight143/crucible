@@ -962,6 +962,51 @@ def _run_single_direction_debate(
                 or gap_info.get("grounded_claims_needed", 0) > 0
                 or gap_info.get("citations_needed", 0) > 0
             ):
+                # Diagnostic surface: the force-none gate used to return silently,
+                # so a user looking at the runner output had no idea which condition
+                # killed the decision (citations? grounded claims? weak directions?).
+                # Print the actual numbers and dump a JSON debug artefact so the
+                # next iteration / user can act on it.
+                _coverage_now: Dict[str, Any] = {}
+                try:
+                    _coverage_now = dict(getattr(research_context, "evidence_coverage", {}) or {})
+                except Exception:
+                    _coverage_now = {}
+                _citations_now = 0
+                _attributions_now = 0
+                try:
+                    _citations_now = len(list(getattr(research_context, "citations", []) or []))
+                    _attributions_now = len(
+                        list(getattr(research_context, "claim_attributions", []) or [])
+                    )
+                except Exception:
+                    pass
+                print(
+                    "[Warn] Direction debate force-none gate fired "
+                    f"(reason={reason!r} attempt={attempt + 1} "
+                    f"citations={_citations_now} "
+                    f"grounded_claims={int(_coverage_now.get('grounded_claims') or 0)} "
+                    f"grounded_summary_claims={int(_coverage_now.get('grounded_summary_claims') or 0)} "
+                    f"claim_attributions={_attributions_now} "
+                    f"weak_directions={list(gap_info.get('weak_directions') or [])[:3]} "
+                    f"critical_unknowns={list(gap_info.get('critical_unknowns') or [])[:3]})."
+                )
+                dump_path = _write_direction_debate_debug_dump(
+                    user_problem=user_problem,
+                    attempt=attempt + 1,
+                    llm=llm,
+                    direction_judge_llm=direction_judge_llm,
+                    elapsed_seconds=elapsed_seconds,
+                    stage_index_map=stage_index_map,
+                    result=direction_result,
+                    raw_candidates=raw_candidates,
+                    decision=decision,
+                    comparator_report=comparator_report,
+                    audit_report=audit_report,
+                    note=f"force_none:{reason}",
+                )
+                if dump_path:
+                    print(f"[Info] Direction debate debug dump: {dump_path}")
                 return None, comparator_report, audit_report, gap_info
             decision = _apply_deterministic_direction_rerank(
                 decision,
@@ -1625,6 +1670,7 @@ def run_direction_debate(
 
     direction_judge_llm = _get_direction_judge_llm()
     current_research_context = research_context
+    last_gap_info: Optional[Dict[str, Any]] = None
     for refinement_iteration in range(DIRECTION_REFINEMENT_MAX_ITERATIONS + 1):
         decision, comparator_report, audit_report, gap_info = _run_single_direction_debate(
             seeded_problem,
@@ -1637,6 +1683,8 @@ def run_direction_debate(
         )
         if decision is not None:
             return decision
+        if gap_info is not None:
+            last_gap_info = gap_info
         if gap_info is None:
             break
         if refinement_iteration >= DIRECTION_REFINEMENT_MAX_ITERATIONS:
@@ -1658,6 +1706,28 @@ def run_direction_debate(
         current_research_context = refined_context
         cache_payload["research_context_sha256"] = _text_sha256(
             _model_to_stable_json(current_research_context)
+        )
+    # Final summary before giving up — preserves what we know about why the
+    # debate failed so the caller (and a human reading the run output) can act
+    # on it.  Without this line the failure is invisible when the JSON-parse
+    # path was never hit and only the force-none gate fired.
+    if last_gap_info is not None:
+        print(
+            "[Warn] Direction debate exhausted "
+            f"{DIRECTION_REFINEMENT_MAX_ITERATIONS + 1} iteration(s) without a "
+            "defendable decision. Likely cause: insufficient grounded evidence "
+            "(see preceding force-none diagnostic line). "
+            f"weak_directions={list(last_gap_info.get('weak_directions') or [])[:3]} "
+            f"missing_evidence={list(last_gap_info.get('missing_evidence_areas') or [])[:3]} "
+            f"grounded_claims_needed={int(last_gap_info.get('grounded_claims_needed') or 0)} "
+            f"citations_needed={int(last_gap_info.get('citations_needed') or 0)}"
+        )
+    else:
+        print(
+            "[Warn] Direction debate produced no parseable decision after all "
+            "JSON-retry attempts. Inspect the latest dump under "
+            "saved_projects/direction_debug/ "
+            "(or %TEMP%/CrucibleCrew_direction_debug/ on Windows fallback)."
         )
     return None
 

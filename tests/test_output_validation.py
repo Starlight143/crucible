@@ -127,6 +127,63 @@ class TestExtractJson:
         assert result["key"] == "open={value"
         assert result["score"] == 1
 
+    def test_think_tag_with_decoy_json_in_reasoning(self) -> None:
+        """Reasoning models (DeepSeek-V3/V4, GLM-5.1, Qwen-3.5, o1-class)
+        emit chain-of-thought inside ``<think>...</think>`` ahead of the real
+        answer.  When the reasoning text contains an example dict, the forward
+        JSON scan would otherwise capture it as the "first" JSON object and
+        the actual answer would be lost.  Strip reasoning blocks first."""
+        raw = (
+            "<think>Let me consider the options. A tentative shape might be "
+            '{"option": "A", "draft": true} but I need to verify.</think>\n'
+            '{"selected_direction": "B", "confidence": "high"}'
+        )
+        result, err = extract_json(raw)
+        assert err is None, f"Unexpected error: {err}"
+        assert result == {"selected_direction": "B", "confidence": "high"}
+
+    def test_thinking_tag_alias_stripped(self) -> None:
+        """The <thinking> alias used by some Anthropic-style prompts."""
+        raw = (
+            "<thinking>{\"hypothesis\": \"X\"}</thinking>\n"
+            '{"answer": 42}'
+        )
+        result, err = extract_json(raw)
+        assert err is None
+        assert result == {"answer": 42}
+
+    def test_reasoning_tag_alias_stripped(self) -> None:
+        raw = (
+            "<reasoning>step 1: {\"foo\": 1}\nstep 2: combine</reasoning>"
+            '{"final": "ok"}'
+        )
+        result, err = extract_json(raw)
+        assert err is None
+        assert result == {"final": "ok"}
+
+    def test_think_tag_with_attributes_stripped(self) -> None:
+        """Some providers emit ``<think type="cot">…</think>``."""
+        raw = (
+            '<think type="cot">{"draft": "ignore me"}</think>'
+            '{"selected_direction": "C"}'
+        )
+        result, err = extract_json(raw)
+        assert err is None
+        assert result == {"selected_direction": "C"}
+
+    def test_only_think_block_no_json_returns_error(self) -> None:
+        raw = "<think>I am still pondering.</think>"
+        result, err = extract_json(raw)
+        assert result is None
+        assert err is not None
+
+    def test_no_think_tag_unchanged(self) -> None:
+        """Idempotent on inputs that do not contain reasoning tags."""
+        raw = '{"selected_direction": "A"}'
+        result, err = extract_json(raw)
+        assert err is None
+        assert result == {"selected_direction": "A"}
+
 
 # ── validate_output — schema-less ────────────────────────────────────────────
 

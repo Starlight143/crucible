@@ -1290,8 +1290,9 @@ def main() -> None:
             # fall back gracefully: skip the direction preamble and continue as if
             # direction debate were disabled.
             print(
-                "[Warn] Direction debate could not produce a valid decision "
-                "(evidence gaps or JSON parse failure after all retries). "
+                "[Warn] Direction debate could not produce a valid decision. "
+                "See the preceding [Warn] line(s) and any debug dump under "
+                "saved_projects/direction_debug/ for the exact gate that fired. "
                 "Continuing without direction preamble."
             )
         else:

@@ -83,6 +83,23 @@ class TestStripCodeFences(unittest.TestCase):
         raw = 'print("hi")'
         self.assertEqual(_strip_code_fences(raw), 'print("hi")')
 
+    def test_think_block_stripped_before_fence_match(self) -> None:
+        """Reasoning models (DeepSeek-V4, GLM-5.1, …) emit chain-of-thought
+        inside ``<think>...</think>`` ahead of the patched file.  The think
+        block can itself contain fenced example code.  Without stripping
+        first, the regex match would bleed reasoning text into the patch
+        body and ast.parse() would reject it on the leading ``<``."""
+        raw = (
+            "<think>Maybe the fix is\n```python\nprint('draft')\n```\n"
+            "but I'll do better.</think>\n"
+            "```python\nprint('actual fix')\n```"
+        )
+        self.assertEqual(_strip_code_fences(raw), "print('actual fix')")
+
+    def test_think_block_around_unfenced_code(self) -> None:
+        raw = "<think>Considering options.</think>\nimport os\nx = 1"
+        self.assertEqual(_strip_code_fences(raw), "import os\nx = 1")
+
 
 class TestIsValidPython(unittest.TestCase):
     def test_valid(self) -> None:

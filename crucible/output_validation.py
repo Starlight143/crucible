@@ -141,6 +141,39 @@ _JSON_BLOCK_RE = re.compile(
     r"```(?:json)?\s*(\{[\s\S]*?\}|\[[\s\S]*?\])\s*```", re.IGNORECASE
 )
 
+# Reasoning-model "thinking" wrappers.  Reasoning models (DeepSeek-V3/V4,
+# GLM-5.1, Qwen-3.5, o1-class …) emit chain-of-thought inside these tags
+# ahead of the answer.  When the reasoning text contains brace-shape tokens
+# (example dicts, pretty-printed sub-results, regex literals …) the forward
+# JSON scanner picks them up first and the actual answer is discarded.
+_REASONING_TAG_RE = re.compile(
+    r"<\s*(?:think|thinking|reasoning|reflection|scratchpad)\b[^>]*>"
+    r"[\s\S]*?"
+    r"<\s*/\s*(?:think|thinking|reasoning|reflection|scratchpad)\s*>",
+    re.IGNORECASE,
+)
+
+
+def strip_reasoning_blocks(text: str) -> str:
+    """Strip ``<think>…</think>`` (and aliases) from LLM output.
+
+    Idempotent; returns input unchanged when no such tag is present.
+
+    Reasoning models (DeepSeek-V3/V4, GLM-5.1, Qwen-3.5, o1-class …) emit
+    chain-of-thought inside ``<think|thinking|reasoning|reflection|scratchpad>``
+    tags ahead of the answer.  Any module that scans LLM output for JSON,
+    fenced code blocks, or other structured artefacts must call this first;
+    otherwise brace-/fence-shape tokens inside the reasoning block can be
+    captured as the "real" output and the actual answer is discarded.
+    """
+    if not text or "<" not in text:
+        return text
+    return _REASONING_TAG_RE.sub("", text)
+
+
+# Backwards-compatible alias (private name used internally before v1.0.4).
+_strip_reasoning_blocks = strip_reasoning_blocks
+
 
 def _coerce_to_str(raw: Any) -> Optional[str]:
     """Best-effort conversion of *raw* to a string for JSON extraction.
@@ -265,6 +298,10 @@ def extract_json(raw: Any) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
 
     raw_str = _coerce_to_str(raw)
     if not raw_str or not raw_str.strip():
+        return None, "Empty output"
+
+    raw_str = _strip_reasoning_blocks(raw_str)
+    if not raw_str.strip():
         return None, "Empty output"
 
     parsed, type_error, hit = _try_direct_json(raw_str.strip())

@@ -211,6 +211,30 @@ class TestExtractJsonFromResponse(unittest.TestCase):
         self.assertEqual(result["verdict"], "fail")
         self.assertEqual(result["summary"], "fmt={bad}")
 
+    def test_think_tag_decoy_json_stripped(self) -> None:
+        """Reasoning models (DeepSeek-V3/V4, GLM-5.1, Qwen-3.5, o1-class)
+        emit chain-of-thought inside ``<think>...</think>`` ahead of the
+        answer.  Any decoy JSON token inside the reasoning block must not
+        be returned as the adversarial-review result."""
+        raw = (
+            '<think>Maybe the verdict could be {"verdict": "fail", '
+            '"summary": "draft idea"}, but I need to check first.</think>\n'
+            '{"verdict": "pass", "findings": [], "summary": "all good"}'
+        )
+        result = _extract_json_from_response(raw)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["verdict"], "pass")
+        self.assertEqual(result["summary"], "all good")
+
+    def test_thinking_tag_alias_stripped(self) -> None:
+        raw = (
+            '<thinking>{"draft": true}</thinking>'
+            '{"verdict": "pass", "findings": []}'
+        )
+        result = _extract_json_from_response(raw)
+        self.assertIsNotNone(result)
+        self.assertEqual(result["verdict"], "pass")
+
 
 class TestSyntaxCheck(unittest.TestCase):
     def test_valid_python_files(self) -> None:

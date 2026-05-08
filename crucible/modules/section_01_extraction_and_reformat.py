@@ -1241,6 +1241,11 @@ def _coerce_direction_option_payloads(value: Any) -> Optional[List[Dict[str, Any
 def _extract_first_json_array(text: str) -> Optional[List[Any]]:
     if not text:
         return None
+    # Reasoning-model defence: any ``[…]`` array literal embedded inside a
+    # ``<think>…</think>`` block is part of the model's chain-of-thought, not
+    # the real answer.  Strip those blocks before scanning so the forward
+    # ``raw_decode`` does not capture an example/draft array as the result.
+    text = _strip_reasoning_blocks(text)
 
     def _decode_first_array(candidate: str) -> Optional[List[Any]]:
         decoder = json.JSONDecoder()

@@ -27,6 +27,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, List, Optional
 
+from crucible.output_validation import strip_reasoning_blocks
+
 # ── Public data models ────────────────────────────────────────────────────────
 
 @dataclass
@@ -112,7 +114,10 @@ def _call_llm(llm: Any, prompt: str) -> Optional[str]:
 
 def _strip_code_fences(text: str) -> str:
     """Remove markdown ``` fences from LLM output."""
-    text = text.strip()
+    # Reasoning-model defence: strip <think>/<reasoning>/… blocks first so
+    # the chain-of-thought (which often contains its own example fenced
+    # blocks) cannot leak into the generated test file body.
+    text = strip_reasoning_blocks(text or "").strip()
     # Full fence block
     match = re.match(r"^```(?:python)?\n?(.*?)```\s*$", text, re.DOTALL)
     if match:

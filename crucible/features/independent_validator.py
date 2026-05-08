@@ -38,6 +38,8 @@ import sys
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
+from crucible.output_validation import strip_reasoning_blocks
+
 # Keys that must never be forwarded to LLM-generated subprocess code.
 # Mirror of backtest_runner._SENSITIVE_ENV_KEY_PATTERNS.
 _SENSITIVE_ENV_KEY_PATTERNS = (
@@ -478,7 +480,11 @@ def _collect_source_for_review(
 
 def _extract_json_from_response(raw: str) -> Optional[dict]:
     """Extract a JSON object from LLM response, handling markdown fences."""
-    raw = raw.strip()
+    # Reasoning-model defence: any JSON-shape token inside <think>…</think>
+    # belongs to the model's chain-of-thought, not the answer.  Strip those
+    # blocks before scanning so a draft / hypothetical dict in the reasoning
+    # text cannot be returned in place of the real adversarial-review JSON.
+    raw = strip_reasoning_blocks(raw or "").strip()
     # Direct parse
     try:
         data = json.loads(raw)

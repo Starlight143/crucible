@@ -33,6 +33,44 @@ class TestJsonExtraction(unittest.TestCase):
         text = "```json\n[1, 2, 3]\n```"
         self.assertIsNone(qsc._extract_first_json_object(text))
 
+    def test_think_tag_decoy_stripped(self) -> None:
+        """Reasoning models embed <think>…</think> ahead of the answer.
+        Brace-shape tokens inside the reasoning block must not be returned
+        as the "first" outermost JSON object.  Regression: on a Quant Mode
+        Direction Debate run with DeepSeek-V4-pro as judge, the model emits
+        a tentative ``{"option": "X"}`` inside <think> before the real
+        decision JSON; without stripping, the decoy was returned and
+        DirectionDecision parsing failed, force-killing the entire stage."""
+        text = (
+            "<think>I'll consider {\"option\": \"X\"} as a draft.</think>\n"
+            "{\"selected_direction\": \"long\", \"confidence\": \"high\"}"
+        )
+        self.assertEqual(
+            qsc._extract_first_json_object(text),
+            {"selected_direction": "long", "confidence": "high"},
+        )
+
+    def test_thinking_alias_stripped(self) -> None:
+        text = (
+            "<thinking>{\"foo\": 1}</thinking>"
+            "{\"selected_direction\": \"B\"}"
+        )
+        self.assertEqual(
+            qsc._extract_first_json_object(text),
+            {"selected_direction": "B"},
+        )
+
+    def test_reasoning_alias_stripped(self) -> None:
+        text = (
+            "<reasoning>some chain of thought {\"draft\": true}</reasoning>"
+            "{\"answer\": 99}"
+        )
+        self.assertEqual(qsc._extract_first_json_object(text), {"answer": 99})
+
+    def test_no_tag_unchanged(self) -> None:
+        text = "{\"a\": 1}"
+        self.assertEqual(qsc._extract_first_json_object(text), {"a": 1})
+
 
 if __name__ == "__main__":
     unittest.main()

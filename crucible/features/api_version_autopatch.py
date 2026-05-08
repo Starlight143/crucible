@@ -28,6 +28,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
+from crucible.output_validation import strip_reasoning_blocks
+
 # ── Data models ───────────────────────────────────────────────────────────────
 
 @dataclass
@@ -113,7 +115,12 @@ def _find_symbol_in_source(source: str, deprecated_api: str) -> bool:
 
 
 def _strip_code_fences(text: str) -> str:
-    text = text.strip()
+    # Reasoning-model defence: DeepSeek-V4 / GLM-5.1 / o1-class judges emit
+    # chain-of-thought inside <think>…</think> ahead of the patched file.
+    # The reasoning text often contains its own fenced sample blocks; without
+    # stripping, the fence regex below would bleed the reasoning text into
+    # the returned code and ast.parse() would reject it on the leading "<".
+    text = strip_reasoning_blocks(text or "").strip()
     match = re.match(r"^```(?:python)?\n?(.*?)```\s*$", text, re.DOTALL)
     if match:
         return match.group(1).strip()

@@ -549,6 +549,33 @@ def _render_prompt_template(template: str, template_vars: Optional[Dict[str, Any
 
 JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)```", re.DOTALL | re.IGNORECASE)
 
+# Reasoning-model "thinking" wrappers.  DeepSeek-V3/V4, GLM-5.1, Qwen-3.5,
+# o1-style and similar reasoning models emit their internal chain of thought
+# inside one of these tags before the actual answer.  When the reasoning text
+# itself contains a brace-shape token (a hypothetical example dict, a
+# pretty-printed sub-result, a regex literal, …), the forward JSON scan
+# captures that token first and the real answer that follows is discarded.
+# Strip these blocks before JSON extraction so the scanner only sees the
+# model's final answer.
+_REASONING_TAG_RE = re.compile(
+    r"<\s*(?:think|thinking|reasoning|reflection|scratchpad)\b[^>]*>"
+    r"[\s\S]*?"
+    r"<\s*/\s*(?:think|thinking|reasoning|reflection|scratchpad)\s*>",
+    re.IGNORECASE,
+)
+
+
+def _strip_reasoning_blocks(text: str) -> str:
+    """Strip ``<think>…</think>`` and similar reasoning blocks from LLM output.
+
+    Idempotent and safe on text that contains no such tags (returns the input
+    unchanged).  Always preserves a trailing newline-trimmed body so downstream
+    JSON scanners do not see a leading whitespace-only fragment.
+    """
+    if not text or "<" not in text:
+        return text
+    return _REASONING_TAG_RE.sub("", text)
+
 
 def _parse_json_candidate(candidate: str) -> Optional[dict]:
     try:
@@ -591,6 +618,7 @@ def _extract_first_json_object(text: str) -> Optional[dict]:
     """Best-effort: extract first JSON object from a string."""
     if not text:
         return None
+    text = _strip_reasoning_blocks(text)
     s = text.strip()
     if s.startswith("{") and s.endswith("}"):
         obj = _parse_json_candidate(s)

@@ -5,6 +5,50 @@ Versioning follows [Semantic Versioning](https://semver.org/). The first public 
 
 ---
 
+## [v1.0.4] — 2026-05-08
+
+### Fixed
+- **Reasoning-model `<think>` blocks corrupted every structured-output
+  extractor**: DeepSeek-V3/V4, GLM-5.1, Qwen-3.5 and o1-class models emit
+  chain-of-thought inside `<think>…</think>` (and `<thinking>` /
+  `<reasoning>` / `<reflection>` / `<scratchpad>` aliases) ahead of the
+  answer. Any brace- or fence-shape token in the reasoning text was
+  captured as the first outermost JSON object / longest fenced block, so
+  the real answer was discarded. The most visible symptom was Stage 0
+  Direction Debate falling back to `[Warn] Direction debate could not
+  produce a valid decision`; the same defect silently truncated every
+  adversarial-review run, every auto-remediation patch, every generated
+  test file, and every multi-language translation. New shared helper
+  `crucible.output_validation.strip_reasoning_blocks` now runs ahead of
+  every structured-output scan: `_extract_first_json_object` /
+  `_extract_first_json_array`, `extract_json`, the section_06 API-version
+  regex, `independent_validator._extract_json_from_response`,
+  `backtest_runner._extract_code_block`, and the four feature-module
+  `_strip_code_fences` helpers. 15 new regression tests.
+- **Direction Debate force-none gate had no diagnostic surface**
+  (`crucible/modules/section_02_research_and_llm.py`):
+  `_should_force_direction_none` returned silently with no print and no
+  dump, so users had no way to tell which gate fired. The path now prints
+  `[Warn] … gate fired (reason=… citations=… grounded_claims=…
+  weak_directions=…)` and writes a JSON debug dump under
+  `saved_projects/direction_debug/` tagged `note=force_none:<reason>`.
+- **`run_direction_debate` final exit summary**
+  (`crucible/modules/section_02_research_and_llm.py`): after all
+  refinement iterations exhaust, the loop now prints one summary line
+  with the last `gap_info` (or points at the latest dump file for
+  JSON-parse failures) before returning None.
+- **Runner [Warn] message points at diagnostics**
+  (`crucible/modules/section_07_selfcheck_output_main.py`): the generic
+  fallback message now references the preceding `[Warn]` line(s) and
+  `saved_projects/direction_debug/`.
+
+### Validation
+- pytest: 1 941 passed, 1 skipped under `-m "not slow and not network"`.
+- `crucible/smoke_test.py`: 5/5 OK.
+- `run_crucible.py --self-check`: OK.
+
+---
+
 ## [v1.0.3] — 2026-05-08
 
 ### Changed

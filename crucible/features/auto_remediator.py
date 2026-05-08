@@ -27,6 +27,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
+from crucible.output_validation import strip_reasoning_blocks
+
 # ── Data models ──────────────────────────────────────────────────────────────
 
 @dataclass
@@ -123,7 +125,12 @@ def _call_llm(llm: Any, prompt: str) -> Optional[str]:
 
 def _strip_code_fences(text: str) -> str:
     # Normalise Windows CRLF → LF first so all patterns work uniformly.
-    text = text.replace("\r\n", "\n").strip()
+    text = (text or "").replace("\r\n", "\n")
+    # Reasoning-model defence: strip <think>/<reasoning>/… blocks before
+    # fence detection.  Without this the patched-file content can leak the
+    # model's chain-of-thought, which then fails ast.parse() on the leading
+    # "<" character and rejects every fix attempt.
+    text = strip_reasoning_blocks(text).strip()
     match = re.match(r"^```(?:python)?\n?(.*?)```\s*$", text, re.DOTALL)
     if match:
         return match.group(1).strip()

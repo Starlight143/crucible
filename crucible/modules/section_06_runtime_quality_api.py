@@ -3779,6 +3779,12 @@ JSON array only, no additional text:"""
             log_fields={"library": library},
         )
         raw_output = str(output).strip()
+        # Reasoning-model defence: a chain-of-thought emitted ahead of the
+        # answer can contain example / hypothetical JSON arrays (e.g. "Maybe
+        # the answer looks like [{"deprecated_api": "..."}]").  The regex
+        # below is non-greedy, so the FIRST match wins — without stripping
+        # we would return the example instead of the real list.
+        raw_output = _strip_reasoning_blocks(raw_output)
 
         # Extract JSON array from output
         json_match = re.search(r"\[\s*\{.*?\}\s*\]", raw_output, re.DOTALL)

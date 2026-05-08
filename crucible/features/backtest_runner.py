@@ -78,6 +78,8 @@ from datetime import datetime, timedelta, timezone
 from itertools import product as iter_product
 from typing import Any, Dict, List, Optional, Set, Tuple
 
+from crucible.output_validation import strip_reasoning_blocks
+
 _UTC = timezone.utc
 
 # Module-level RNG used for non-reproducible sampling (e.g. random parameter
@@ -2322,6 +2324,13 @@ def _extract_code_block(text: str) -> str:
        fence followed by the real fix).
     """
     import re
+
+    # Reasoning-model defence: a model like DeepSeek-V4 / GLM-5.1 may emit a
+    # ``<think>`` block ahead of the actual fix that itself contains a fenced
+    # ``\`\`\`python`` example.  Strategy 1's "longest fenced block wins"
+    # heuristic would then return the example instead of the real patch.
+    # Strip reasoning blocks before any fence scanning.
+    text = strip_reasoning_blocks(text)
 
     # Strategy 1: paired fenced block — prefer the longest match across
     # multiple fences so a small ``# example`` block before the actual fix
