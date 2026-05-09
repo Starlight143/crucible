@@ -2964,6 +2964,14 @@ def _normalize_codegen_manifest(
             for key in chunk:
                 remaining.pop(key, None)
 
+    if expected_project_type == "quant":
+        normalized_batches = _quant_hoist_schema_first(
+            normalized_batches,
+            known_paths=known_paths,
+            file_map=normalized_plan_map,
+            batch_size=batch_size,
+        )
+
     return CodegenManifest(
         project_type=project_type,
         architecture_summary=limit_text(
@@ -2975,6 +2983,189 @@ def _normalize_codegen_manifest(
         files=normalized_files,
         generation_batches=normalized_batches,
     )
+
+
+# v1.0.5 round 2 (P1-6 b): hoist Quant schema files (trade.py, config.py) into
+# the very first batch so subsequent batches see their dataclass/Config field
+# layout as ground truth via the codegen prompt's "Approved schema signatures"
+# section. Without this, the LLM frequently invents Trade kwargs in batch_2
+# that batch_4's actual trade.py never declared, producing TypeError at first
+# call. The hoist is purely a re-ordering — every emitted file is still
+# present, dependency order is still respected, and bundle contents are
+# unchanged when no schema files exist.
+#
+# v1.0.5 round 3 (P1-6 b': generalisation): the hardcoded filename list above
+# is the *baseline* — but the hoist now ALSO accepts any other module whose
+# manifest plan declares a schema-shaped definition (dataclass / Pydantic
+# BaseModel / TypedDict / NamedTuple / Enum / @attr.s). When the LLM merges
+# Trade + Config into ``models.py`` or renames them, the AST-based discovery
+# below finds them anyway. Detection runs on the manifest's ``must_contain``
+# strings + ``purpose`` field (no source code is available pre-codegen), with
+# a permissive heuristic so a single schema-shaped marker is enough.
+_QUANT_SCHEMA_FILENAMES: Set[str] = {"trade.py", "config.py"}
+_SCHEMA_PURPOSE_KEYWORDS: Tuple[str, ...] = (
+    "dataclass",
+    "data class",
+    "schema",
+    "domain model",
+    "domain models",
+    "value object",
+    "config object",
+    "config dataclass",
+    "settings dataclass",
+    "trade record",
+    "order record",
+    "typedef",
+    "typeddict",
+    "namedtuple",
+    "pydantic model",
+    "basemodel",
+    "constants",
+    "configuration constants",
+)
+_SCHEMA_MUSTCONTAIN_HINTS: Tuple[str, ...] = (
+    "@dataclass",
+    "@dataclasses.dataclass",
+    "class Trade",
+    "class Order",
+    "class Position",
+    "class Signal",
+    "class Config",
+    "class Settings",
+    "class Constants",
+    "(BaseModel)",
+    "TypedDict",
+    "NamedTuple",
+    "Enum)",
+    "from dataclasses import",
+)
+
+
+def _file_plan_looks_schema_shaped(plan: Optional["CodegenFilePlan"]) -> bool:
+    """v1.0.5 round 3: heuristic — does this file plan describe a pure-schema
+    module (dataclass/TypedDict/Pydantic/Enum/constants)?
+
+    Used by ``_quant_hoist_schema_first`` so the hoist is not coupled to the
+    hardcoded ``trade.py`` / ``config.py`` filenames. Returns False when the
+    plan is missing or has no schema-shaped marker.
+    """
+    if plan is None:
+        return False
+    purpose = (getattr(plan, "purpose", "") or "").lower()
+    if any(keyword in purpose for keyword in _SCHEMA_PURPOSE_KEYWORDS):
+        return True
+    must_contain_items = list(getattr(plan, "must_contain", None) or [])
+    must_contain_text = "\n".join(str(item) for item in must_contain_items)
+    if any(hint in must_contain_text for hint in _SCHEMA_MUSTCONTAIN_HINTS):
+        return True
+    return False
+
+
+def _quant_hoist_schema_first(
+    batches: List[CodegenBatchPlan],
+    *,
+    known_paths: Set[str],
+    file_map: Dict[str, CodegenFilePlan],
+    batch_size: int,
+) -> List[CodegenBatchPlan]:
+    """Lift trade.py / config.py to batch 0 in-place.
+
+    Schema files with no external deps (or deps only on other schema files)
+    can always be hoisted safely — they are pure dataclass / constants by
+    contract. Files that depend on something outside the schema set are left
+    in their dependency-resolved slot.
+
+    If the existing batch 0 plus the hoisted schema files would exceed the
+    per-batch ``batch_size`` cap, a new dedicated schema batch is inserted at
+    position 0; otherwise the schema files are merged into the front of the
+    existing first batch.
+    """
+    if not batches:
+        return batches
+
+    # Identify hoistable schema files. v1.0.5 round 3: the canonical
+    # filenames are still tier-1 evidence, but any file whose manifest plan
+    # describes a schema-shaped module (dataclass / Pydantic / TypedDict /
+    # constants module) is also eligible — so a bundle that consolidates
+    # Trade + Config into ``models.py`` still gets the hoist.
+    schema_in_bundle: Set[str] = set()
+    for path in known_paths:
+        if os.path.basename(path) in _QUANT_SCHEMA_FILENAMES:
+            schema_in_bundle.add(path)
+            continue
+        plan = file_map.get(path)
+        if _file_plan_looks_schema_shaped(plan):
+            schema_in_bundle.add(path)
+    if not schema_in_bundle:
+        return batches
+
+    candidates: List[str] = []
+    for path in sorted(schema_in_bundle):
+        plan = file_map.get(path)
+        if plan is None:
+            continue
+        deps = set(plan.depends_on or [])
+        if deps and not deps.issubset(schema_in_bundle):
+            continue
+        candidates.append(path)
+    if not candidates:
+        return batches
+
+    # If every candidate is already in the first batch, no work to do.
+    first_files = list(batches[0].files or [])
+    first_set = set(first_files)
+    needs_lift = [p for p in candidates if p not in first_set]
+    if not needs_lift:
+        return batches
+
+    # Strip lifted files from later batches (and drop emptied batches).
+    new_after_first: List[CodegenBatchPlan] = []
+    for batch in batches[1:]:
+        kept = [f for f in (batch.files or []) if f not in needs_lift]
+        if kept:
+            new_after_first.append(
+                CodegenBatchPlan(
+                    name=batch.name,
+                    objective=batch.objective,
+                    files=kept,
+                )
+            )
+
+    # Merge into front of batch_0 if it fits the per-batch cap; otherwise
+    # insert a new schema-only batch ahead of the original first batch.
+    schema_in_first = [p for p in first_files if p in candidates]
+    schema_files_for_first = [
+        p
+        for p in (sorted(set(schema_in_first) | set(needs_lift)))
+    ]
+    non_schema_first = [f for f in first_files if f not in candidates]
+    merged_first_files = schema_files_for_first + non_schema_first
+
+    if len(merged_first_files) <= batch_size:
+        new_first = CodegenBatchPlan(
+            name=batches[0].name,
+            objective=(batches[0].objective or "")
+            + " (v1.0.5: schema-first hoist)",
+            files=merged_first_files,
+        )
+        return [new_first] + new_after_first
+
+    # Schema-only sentinel batch + original first batch (minus schema dupes).
+    schema_only_batch = CodegenBatchPlan(
+        name="batch_schema",
+        objective="v1.0.5 schema-first batch: emit Trade / Config dataclasses before any dependant file.",
+        files=schema_files_for_first,
+    )
+    original_first_kept = CodegenBatchPlan(
+        name=batches[0].name,
+        objective=batches[0].objective,
+        files=non_schema_first,
+    )
+    out: List[CodegenBatchPlan] = [schema_only_batch]
+    if original_first_kept.files:
+        out.append(original_first_kept)
+    out.extend(new_after_first)
+    return out
 
 
 def _reformat_codegen_manifest(
@@ -3305,6 +3496,156 @@ def _build_codegen_manifest_crew(
     )
 
 
+_SCHEMA_BASE_NAMES: Set[str] = {
+    "BaseModel",
+    "TypedDict",
+    "NamedTuple",
+    "Enum",
+    "IntEnum",
+    "StrEnum",
+    "Flag",
+}
+
+
+def _class_def_is_schema_shaped(node: "Any") -> bool:
+    """v1.0.5 round 3: True iff the AST ClassDef looks like a dataclass /
+    Pydantic / TypedDict / NamedTuple / Enum — i.e. a pure declarative schema
+    we should publish to subsequent batches as a frozen signature.
+    """
+    import ast as _ast
+
+    if not isinstance(node, _ast.ClassDef):
+        return False
+    # @dataclass / @dataclasses.dataclass / @attr.s / @attrs.define
+    for d in node.decorator_list or []:
+        # `@dataclass`
+        if isinstance(d, _ast.Name) and d.id in {"dataclass", "frozen"}:
+            return True
+        # `@dataclasses.dataclass`
+        if isinstance(d, _ast.Attribute) and d.attr in {"dataclass", "define", "frozen"}:
+            return True
+        # `@dataclass(frozen=True)` etc.
+        if isinstance(d, _ast.Call):
+            f = d.func
+            if isinstance(f, _ast.Name) and f.id in {"dataclass", "define"}:
+                return True
+            if isinstance(f, _ast.Attribute) and f.attr in {"dataclass", "define"}:
+                return True
+    # Inherit from BaseModel / TypedDict / NamedTuple / Enum-flavoured.
+    for base in node.bases or []:
+        if isinstance(base, _ast.Name) and base.id in _SCHEMA_BASE_NAMES:
+            return True
+        if isinstance(base, _ast.Attribute) and base.attr in _SCHEMA_BASE_NAMES:
+            return True
+    # Conventional names (Trade / Order / Position / Signal / Config / Settings).
+    if node.name in {"Trade", "Order", "Position", "Signal", "Config", "Settings", "Constants"}:
+        return True
+    return False
+
+
+def _extract_quant_schema_signatures(
+    current_bundle: Optional[CodeBundle],
+    *,
+    project_type: str,
+) -> str:
+    """v1.0.5 round 2 (P1-6 c) + round 3 (generalisation): build a compact
+    "Approved schema signatures" block from already-emitted schema-shaped
+    modules so subsequent codegen batches receive the actual dataclass field
+    names + types instead of inventing kwargs.
+
+    Round 3: detection is no longer locked to ``trade.py`` / ``config.py``.
+    Any bundle file whose AST contains a dataclass / Pydantic BaseModel /
+    TypedDict / NamedTuple / Enum / @attr.s / well-known schema class name
+    contributes its declarations. This means bundles where the LLM merges
+    ``Trade`` + ``Config`` into ``models.py`` (or renames them) still get
+    schema injection — eliminating the round-2 brittleness around hardcoded
+    filenames.
+
+    Pure-AST — no imports, no exec — and silent on every non-Quant project so
+    SaaS/Web/Agent/Scientist prompts are unaffected.
+
+    Returns an empty string when no schema files have been emitted yet (the
+    very first batch) or when the bundle has no parseable schema modules.
+    """
+    if (project_type or "").strip().lower() != "quant":
+        return ""
+    bundle_files = list(getattr(current_bundle, "files", []) or [])
+    if not bundle_files:
+        return ""
+
+    import ast as _ast
+
+    parts: List[str] = []
+    for f in bundle_files:
+        path = (getattr(f, "path", "") or "").replace("\\", "/").lstrip("./")
+        if not path.endswith(".py"):
+            continue
+        base = path.split("/")[-1]
+        content = getattr(f, "content", "") or ""
+        if not content:
+            continue
+        try:
+            tree = _ast.parse(content)
+        except SyntaxError:
+            continue
+
+        # v1.0.5 round 3: tier-1 (canonical filename) AND tier-2 (AST-shaped)
+        # detection share the same emitter. Canonical-name files publish
+        # every top-level class; non-canonical files only publish those whose
+        # body matches the schema heuristic — this avoids dumping random
+        # service classes from ``backtest.py`` into the schema block.
+        canonical_filename = base in _QUANT_SCHEMA_FILENAMES
+        for node in tree.body:
+            if not isinstance(node, _ast.ClassDef):
+                continue
+            if not canonical_filename and not _class_def_is_schema_shaped(node):
+                continue
+            decorators = node.decorator_list or []
+            is_dataclass = any(
+                (isinstance(d, _ast.Name) and d.id == "dataclass")
+                or (isinstance(d, _ast.Attribute) and d.attr == "dataclass")
+                or (
+                    isinstance(d, _ast.Call)
+                    and (
+                        (isinstance(d.func, _ast.Name) and d.func.id == "dataclass")
+                        or (isinstance(d.func, _ast.Attribute) and d.func.attr == "dataclass")
+                    )
+                )
+                for d in decorators
+            )
+            field_lines: List[str] = []
+            for stmt in node.body:
+                if isinstance(stmt, _ast.AnnAssign) and isinstance(stmt.target, _ast.Name):
+                    ann = ""
+                    try:
+                        ann = _ast.unparse(stmt.annotation) if stmt.annotation else ""
+                    except Exception:
+                        ann = ""
+                    suffix = "" if stmt.value is None else " = ..."
+                    field_lines.append(
+                        f"    {stmt.target.id}: {ann}{suffix}".rstrip()
+                    )
+                elif isinstance(stmt, _ast.Assign):
+                    for target in stmt.targets:
+                        if isinstance(target, _ast.Name):
+                            field_lines.append(f"    {target.id} = ...")
+                            break
+            if not field_lines:
+                continue
+            label = "@dataclass " if is_dataclass else ""
+            parts.append(
+                f"[{base}] {label}class {node.name}:\n" + "\n".join(field_lines)
+            )
+
+    if not parts:
+        return ""
+    header = (
+        "Approved schema signatures (these are FROZEN — every kwarg / attribute "
+        "you use must appear below; do not invent extras):"
+    )
+    return header + "\n" + "\n\n".join(parts)
+
+
 def _build_codegen_batch_crew(
     user_problem: str,
     *,
@@ -3352,6 +3693,13 @@ def _build_codegen_batch_crew(
         dependency_file_max_chars=effective_dependency_file_max_chars,
         max_dependency_files=int(budget_profile["batch_max_dep_files"]),
     )
+    # v1.0.5 round 2 (P1-6 c): inject already-emitted Quant schema signatures
+    # so the LLM cannot reinvent Trade kwargs / Config attrs in later batches.
+    # Returns "" for non-Quant or when the very first batch is being built —
+    # both safe no-ops that keep the prompt budget intact.
+    schema_signatures = _extract_quant_schema_signatures(
+        current_bundle, project_type=project_type
+    )
     mode_rule_text = "\n".join(_resolved_codegen_rule_lines(mode_config, gate_decision, scope=scope))
     agent_spec = AgentSpec(
         name="codegen_batch",
@@ -3382,6 +3730,7 @@ def _build_codegen_batch_crew(
             "- Keep imports, names, and contracts consistent with dependency files already completed.\n"
             "- Do not emit markdown or commentary.\n"
             "{mode_rule_text}\n\n"
+            "{schema_signatures}\n\n"
             "User problem:\n{user_problem}\n\n"
             "Approved implementation context:\n{approved_context}\n\n"
             "Current manifest slice:\n{manifest_prompt}\n\n"
@@ -3405,8 +3754,13 @@ def _build_codegen_batch_crew(
             "approved_context": approved_context,
             "manifest_prompt": manifest_prompt,
             "existing_bundle_context": existing_bundle_context,
+            # v1.0.5 round 2: schema_signatures is high-priority — losing this
+            # block re-opens the Trade-kwargs-mismatch failure mode the rest
+            # of v1.0.5 was designed to close.
+            "schema_signatures": schema_signatures,
         },
         section_priority=[
+            "schema_signatures",
             "manifest_prompt",
             "existing_bundle_context",
             "approved_context",

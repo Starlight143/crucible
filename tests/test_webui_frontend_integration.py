@@ -167,6 +167,17 @@ _CANONICAL_SSE_EVENTS: tuple[str, ...] = (
     "codegen_kickoff_done",
     "direction_feedback_start",
     "direction_feedback_failed",
+    # v1.0.5 audit: ensure project_fix and crash-failure events emitted by
+    # backend sections 02/05/07 are wired into the agent-flow visualisation.
+    # project_fix_kickoff_* covers the quality-loop re-codegen phase that
+    # was previously silent on the frontend for 30-60s × N rounds — the
+    # exact area that v1.0.5 round 2/3 added structured failure_type to.
+    "project_fix_kickoff_start",
+    "project_fix_kickoff_done",
+    "project_fix_kickoff_failed",
+    "librarian_kickoff_failed",
+    "analysis_kickoff_failed",
+    "codegen_kickoff_failed",
 )
 
 
@@ -209,6 +220,8 @@ _STATE_HANDLER_KEYS: tuple[str, ...] = (
     "research_phase_done",
     "librarian_phase_start",
     "analysis_phase_done",
+    # v1.0.5: new state handler for the analysis-crew crash path.
+    "analysis_phase_error",
 )
 
 
@@ -270,3 +283,224 @@ def test_sse_eventsource_wiring_intact(app_js: str) -> None:
     assert "/api/run/" in app_js, "Run-status API path missing"
     assert "/stream?from=" in app_js, "SSE stream path missing"
     assert ".onmessage" in app_js, "EventSource.onmessage handler missing"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6. v1.0.5 — Frontend ↔ backend alignment for the structured quality-loop
+#    outcome.  Backend section_07 now writes ``review_report.failure_type``
+#    as a strictly-validated enum and promotes ``quality_passed`` /
+#    ``quality_loop_failure_type`` to the top level of ``run_meta.json``.
+#    The substring fallback (``"QUALITY_LOOP_GAVE_UP" in summary``) was
+#    removed in round 3.  These tests pin the frontend to the same contract
+#    so a future refactor cannot silently re-introduce the substring path
+#    or stop reading the structured field.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def test_app_js_reads_structured_quality_passed_field(app_js: str) -> None:
+    """``app.js`` must read ``meta.quality_passed`` and ``review.passes``.
+
+    The dashboard runs table and the run-detail modal both render a
+    quality-status badge; the only safe source of truth is the structured
+    field, not heuristics over free-form summary text.
+    """
+    assert "quality_passed" in app_js, (
+        "app.js does not reference quality_passed — the dashboard cannot "
+        "render the quality-loop status badge from the structured field."
+    )
+    assert "review.passes" in app_js or "review.failure_type" in app_js, (
+        "app.js does not read review.passes / review.failure_type — the "
+        "run-detail modal cannot fall back to the per-run review report "
+        "for older saved_projects/ entries."
+    )
+
+
+def test_app_js_reads_structured_quality_loop_failure_type(app_js: str) -> None:
+    """``app.js`` must reference ``quality_loop_failure_type``.
+
+    This is the canonical top-level field promoted by section_07 in
+    v1.0.5 round 2.  The frontend-side string match documents the
+    contract that a future renaming would need to preserve.
+    """
+    assert "quality_loop_failure_type" in app_js, (
+        "app.js does not reference quality_loop_failure_type — the "
+        "frontend will silently lose the structured failure signal."
+    )
+
+
+def test_app_js_does_not_substring_match_quality_loop_giveup(app_js: str) -> None:
+    """The frontend must mirror backend section_07's removal of the
+    substring fallback for ``QUALITY_LOOP_GAVE_UP``.  We forbid any code
+    path that does ``summary.includes("QUALITY_LOOP_GAVE_UP")`` or
+    ``indexOf("QUALITY_LOOP_GAVE_UP")`` on free-form text — the only
+    legitimate consumers are the strict-equality checks against the
+    structured ``failure_type`` enum value.
+    """
+    forbidden_patterns = [
+        re.compile(r"summary[^.]*\.\s*(?:includes|indexOf)\s*\(\s*['\"]QUALITY_LOOP_GAVE_UP", re.IGNORECASE),
+        re.compile(r"['\"]QUALITY_LOOP_GAVE_UP['\"]\s*\.\s*test\s*\(", re.IGNORECASE),
+        re.compile(r"\.match\s*\(\s*/QUALITY_LOOP_GAVE_UP/", re.IGNORECASE),
+    ]
+    for pat in forbidden_patterns:
+        m = pat.search(app_js)
+        assert not m, (
+            f"app.js contains a substring/regex match for "
+            f"QUALITY_LOOP_GAVE_UP against free-form text "
+            f"({m.group(0) if m else ''!r}).  Backend section_07 removed "
+            "this fallback in v1.0.5 round 3 — the frontend must use the "
+            "structured review_report.failure_type field instead."
+        )
+
+
+def test_app_js_quality_badge_helper_defined(app_js: str) -> None:
+    """The ``_qualityBadgeHtml`` helper must exist and recognise the
+    canonical enum value ``QUALITY_LOOP_GAVE_UP`` (uppercase, exact)."""
+    assert "_qualityBadgeHtml" in app_js, (
+        "_qualityBadgeHtml helper missing — runs table / run-detail modal "
+        "have no way to render the quality-loop status badge."
+    )
+    assert "'QUALITY_LOOP_GAVE_UP'" in app_js or '"QUALITY_LOOP_GAVE_UP"' in app_js, (
+        "QUALITY_LOOP_GAVE_UP literal missing from app.js — the badge "
+        "helper cannot match the structured failure_type value."
+    )
+
+
+def test_app_js_renders_review_issues_section(app_js: str) -> None:
+    """The run-detail modal must render the ``review.issues`` array with
+    severity grouping (high/medium/low).  Without this, the operator can
+    see ``Quality Status: ⚠ Gave up`` but has no in-UI way to inspect
+    *why* it gave up — the JSON file is only accessible from the disk.
+    """
+    assert "review.issues" in app_js, (
+        "app.js does not read review.issues — the run-detail modal will "
+        "not render the actionable issue list emitted by the quality loop."
+    )
+    assert "review-issue-list" in app_js, (
+        "app.js does not render the .review-issue-list container — the "
+        "issues section is missing from the modal body."
+    )
+
+
+def test_app_css_quality_badge_classes_present(app_css: str) -> None:
+    """The CSS must define the badge variants; missing classes silently
+    render an unstyled span and look like a regression."""
+    for cls in (
+        ".quality-badge.passed",
+        ".quality-badge.gaveup",
+        ".quality-badge.failed",
+        ".review-issue-severity-high",
+        ".review-issue-severity-medium",
+        ".review-issue-severity-low",
+    ):
+        assert cls in app_css, (
+            f"app.css does not define {cls} — the badge / issue row "
+            "renders without colour and the operator cannot tell the "
+            "severity at a glance."
+        )
+
+
+def test_project_fix_start_maps_to_code_gen_active(app_js: str) -> None:
+    """Backend section_07 emits ``project_fix_kickoff_start`` whenever the
+    quality loop re-runs codegen with feedback after self_check finds
+    issues.  The frontend evMap must map this event to the ``code_gen``
+    node in ``active`` state — otherwise the visual graph goes silent for
+    the entire quality loop (often 30-60s × N rounds), which is exactly
+    the v1.0.5 round 2/3 work area.
+    """
+    block = re.search(r"const evMap = \[(.+?)\];", app_js, re.DOTALL)
+    assert block is not None, "evMap declaration not found in app.js"
+    evmap_text = block.group(1)
+    # The mapping line must include all three pieces in the same row.
+    pat = re.compile(
+        r"\[/project_fix_kickoff_start[^/]*/[^,]*,\s*'code_gen'\s*,\s*'active'",
+    )
+    assert pat.search(evmap_text), (
+        "project_fix_kickoff_start does not map to code_gen / active in "
+        "evMap.  The quality-loop re-codegen phase will be invisible on "
+        "the agent-flow panel."
+    )
+
+
+def test_project_fix_done_dispatches_codegen_phase_done(app_js: str) -> None:
+    """``project_fix_kickoff_done`` must dispatch the existing
+    ``codegen_phase_done`` state handler so code_gen closes cleanly and
+    self_check re-activates for the next loop iteration.  Inventing a
+    new state handler would silently bypass the deferred-done flash that
+    ``codegen_phase_done`` already implements for stage-8 nodes.
+    """
+    block = re.search(r"const evMap = \[(.+?)\];", app_js, re.DOTALL)
+    assert block is not None
+    evmap_text = block.group(1)
+    pat = re.compile(
+        r"\[/project_fix_kickoff_done[^/]*/[^,]*,\s*null\s*,\s*'codegen_phase_done'",
+    )
+    assert pat.search(evmap_text), (
+        "project_fix_kickoff_done does not dispatch codegen_phase_done — "
+        "the quality-loop iteration boundary will not visibly hand off "
+        "from code_gen back to self_check."
+    )
+
+
+def test_project_fix_failed_maps_to_code_gen_error(app_js: str) -> None:
+    """A project_fix failure must mark code_gen as ``error`` so the
+    operator sees the red dot exactly where the fix attempt crashed.
+    """
+    block = re.search(r"const evMap = \[(.+?)\];", app_js, re.DOTALL)
+    assert block is not None
+    evmap_text = block.group(1)
+    pat = re.compile(
+        r"\[/project_fix_kickoff_failed[^/]*/[^,]*,\s*'code_gen'\s*,\s*'error'",
+    )
+    assert pat.search(evmap_text), (
+        "project_fix_kickoff_failed does not mark code_gen as error — "
+        "a crashed fix attempt would leave code_gen stuck active."
+    )
+
+
+def test_analysis_kickoff_failed_dispatches_phase_error(app_js: str) -> None:
+    """The analysis-crew crash path must error every stage-5/6/7 node so
+    the failure is visible regardless of which sub-agent crashed."""
+    block = re.search(r"const evMap = \[(.+?)\];", app_js, re.DOTALL)
+    assert block is not None
+    evmap_text = block.group(1)
+    pat = re.compile(
+        r"\[/analysis_kickoff_failed[^/]*/[^,]*,\s*null\s*,\s*'analysis_phase_error'",
+    )
+    assert pat.search(evmap_text), (
+        "analysis_kickoff_failed does not dispatch analysis_phase_error — "
+        "a crashed analysis crew would leave its nodes stuck active."
+    )
+
+
+def test_librarian_kickoff_failed_maps_to_librarian_error(app_js: str) -> None:
+    """The librarian-crew crash path must mark the librarian node as
+    error.  Without this, ``librarian_kickoff_done`` cannot fire either
+    (since the crew never finished) and the node stays green-active."""
+    block = re.search(r"const evMap = \[(.+?)\];", app_js, re.DOTALL)
+    assert block is not None
+    evmap_text = block.group(1)
+    pat = re.compile(
+        r"\[/librarian_kickoff_failed[^/]*/[^,]*,\s*'librarian'\s*,\s*'error'",
+    )
+    assert pat.search(evmap_text), (
+        "librarian_kickoff_failed does not mark librarian as error."
+    )
+
+
+def test_app_js_does_not_use_int_quality_passed_truthiness(app_js: str) -> None:
+    """The backend emits ``quality_passed`` as a JSON boolean (true / false
+    / null) — never an int.  The frontend must check against the boolean
+    explicitly so SQLite's int(0) result from older codepaths cannot
+    silently render as falsy when surfaced by some other backend feeding
+    in legacy data.  The badge helper does ``passed === true`` /
+    ``passed === false``; we pin that strict-equality usage here.
+    """
+    assert "passed === true" in app_js, (
+        "app.js does not strict-compare quality_passed against true — "
+        "ambiguous truthiness on the wire (1 vs true) could silently "
+        "render the wrong badge."
+    )
+    assert "passed === false" in app_js, (
+        "app.js does not strict-compare quality_passed against false — "
+        "the failed-run badge will not render correctly on legacy data."
+    )

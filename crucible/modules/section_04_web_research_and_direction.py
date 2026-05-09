@@ -197,6 +197,12 @@ def _quant_codegen_rules(scope: str) -> List[str]:
         "- Include a README.md with: project description, quick-start instructions, "
         "file-by-file explanation, all CLI flags and environment variables, "
         "backtest usage examples, live trading setup guide, and .env configuration reference",
+        # v1.0.5: correctness checklist as a single short line — keeps codegen
+        # prompt budget intact. Each clause maps to a concrete failure mode
+        # observed in real codegen runs (look-ahead, off-by-one, Trade kwargs
+        # mismatch, env-bool typo, IEEE 754 subnormal, missing import,
+        # constant-slippage when dynamic was advertised).
+        "- Quant correctness: entry@t+1-open; stop/TP range(1,N+1); Trade flat scalars + frozen signature first; bool-env whitelist; float-div not(x>1e-14); cross-file names must exist; dynamic-slippage MUST be size-dependent",
     ]
     if scope == "mvp":
         return base

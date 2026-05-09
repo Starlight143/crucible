@@ -663,6 +663,130 @@ textarea { resize: vertical; min-height: 120px; }
 .detail-chart-wrap canvas { max-height: 200px; }
 
 /* ═══════════════════════════════════════════════════════════════
+   v1.0.5 — QUALITY-LOOP STATUS BADGE
+   Renders ``review_report.passes`` + ``review_report.failure_type``
+   on the dashboard runs table and the run-detail modal.  Tri-state:
+   ✓ Passed (success) / ⚠ Gave up (warn) / ✗ Failed (error).
+═══════════════════════════════════════════════════════════════ */
+.quality-badge {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 8px;
+  border-radius: 99px;
+  font-size: 10px; font-weight: 700;
+  letter-spacing: .04em;
+  vertical-align: middle;
+  white-space: nowrap;
+}
+.quality-badge.passed {
+  background: rgba(34,211,160,.12);
+  border: 1px solid rgba(34,211,160,.35);
+  color: var(--success);
+}
+.quality-badge.gaveup {
+  background: rgba(251,191,36,.12);
+  border: 1px solid rgba(251,191,36,.35);
+  color: var(--warn);
+}
+.quality-badge.failed {
+  background: rgba(248,113,113,.12);
+  border: 1px solid rgba(248,113,113,.35);
+  color: var(--error);
+}
+
+/* ═══════════════════════════════════════════════════════════════
+   v1.0.5 — REVIEW ISSUE LIST (run-detail modal)
+   Surfaces ``review_report.json`` issues grouped/sorted by severity.
+═══════════════════════════════════════════════════════════════ */
+.review-issue-list {
+  display: flex; flex-direction: column; gap: 8px;
+  max-height: 360px;
+  overflow-y: auto;
+}
+.review-issue-item {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+.review-issue-head {
+  display: flex; align-items: center; gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 6px;
+}
+.review-issue-sev {
+  display: inline-flex; align-items: center;
+  padding: 2px 7px;
+  border-radius: 99px;
+  font-size: 10px; font-weight: 700;
+  letter-spacing: .04em;
+}
+.review-issue-severity-high {
+  background: rgba(248,113,113,.12);
+  border: 1px solid rgba(248,113,113,.35);
+  color: var(--error);
+}
+.review-issue-severity-medium {
+  background: rgba(251,191,36,.12);
+  border: 1px solid rgba(251,191,36,.35);
+  color: var(--warn);
+}
+.review-issue-severity-low {
+  background: rgba(96,165,250,.12);
+  border: 1px solid rgba(96,165,250,.35);
+  color: var(--info);
+}
+.review-issue-severity-unknown {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  color: var(--text-2);
+}
+.review-issue-cat {
+  font-size: 10px;
+  color: var(--text-2);
+  text-transform: uppercase;
+  letter-spacing: .05em;
+}
+.review-issue-file {
+  font-size: 11px;
+  color: #a5b4fc;
+  font-family: 'JetBrains Mono', monospace;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 1px 6px;
+}
+.review-issue-desc {
+  font-size: 12px;
+  color: var(--text-1);
+  line-height: 1.5;
+  word-break: break-word;
+}
+.review-issue-sug {
+  font-size: 11px;
+  color: var(--text-2);
+  line-height: 1.5;
+  margin-top: 5px;
+  padding-top: 5px;
+  border-top: 1px dashed var(--border);
+  word-break: break-word;
+}
+.review-issue-sug-label {
+  font-weight: 700;
+  color: var(--success);
+  margin-right: 4px;
+  letter-spacing: .03em;
+  text-transform: uppercase;
+  font-size: 10px;
+}
+.review-issue-overflow {
+  font-size: 11px;
+  color: var(--text-muted);
+  text-align: center;
+  padding: 6px 0 2px;
+  font-style: italic;
+}
+
+/* ═══════════════════════════════════════════════════════════════
    WEBHOOK STATUS BADGE
 ═══════════════════════════════════════════════════════════════ */
 .webhook-badge {

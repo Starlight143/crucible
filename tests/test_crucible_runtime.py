@@ -2597,14 +2597,19 @@ class TestCrucibleCrewRuntime(unittest.TestCase):
                 current_bundle=current_bundle,
                 context_max_chars=9000,
                 dependency_file_max_chars=5000,
-                max_input_chars=4800,
+                # v1.0.5 bumped from 4800 → 5100 to absorb the new Quant
+                # correctness checklist line in the rules section. The test
+                # still proves manifest/dependency preservation under tight
+                # budget pressure — only the precise ceiling moved with the
+                # rule set's natural growth.
+                max_input_chars=5100,
             )
         finally:
             for key, value in original_values.items():
                 globals_dict[key] = value
 
         description = str(captured.get("description", "") or "")
-        self.assertLessEqual(len(description), 4800)
+        self.assertLessEqual(len(description), 5100)
         self.assertIn("Current manifest slice:", description)
         self.assertIn("- path: src/main.py", description)
         self.assertIn("depends_on: src/types.py", description)

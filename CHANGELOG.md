@@ -5,6 +5,107 @@ Versioning follows [Semantic Versioning](https://semver.org/). The first public 
 
 ---
 
+## [v1.0.5] — 2026-05-09
+
+### Fixed
+- **Quant runtime validation was a no-op** — detector only saw FastAPI
+  apps so Quant slipped past `py_compile`. New `section_06` track:
+  import smoke + AST cross-ref (`cross_reference_check.py`,
+  **X001-X004** + escape **W001-W003**) + domain lint (`quant_lint.py`,
+  **Q001-Q004**, `# noqa: Q00x`) + GBM-OHLCV dry-run (`quant_smoke.py`,
+  **Q010-Q015**) + ccxt-stubbed live_trader smoke (**Q020-Q024**).
+- **Q001 closes all look-ahead escapes** — direct (`row['open']`,
+  `.open`), wrapped (`float`/`int`/`Decimal`/`round`), function-wrapped
+  (`compute_entry(row)` with param aliasing), column-iter literal
+  (`for col in ['open']`), positional on row aliases (`row.values[0]`,
+  MEDIUM), async/closure. Vars: `entry_price`/`fill_price`/etc.
+- **Q024 live_trader behavioural SL** — price ramp 100→64 over 10 ticks
+  with `_opened`/`_closed` lists + wrappers on `close_position`/
+  `_close`/`exit_pos`/`manage_pos`/`check_stop`. `stop_loss` source +
+  open + zero closes → high. Catches the silent-SL class (no exception,
+  just always-False time gate / off-by-one) that Q020-Q023 miss.
+- **W001-W003 escape warnings** — `Trade(**signal_dict)` → W001 (med);
+  `getattr(cfg, "LIT"[, default])` → W002 (high without default, med
+  with); `cfg['LIT']` → W003 (high). Closes the LLM's three favourite
+  shortcuts when X001/X002 fires in the fix loop.
+- **Schema-first Quant codegen** (`section_05`) — manifest hoists
+  schema files to batch 0; prompt gets AST-extracted "Approved schema
+  signatures". Shape-based detection (`@dataclass`/`BaseModel`/
+  `TypedDict`/`NamedTuple`/Enum/`@attr.s`/canonical names) survives
+  merging into `models.py` or renaming. Trade-kwargs mismatch eliminated
+  at source.
+- **Dirty-data fixture** (`CRUCIBLE_QUANT_DRYRUN_DIRTY_DATA=1`) —
+  NaN/zero volume + partial-NaN OHLC + 3-day gap exercise data-cleaning
+  branches.
+- **Pre-codegen gate floor** (`CRUCIBLE_PRE_CODEGEN_MIN_SCORE`, default
+  60) — forces `ready_for_codegen=False` below floor unless
+  validation-only scope.
+- **Quality-loop stagnation: structured + strict** —
+  `ReviewReport.failure_type` is Pydantic-validated against an explicit
+  allowed-set (typo → ValueError at write); section_07 substring
+  fallback removed; `save_project_output` promotes `quality_passed` +
+  `quality_loop_failure_type` to `run_meta.json`. README renders a
+  `quality_pass=False` blockquote (EN + zh-TW). Migration script
+  `scripts/migrate_review_failure_type.py` back-fills legacy runs.
+- **Quant correctness checklist** (`section_04`) — one prompt bullet
+  codifies entry@t+1-open, `range(1, N+1)` stop loops, flat frozen
+  Trade dataclass, env-bool whitelist, `not (x > 1e-14)` denominators,
+  cross-file name existence, size-dependent dynamic slippage.
+- **Production-scope `tests/` enforcement** — opt-in via
+  `CRUCIBLE_QUANT_REQUIRE_TESTS=1` or `codegen_scope='production'`;
+  missing `tests/*.py` becomes high.
+- **Mode-specific validation matrix** (`mode_validation_matrix.py`) —
+  single source of truth (active/opt-in/deferred). Universal cross-ref
+  (X001-X004 + W001-W003) now runs on all modes (default ON, opt-out
+  `CRUCIBLE_UNIVERSAL_CROSSREF=0`) plus per-mode lint: SaaS **H001**
+  (web framework imported but undeclared); Agent **A001/A002**
+  (role/goal/backstory missing; Tool without description); Scientist
+  **S001/S002** (no seed; no requirements manifest). Rendered table in
+  `ARCHITECTURE.md` makes deferred defences visible debt.
+- **Pipeline integration regression suite** — 9 fixture bundles
+  (R01-R09 covering X001-X003, Q001-Q004, W001-W002) with hard CI floor
+  ≥ 7/9 caught; guards silent pipeline short-circuits.
+- **WebUI surfaces structured quality outcome** — `_extract_run_row`
+  reads `run_meta.quality_passed` (canonical, `review_report.json`
+  fallback for legacy runs) and strictly-validated
+  `quality_loop_failure_type`; SQLite index gains two idempotently-
+  migrated columns. Dashboard tri-state badge (✓ Passed / ⚠ Gave up /
+  ✗ Failed); run-detail modal adds Quality Status, Review Summary,
+  severity-grouped Issues (high → med → low, cap 20 + overflow tail).
+  Substring matching `QUALITY_LOOP_GAVE_UP` against summary text
+  forbidden by regression test (mirrors backend strict validation).
+- **Agent-flow ↔ backend SSE alignment** — `project_fix_kickoff_*`
+  (the entire quality-loop re-codegen area) was unmapped in `evMap`,
+  leaving the panel silent for 30-60s × N rounds. Added: `start` →
+  `code_gen` active; `done` → reuses `codegen_phase_done`; `failed` →
+  `code_gen` error. Also wired `librarian_kickoff_failed` and
+  `analysis_kickoff_failed` (new `analysis_phase_error` handler errors
+  stages 5-7 in one shot). Shape tests pin exact mapping rows.
+- **Dashboard "Total Cost" was always $0** — `save_project_output`
+  never wrote `total_cost_usd` / `total_cost` / `total_tokens` to
+  `run_meta.json`, so `_extract_run_row` read `None` → SQLite NULL →
+  dashboard summed to $0 even when runs spent real money. Section_07
+  now promotes the cost ledger from `run_snapshot.cost_summary`
+  (frozen authoritative state) or the live cost accountant; `setdefault`
+  preserves caller overrides. Webui extraction prefers `total_cost_usd`
+  over the legacy units field, falls back to `run_snapshot.json`
+  for legacy saved_projects/, and preserves full IEEE 754 precision
+  end-to-end (no rounding before persistence — a per-call OpenRouter
+  cost at the 6th decimal survives 100× summation intact). Dashboard
+  rounds to **6 decimals** (was 5); all four frontend cost formatters
+  (`toFixed(4)`/`toFixed(5)`) raised to `toFixed(6)` to match
+  cost_tracker precision. `scripts/migrate_run_meta_cost.py`
+  back-fills cost into legacy `run_meta.json` from `run_snapshot.json`.
+
+### Validation
+- pytest: 2 149 passed, 1 skipped (`-m "not slow and not network"`);
+  201 new v1.0.5 tests, 30 webui frontend/backend alignment tests,
+  12 cost-surfacing tests covering all three layers (section_07
+  promotion / webui extraction / display precision).
+- `crucible/smoke_test.py`: 5/5 OK; `run_crucible.py --self-check`: OK.
+
+---
+
 ## [v1.0.4] — 2026-05-08
 
 ### Fixed

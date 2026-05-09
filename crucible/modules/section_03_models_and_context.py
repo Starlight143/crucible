@@ -270,10 +270,85 @@ class ReviewIssue(BaseModel):
     suggestion: Optional[str] = Field(None, description="Suggested fix or mitigation")
 
 
+# v1.0.5 round 3 (P2-11 strict): allowed values for ReviewReport.failure_type.
+# Every value MUST be a member of FailureType (defined later in this file) and
+# MUST have a banner branch wired up in section_07. Adding a new value
+# requires updates in three places:
+#   1. add the FailureType enum member,
+#   2. add it here,
+#   3. add the banner copy + handling in section_07_selfcheck_output_main.
+# A unit test (test_failure_type_enum_drift.py) asserts the three lists stay
+# in sync, so a typo at any callsite raises ValueError at write time rather
+# than silently dropping the structured signal.
+_REVIEW_REPORT_ALLOWED_FAILURE_TYPES: "frozenset[str]" = frozenset({
+    "QUALITY_LOOP_GAVE_UP",
+})
+
+
+def _coerce_review_failure_type(value: Any) -> Optional[str]:
+    """Normalise + validate the value being assigned to ReviewReport.failure_type.
+
+    Accepts ``None``, an empty string (treated as None), an Enum whose
+    ``.value`` is a known marker, or a string equal (case-insensitively after
+    strip) to a known marker. Anything else raises ``ValueError`` so typos
+    (e.g. ``"QUALITY_LOOP_GIVE_UP"``) fail loudly at the write site instead of
+    silently dropping the observability signal.
+    """
+    if value is None:
+        return None
+    if hasattr(value, "value") and not isinstance(value, str):
+        # Enum instance — recurse on its .value so we share the same path.
+        return _coerce_review_failure_type(value.value)
+    if isinstance(value, str):
+        normalized = value.strip().upper()
+        if not normalized:
+            return None
+        if normalized not in _REVIEW_REPORT_ALLOWED_FAILURE_TYPES:
+            raise ValueError(
+                "ReviewReport.failure_type must be one of "
+                f"{sorted(_REVIEW_REPORT_ALLOWED_FAILURE_TYPES)} or None; "
+                f"got {value!r}. Add the new value to "
+                "_REVIEW_REPORT_ALLOWED_FAILURE_TYPES and to FailureType, "
+                "and wire a banner branch in section_07."
+            )
+        return normalized
+    raise TypeError(
+        "ReviewReport.failure_type must be str | Enum | None, "
+        f"got {type(value).__name__}"
+    )
+
+
 class ReviewReport(BaseModel):
     passes: bool = Field(..., description="Whether the review passed")
     summary: str = Field("", description="Review summary")
     issues: List[ReviewIssue] = Field(..., description="Review findings")
+    # v1.0.5 round 2 (P2-11 structural): structured failure_type so observability
+    # tools (agent_metrics, multi_project_compare, run_diff) can read the
+    # quality-loop outcome without grepping the summary string. Defaults to
+    # None for normal converged runs; set to FailureType.QUALITY_LOOP_GAVE_UP
+    # by run_quality_loop's stagnation early-stop path.
+    # v1.0.5 round 3 (strict): a model_validator below now coerces + validates
+    # every assignment against _REVIEW_REPORT_ALLOWED_FAILURE_TYPES, so typos
+    # raise ValueError at write time. The substring fallback in section_07's
+    # banner detection has been removed — consumers MUST go through the
+    # structured field.
+    failure_type: Optional[str] = Field(
+        default=None,
+        description="Structured failure_type marker (e.g. 'QUALITY_LOOP_GAVE_UP'); None for normal review outcomes.",
+    )
+
+    if _HAS_PYDANTIC_V2_MODEL_VALIDATOR:
+
+        @model_validator(mode="after")
+        def _validate_failure_type(self) -> "ReviewReport":
+            self.failure_type = _coerce_review_failure_type(self.failure_type)
+            return self
+    else:  # pragma: no cover - exercised only on Pydantic v1
+
+        @root_validator(skip_on_failure=True)
+        def _validate_failure_type(cls, values: Dict[str, Any]) -> Dict[str, Any]:
+            values["failure_type"] = _coerce_review_failure_type(values.get("failure_type"))
+            return values
 
 
 # =========================
@@ -779,6 +854,12 @@ class FailureType(str, Enum):
     CONFLICTING_OUTPUT = "CONFLICTING_OUTPUT"
     POLICY_VIOLATION = "POLICY_VIOLATION"
     NON_DETERMINISTIC = "NON_DETERMINISTIC"
+    # v1.0.5: quality-loop stagnation early stop — emitted when the per-round
+    # issue score has not improved for QUALITY_EARLY_STOP_STAGNATION_ROUNDS
+    # rounds and the loop bails. The bundle is *not* ready for production use,
+    # and snapshots flagged with this value should be surfaced as failures
+    # in the saved-project README rather than treated as deliverable.
+    QUALITY_LOOP_GAVE_UP = "QUALITY_LOOP_GAVE_UP"
 
 
 class ScoreVector(BaseModel):
@@ -1699,6 +1780,41 @@ def _normalize_gate_decision(
             list(gate_decision.advisory_experiments_after_codegen or [])
             + list(gate_decision.validation_objectives or [])
         )
+    # v1.0.5: hard pre-codegen gate on overall_score.
+    # Background: a previous run had ready_for_codegen=true with overall_score=40
+    # and 11 high/medium issues — the gate let the bundle through to codegen,
+    # the quality loop spun for 80 rounds without resolving the structural
+    # mismatches, and the saved_project shipped quality_pass=False as if
+    # deliverable. The fix is a deterministic floor: when overall_score is
+    # below the configured threshold, ready_for_codegen is forced False unless
+    # the gate explicitly opted into a validation-only scope. The threshold
+    # defaults to 60 and can be overridden with CRUCIBLE_PRE_CODEGEN_MIN_SCORE.
+    if (
+        gate_decision.ready_for_codegen
+        and not _gate_is_validation_scope(gate_decision)
+        and gate_decision.overall_score is not None
+    ):
+        try:
+            min_score_default = 60
+            min_score = int(
+                os.environ.get(
+                    "CRUCIBLE_PRE_CODEGEN_MIN_SCORE", str(min_score_default)
+                )
+            )
+        except (TypeError, ValueError):
+            min_score = 60
+        # min_score == 0 disables the floor entirely (escape hatch for tests).
+        if min_score > 0 and gate_decision.overall_score < min_score:
+            gate_decision.ready_for_codegen = False
+            detail = (
+                f"Pre-codegen gate floor: overall_score={gate_decision.overall_score} "
+                f"< {min_score}; refusing to enter codegen on a low-quality analysis."
+            )
+            if gate_decision.failure_type == FailureType.NONE.value:
+                gate_decision.failure_type = FailureType.LOW_CONFIDENCE.value
+                gate_decision.failure_details = detail
+            elif not gate_decision.failure_details:
+                gate_decision.failure_details = detail
     if gate_decision.should_kill or gate_decision.ready_for_codegen:
         gate_decision.direction_feedback_needed = False
         gate_decision.direction_feedback_type = None
@@ -1953,6 +2069,19 @@ ENTRYPOINT_FILES = {
     "main.js",
     "server.js",
     "index.js",
+}
+# v1.0.5: Quant-mode bundles never expose a web entrypoint; their canonical
+# top-level scripts are listed below so runtime validation can detect them
+# (importable smoke + synthetic-data dry-run) instead of reporting "no
+# entrypoints detected" and skipping smoke entirely.
+QUANT_ENTRYPOINT_FILES = {
+    "backtest.py",
+    "run_backtest.py",
+    "live_trader.py",
+    "data_provider.py",
+    "strategy.py",
+    "trade.py",
+    "cli.py",
 }
 SENSITIVE_FILENAMES = {
     "openrouter_key.txt",

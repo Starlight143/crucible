@@ -128,6 +128,19 @@ _README_LABELS_EN = {
     "validation_scope_reason": "Validation Scope Reason",
     "validation_objectives": "Validation Objectives",
     "kill_reason": "Kill Reason",
+    # v1.0.5: failure-prominent banner shown above the body when quality_pass=False
+    "failure_banner_title": "Quality review did NOT pass",
+    "failure_banner_body": (
+        "This bundle still has unresolved high/medium issues from the quality "
+        "review loop. Running it as-is is likely to crash or produce incorrect "
+        "results. Read the issues below (or `review_report.json`) and fix them "
+        "before treating this output as deliverable."
+    ),
+    "failure_banner_giveup_extra": (
+        "The quality loop hit early-stop stagnation — issue counts stopped "
+        "improving across consecutive rounds, so the loop bailed without "
+        "converging. The bundle is in a NOT-production-ready state."
+    ),
 }
 
 _README_LABELS_ZH = {
@@ -161,6 +174,17 @@ _README_LABELS_ZH = {
     "validation_scope_reason": "驗證範圍原因",
     "validation_objectives": "驗證目標",
     "kill_reason": "終止原因",
+    # v1.0.5: 品質審查未通過時於正文上方顯示的橫幅
+    "failure_banner_title": "品質審查未通過",
+    "failure_banner_body": (
+        "本批產出仍有未解決的 high/medium 問題。直接執行可能會 crash 或產出"
+        "錯誤結果。請先讀完下方的問題清單（或 `review_report.json`），修好"
+        "之後才能視為可交付。"
+    ),
+    "failure_banner_giveup_extra": (
+        "品質迴圈觸發 stagnation 早停 — 連續多輪問題數沒有下降，迴圈未"
+        "收斂就退出。此份產出屬於「未達生產就緒」狀態。"
+    ),
 }
 
 _PRINT_LABELS_EN = {
@@ -2221,6 +2245,78 @@ def save_project_output(
     if gate_payload:
         run_meta_payload.setdefault("gate_ready_for_codegen", gate_payload.get("ready_for_codegen"))
         run_meta_payload.setdefault("gate_confidence", gate_payload.get("confidence"))
+    # v1.0.5 round 2 (P2-11 structural): expose review.passes and review.failure_type
+    # at the top level of run_meta.json so observability tools (agent_metrics,
+    # multi_project_compare, run_diff, batch dashboards) can read the
+    # quality-loop outcome without parsing review_report.json.
+    if review is not None:
+        run_meta_payload.setdefault("quality_passed", bool(review.passes))
+        review_failure_type = (
+            str(getattr(review, "failure_type", "") or "").strip().upper()
+        )
+        if review_failure_type:
+            run_meta_payload.setdefault(
+                "quality_loop_failure_type", review_failure_type
+            )
+
+    # v1.0.5 round 4 (cost surfacing): promote total_cost / total_cost_usd /
+    # total_tokens / cost_source from the in-memory cost summary to the top
+    # level of run_meta.json so the WebUI dashboard renders the real $ amount
+    # instead of $0.00.  Without this, the dashboard reads ``meta.total_cost``
+    # (None) → SQLite stores NULL → "Total Cost" widget collapses to $0.
+    #
+    # Authoritative source priority:
+    #   1. ``run_snapshot.cost_summary`` — frozen end-of-run state, written
+    #      by section_07 itself before save_project_output is called.
+    #   2. ``get_cost_accountant().get_summary()`` — live accountant for
+    #      legacy callers that pass run_meta but no run_snapshot.
+    #
+    # Persistence rule: NEVER round before persisting.  OpenRouter per-call
+    # costs reach the 6th decimal (e.g. $0.000003 for cached tokens on a
+    # cheap model) — rounding here would silently truncate real money to $0.
+    # The display layer (WebUI / __format__ specifiers) is responsible for
+    # any human-readable rounding; the persisted JSON keeps full float
+    # precision.
+    cost_summary_payload: Optional[Dict[str, Any]] = None
+    if run_snapshot is not None:
+        cs_attr = getattr(run_snapshot, "cost_summary", None)
+        if isinstance(cs_attr, dict) and cs_attr:
+            cost_summary_payload = cs_attr
+    if cost_summary_payload is None:
+        try:
+            live_summary = get_cost_accountant().get_summary()
+            if (
+                isinstance(live_summary, dict)
+                and int(live_summary.get("total_executions") or 0) > 0
+            ):
+                cost_summary_payload = live_summary
+        except Exception:
+            cost_summary_payload = None
+    if cost_summary_payload:
+        if "total_cost_usd" not in run_meta_payload:
+            try:
+                run_meta_payload["total_cost_usd"] = float(
+                    cost_summary_payload.get("total_cost_usd") or 0.0
+                )
+            except (TypeError, ValueError):
+                pass
+        if "total_cost" not in run_meta_payload:
+            try:
+                run_meta_payload["total_cost"] = float(
+                    cost_summary_payload.get("total_cost") or 0.0
+                )
+            except (TypeError, ValueError):
+                pass
+        if "total_tokens" not in run_meta_payload:
+            try:
+                run_meta_payload["total_tokens"] = int(
+                    cost_summary_payload.get("total_tokens") or 0
+                )
+            except (TypeError, ValueError):
+                pass
+        cs_label = str(cost_summary_payload.get("cost_source") or "").strip()
+        if cs_label and "cost_source" not in run_meta_payload:
+            run_meta_payload["cost_source"] = cs_label
     resolved_primary_model_id = _resolve_primary_model_id()
     if resolved_primary_model_id and "model_id" not in run_meta_payload:
         run_meta_payload["model_id"] = resolved_primary_model_id
@@ -2301,6 +2397,32 @@ def save_project_output(
     if review:
         _md_buf.write(f"- {labels['quality_passed']}: {review.passes}\n")
     _md_buf.write("\n")
+
+    # v1.0.5 (P2-12): when the quality review explicitly did not pass, render
+    # a prominent warning banner above the body so consumers of the
+    # saved_project README cannot mistake the bundle for deliverable work.
+    # Detect the QUALITY_LOOP_GAVE_UP marker injected by run_quality_loop's
+    # stagnation early-stop path so the banner can call out the failure mode
+    # specifically.
+    if review is not None and review.passes is False:
+        # v1.0.5 round 3 (P2-11 strict): the substring fallback on
+        # review.summary has been removed. The Pydantic model now validates
+        # failure_type at write time against _REVIEW_REPORT_ALLOWED_FAILURE_TYPES
+        # so any typo raises ValueError at the write site instead of silently
+        # missing the marker here. Consumers of older saved_projects that
+        # predate the structured field can run scripts/migrate_review_failure_type.py
+        # to backfill it from the summary string.
+        review_failure_type = (
+            str(getattr(review, "failure_type", "") or "").strip().upper()
+        )
+        gave_up = review_failure_type == "QUALITY_LOOP_GAVE_UP"
+        _md_buf.write(f"> **⚠️ {labels['failure_banner_title']}**\n")
+        _md_buf.write(f"> \n")
+        _md_buf.write(f"> {labels['failure_banner_body']}\n")
+        if gave_up:
+            _md_buf.write(f"> \n")
+            _md_buf.write(f"> {labels['failure_banner_giveup_extra']}\n")
+        _md_buf.write("\n")
 
     if not result and gate_payload:
         _md_buf.write(f"{labels['gate_fallback_notice']}\n\n")

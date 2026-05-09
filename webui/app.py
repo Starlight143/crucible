@@ -680,6 +680,25 @@ def _bootstrap_db_schema(conn: sqlite3.Connection) -> None:
                 "duplicate column" not in str(_alter_exc).lower():
             raise
 
+    # v1.0.5: surface quality-loop outcome fields on the dashboard / runs API.
+    # ``quality_passed`` mirrors ``review_report.passes`` (bool → 0/1/null) and
+    # ``quality_loop_failure_type`` mirrors the structured review failure_type
+    # (e.g. ``QUALITY_LOOP_GAVE_UP``).  Both are written to the top level of
+    # ``run_meta.json`` by section_07 so the dashboard list and run-detail
+    # modal can render a quality-status badge without re-parsing
+    # ``review_report.json`` on every request.  Older runs that predate the
+    # field stay NULL and the frontend renders no badge for them.
+    for _col_name, _col_type in (
+        ("quality_passed", "INTEGER"),
+        ("quality_loop_failure_type", "TEXT"),
+    ):
+        try:
+            conn.execute(f"ALTER TABLE runs ADD COLUMN {_col_name} {_col_type}")
+        except sqlite3.OperationalError as _alter_exc:
+            if "already exists" not in str(_alter_exc).lower() and \
+                    "duplicate column" not in str(_alter_exc).lower():
+                raise
+
     # Feature 9: daily budget tracking table
     conn.execute("""
         CREATE TABLE IF NOT EXISTS budget_daily (
@@ -781,7 +800,39 @@ def _extract_run_row(d: Path) -> dict[str, Any]:
         "drawdown": None,
         "total_return": None,
         "schema_version": None,
+        # v1.0.5: quality-loop outcome surfaced from run_meta.json.  ``None``
+        # on older runs that predate the structured field; the frontend uses
+        # this tri-state (true / false / None) to render the badge.
+        "quality_passed": None,
+        "quality_loop_failure_type": None,
     }
+
+    # ── Cost / token extraction with USD priority ────────────────────────────
+    # v1.0.5 round 4 (cost surfacing): the legacy ``total_cost`` field on
+    # ``analysis_result.json`` was a token-derived "cost_units" value with no
+    # USD semantics; the actual USD spend lives in ``run_meta.total_cost_usd``
+    # (promoted from ``run_snapshot.cost_summary`` by section_07).  We prefer
+    # USD whenever available so the dashboard renders real billing dollars
+    # instead of arbitrary token-units.  Older saved_projects/ that predate
+    # the meta-promotion fall through to ``run_snapshot.json`` directly.
+    #
+    # The full float value is preserved end-to-end (no rounding at this
+    # layer): SQLite stores REAL = double-precision IEEE 754, which keeps
+    # all 6 decimal places of the per-call OpenRouter cost.  Any precision
+    # loss in the user-visible UI happens only in the display formatter,
+    # never on the wire.
+    def _coerce_finite_float(value: Any) -> Optional[float]:
+        try:
+            f = float(value)
+        except (TypeError, ValueError):
+            return None
+        return f if math.isfinite(f) else None
+
+    def _coerce_int(value: Any) -> Optional[int]:
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return None
 
     # analysis_result.json
     analysis = _read_json_file(d / "analysis_result.json")
@@ -791,24 +842,15 @@ def _extract_run_row(d: Path) -> dict[str, Any]:
         if sv is not None:
             row["schema_version"] = str(sv)
         if row["cost"] is None:
-            try:
-                _c = float(analysis.get("total_cost"))  # type: ignore[arg-type]
-                row["cost"] = _c if math.isfinite(_c) else None
-            except (TypeError, ValueError):
-                pass
+            # USD has priority over the legacy units field.
+            row["cost"] = _coerce_finite_float(analysis.get("total_cost_usd"))
+            if row["cost"] is None:
+                row["cost"] = _coerce_finite_float(analysis.get("total_cost"))
         if row["tokens"] is None:
-            try:
-                _t = int(float(analysis.get("total_tokens")))  # type: ignore[arg-type]
-                row["tokens"] = _t
-            except (TypeError, ValueError):
-                pass
+            row["tokens"] = _coerce_int(analysis.get("total_tokens"))
         if row["quality"] is None:
             v = analysis.get("quality_score") if analysis.get("quality_score") is not None else analysis.get("score")
-            try:
-                fq = float(v) if v is not None else None
-                row["quality"] = fq if (fq is None or math.isfinite(fq)) else None
-            except (TypeError, ValueError):
-                pass
+            row["quality"] = _coerce_finite_float(v)
 
     # run_meta.json
     meta = _read_json_file(d / "run_meta.json")
@@ -817,17 +859,72 @@ def _extract_run_row(d: Path) -> dict[str, Any]:
         row["provider"] = meta.get("llm_provider") or None
         row["timestamp"] = meta.get("timestamp") or None
         if row["cost"] is None:
-            try:
-                _c = float(meta.get("total_cost"))  # type: ignore[arg-type]
-                row["cost"] = _c if math.isfinite(_c) else None
-            except (TypeError, ValueError):
-                pass
+            # USD priority again — meta is the canonical source after v1.0.5.
+            row["cost"] = _coerce_finite_float(meta.get("total_cost_usd"))
+            if row["cost"] is None:
+                row["cost"] = _coerce_finite_float(meta.get("total_cost"))
         if row["tokens"] is None:
-            try:
-                _t = int(float(meta.get("total_tokens")))  # type: ignore[arg-type]
-                row["tokens"] = _t
-            except (TypeError, ValueError):
-                pass
+            row["tokens"] = _coerce_int(meta.get("total_tokens"))
+        # v1.0.5: structured quality outcome.  ``quality_passed`` is written
+        # by section_07 as a Python bool; SQLite stores 0/1/None.  We accept
+        # the raw bool, ints {0,1}, and the strings ``"true"``/``"false"`` so
+        # operator-edited meta files do not silently drop the field.
+        if "quality_passed" in meta:
+            qp_raw = meta.get("quality_passed")
+            if isinstance(qp_raw, bool):
+                row["quality_passed"] = 1 if qp_raw else 0
+            elif isinstance(qp_raw, int) and qp_raw in (0, 1):
+                row["quality_passed"] = qp_raw
+            elif isinstance(qp_raw, str):
+                _qs = qp_raw.strip().lower()
+                if _qs in {"true", "1", "yes", "passed"}:
+                    row["quality_passed"] = 1
+                elif _qs in {"false", "0", "no", "failed"}:
+                    row["quality_passed"] = 0
+        qft = meta.get("quality_loop_failure_type")
+        if isinstance(qft, str) and qft.strip():
+            # Mirror the backend's strict validation: only persist values
+            # whose normalised form matches the allowed enum.  Anything else
+            # is dropped so the frontend never renders a phantom failure.
+            qft_norm = qft.strip().upper()
+            if qft_norm in {"QUALITY_LOOP_GAVE_UP"}:
+                row["quality_loop_failure_type"] = qft_norm
+
+    # run_snapshot.json fallback for legacy saved_projects/ that predate the
+    # cost-promotion-into-run_meta fix (any run created before v1.0.5 round 4).
+    # The snapshot's ``cost_summary`` block is the authoritative end-of-run
+    # cost ledger frozen by section_07 just before save_project_output is
+    # called.  Reading it here lets the dashboard show real $ figures for
+    # historical runs without requiring an explicit migration step.
+    if row["cost"] is None or row["tokens"] is None:
+        snapshot = _read_json_file(d / "run_snapshot.json")
+        if snapshot:
+            cs = snapshot.get("cost_summary")
+            if isinstance(cs, dict):
+                if row["cost"] is None:
+                    row["cost"] = _coerce_finite_float(cs.get("total_cost_usd"))
+                    if row["cost"] is None:
+                        row["cost"] = _coerce_finite_float(cs.get("total_cost"))
+                if row["tokens"] is None:
+                    row["tokens"] = _coerce_int(cs.get("total_tokens"))
+
+    # Fallback path for older runs whose run_meta.json predates the v1.0.5
+    # round 2 promotion of quality_passed / quality_loop_failure_type to the
+    # top level: read review_report.json directly so the dashboard badge
+    # still works on saved_projects/ created by earlier crucible versions.
+    if row["quality_passed"] is None or row["quality_loop_failure_type"] is None:
+        review = _read_json_file(d / "review_report.json")
+        if review:
+            if row["quality_passed"] is None:
+                rp = review.get("passes")
+                if isinstance(rp, bool):
+                    row["quality_passed"] = 1 if rp else 0
+            if row["quality_loop_failure_type"] is None:
+                rft = review.get("failure_type")
+                if isinstance(rft, str) and rft.strip():
+                    rft_norm = rft.strip().upper()
+                    if rft_norm in {"QUALITY_LOOP_GAVE_UP"}:
+                        row["quality_loop_failure_type"] = rft_norm
 
     # backtest_report.json / summary.json — backtest metrics.
     # summary.json may live in sample_out/ subdirectory for older runs.
@@ -916,10 +1013,12 @@ def _sync_run_index() -> None:
                     conn.execute("""
                         INSERT OR REPLACE INTO runs
                             (run_id, mtime, cost, tokens, quality, mode, provider, timestamp,
-                             has_backtest, sharpe, drawdown, total_return, schema_version)
+                             has_backtest, sharpe, drawdown, total_return, schema_version,
+                             quality_passed, quality_loop_failure_type)
                         VALUES
                             (:run_id, :mtime, :cost, :tokens, :quality, :mode, :provider, :timestamp,
-                             :has_backtest, :sharpe, :drawdown, :total_return, :schema_version)
+                             :has_backtest, :sharpe, :drawdown, :total_return, :schema_version,
+                             :quality_passed, :quality_loop_failure_type)
                     """, row)
                     # Feature 9: record cost in budget_daily whenever a new run is upserted
                     if row.get("cost") is not None:
@@ -1031,7 +1130,8 @@ def _scan_saved_runs(
         rows = conn.execute(
             f"""
             SELECT run_id, mtime, cost, tokens, quality, mode, provider, timestamp,
-                   has_backtest, sharpe, drawdown, total_return
+                   has_backtest, sharpe, drawdown, total_return,
+                   quality_passed, quality_loop_failure_type
             FROM runs
             {where}
             ORDER BY mtime DESC
@@ -1042,6 +1142,16 @@ def _scan_saved_runs(
 
         result: list[dict[str, Any]] = []
         for row in rows:
+            qp_raw = row[12]
+            # Re-emit as JSON booleans (or null) so the frontend never has to
+            # special-case the SQLite int(0/1) representation.
+            if qp_raw is None:
+                qp = None
+            else:
+                try:
+                    qp = bool(int(qp_raw))
+                except (TypeError, ValueError):
+                    qp = None
             result.append({
                 "id":          row[0],
                 "name":        row[0],
@@ -1056,6 +1166,8 @@ def _scan_saved_runs(
                 "sharpe":      row[9],
                 "drawdown":    row[10],
                 "total_return":row[11],
+                "quality_passed":            qp,
+                "quality_loop_failure_type": row[13],
             })
         return result
     except Exception:
@@ -1080,6 +1192,17 @@ def _scan_saved_runs(
         row = _extract_run_row(d)
         if mode and (row.get("mode") or "").lower() != mode.lower():
             continue
+        # Mirror SQLite path's tri-state quality_passed encoding (true/false/null
+        # — never int) so the frontend sees the same shape regardless of which
+        # branch produced the row.
+        qp_raw = row.get("quality_passed")
+        if qp_raw is None:
+            qp_emit: bool | None = None
+        else:
+            try:
+                qp_emit = bool(int(qp_raw))
+            except (TypeError, ValueError):
+                qp_emit = None
         runs.append({
             "id":          row["run_id"],
             "name":        row["run_id"],
@@ -1094,6 +1217,8 @@ def _scan_saved_runs(
             "sharpe":      row["sharpe"],
             "drawdown":    row["drawdown"],
             "total_return":row["total_return"],
+            "quality_passed":            qp_emit,
+            "quality_loop_failure_type": row.get("quality_loop_failure_type"),
         })
         if len(runs) >= limit:
             break
@@ -1634,12 +1759,19 @@ def api_dashboard():
             for r in _runs.values()
         ]
 
+    # v1.0.5 round 4: round to 6 decimals to match cost_tracker's persistence
+    # precision.  OpenRouter per-call costs reach the 6th decimal (e.g.
+    # $0.000003 for cheap-model cached tokens) — rounding to 5 silently
+    # drops 90 % of the lowest-cost calls to $0.00 when summed across many
+    # runs.  Expose ``total_cost_usd`` as an explicit alias so newer
+    # clients can disambiguate USD billing from any legacy cost-units field.
     return jsonify({
         "total_saved_runs": len(saved),
-        "total_cost": round(total_cost, 5),
-        "avg_quality": round(avg_quality, 3),
-        "saved_runs": saved[:20],
-        "session_runs": session_runs,
+        "total_cost":     round(total_cost, 6),
+        "total_cost_usd": round(total_cost, 6),
+        "avg_quality":    round(avg_quality, 3),
+        "saved_runs":     saved[:20],
+        "session_runs":   session_runs,
     })
 
 

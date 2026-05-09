@@ -32,9 +32,21 @@ class TestRuntimeValidation(unittest.TestCase):
                 "    return {'ok': True}",
             ]
         )
-        bundle = self._bundle(content)
+        # v1.0.5 round 3 final: realistic SaaS bundle includes a
+        # requirements.txt declaring its web framework, otherwise the H001
+        # mode-specific lint correctly flags an undeclared import.
+        bundle = qsc.CodeBundle(
+            project_type="saas",
+            files=[
+                qsc.GeneratedFile(path="main.py", content=content),
+                qsc.GeneratedFile(
+                    path="requirements.txt",
+                    content="fastapi==0.110\nuvicorn==0.30\n",
+                ),
+            ],
+        )
         ok, issues, log = qsc.run_runtime_validation(bundle, mode="SaaS")
-        self.assertTrue(ok)
+        self.assertTrue(ok, msg=log)
         self.assertEqual(issues, [])
         self.assertIn("py_compile", log)
 

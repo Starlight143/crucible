@@ -90,6 +90,34 @@ Post-processing and enhancement modules invoked by the Enhanced Runner after Sta
 | `agent_metrics.py` | `--agent-metrics` | Scans all historical runs in `saved_projects/`; computes per-project avg/max/min score, risk distribution, gate pass rate, hallucination flag count, security pass rate. Outputs formatted terminal dashboard and `agent_metrics_report.json`. |
 | `prompt_version_tracker.py` | `--prompt-version-label` | SQLite-backed prompt version management. Records per-run scores against a version label. `get_best_version()` returns the label with the highest average score. |
 
+### Mode-specific Validation Matrix (v1.0.5 round 3 final)
+
+`section_06_runtime_quality_api` runs different defence layers per pipeline mode. The canonical mapping lives in `crucible/features/mode_validation_matrix.py`; the rendered table below is a snapshot of `mode_validation_summary_markdown()` and is regenerated whenever the matrix changes.
+
+| Mode | Defence | Status | Rules | Notes |
+|------|---------|--------|-------|-------|
+| `quant` | import_smoke | active | Q010, Q011 | Subprocess import of every Quant entrypoint; surfaces import-time errors. |
+| `quant` | cross_reference | active | X001, X002, X003, X004, W001, W002, W003 | AST cross-file consistency: dataclass kwargs, config attrs, missing imports, positional types, escape paths. |
+| `quant` | domain_lint | active | Q001, Q002, Q003, Q004 | Lookahead bias (4 escape paths), off-by-one stop window, Trade(spread=0), fixed slippage with dynamic flag. |
+| `quant` | synthetic_dryrun | active | Q012, Q013, Q014, Q015 | GBM OHLCV subprocess run of backtest entrypoint; opt-in dirty-data fixture via env var. |
+| `quant` | live_trader_smoke | active | Q020, Q021, Q022, Q023, Q024 | ccxt-stubbed import + behavioural SL assertion (40% drawdown ramp). |
+| `quant` | production_tests | opt-in | X005 | Enforces tests/*.py when CRUCIBLE_QUANT_REQUIRE_TESTS=1 or codegen_scope='production'. |
+| `saas` | web_smoke | active | HTTP-smoke | Existing ASGI/WSGI app start + GET / probe (legacy section_06 path). |
+| `saas` | cross_reference | active | X001, X002, X003, X004, W001, W002, W003 | v1.0.5 round 3 final: now runs on all non-Quant modes too. |
+| `saas` | mode_specific_lint | active | H001 | Web framework imported but missing from requirements.txt declaration. |
+| `saas` | dependency_audit | opt-in | dep-audit | pip-audit via --dependency-audit flag. |
+| `saas` | openapi_consistency | deferred | — | OpenAPI spec ↔ route handler consistency — planned for v1.0.6. |
+| `agent` | cross_reference | active | X001, X002, X003, X004, W001, W002, W003 | v1.0.5 round 3 final. |
+| `agent` | mode_specific_lint | active | A001, A002 | Agent(...) missing role/goal/backstory; Tool/BaseTool missing description. |
+| `agent` | tool_use_smoke | deferred | — | Stubbed tool-use round-trip — planned for v1.0.6. |
+| `scientist` | cross_reference | active | X001, X002, X003, X004, W001, W002, W003 | v1.0.5 round 3 final. |
+| `scientist` | mode_specific_lint | active | S001, S002 | Numerical work without explicit seed/RandomState; missing requirements.txt. |
+| `scientist` | data_leakage_check | deferred | — | Train/test split leakage detection — planned for v1.0.6. |
+
+`active` defences run by default. `opt-in` requires an env var or codegen scope flag. `deferred` is tracked-but-unimplemented debt — listed here so it stays visible until the rule lands. Set `CRUCIBLE_UNIVERSAL_CROSSREF=0` to opt out of the universal cross-reference layer for legacy callers (default ON).
+
+---
+
 ### Quant Analytics Suite
 
 Activated via `--quant-analytics` and related flags. All are Quant mode only.

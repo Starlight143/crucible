@@ -381,6 +381,465 @@ def _detect_entrypoints(py_files: List[str]) -> List[EntryPointSpec]:
     return entrypoints
 
 
+def _detect_quant_entrypoints(py_files: List[str]) -> List[EntryPointSpec]:
+    """
+    v1.0.5: detect Quant-mode top-level scripts (backtest.py, strategy.py, …).
+
+    Quant bundles never expose a FastAPI/Flask app object, so the regular
+    ``_detect_entrypoints`` returns an empty list and ``run_runtime_validation``
+    used to log "No entrypoints detected; smoke test skipped." The downstream
+    quality loop then trusted ``py_compile`` alone — an entire class of
+    import-time and runtime errors (TypeError on dataclass kwargs, AttributeError
+    on undefined config attrs, function-signature mismatches) sailed through.
+
+    This helper enumerates every Quant-canonical script in the bundle so the
+    caller can run an import-only smoke + a synthetic-data dry-run instead.
+    """
+    entrypoints: List[EntryPointSpec] = []
+    seen: Set[str] = set()
+    for path in py_files:
+        base = os.path.basename(path)
+        if base in QUANT_ENTRYPOINT_FILES and path not in seen:
+            entrypoints.append(EntryPointSpec(path=path))
+            seen.add(path)
+    return entrypoints
+
+
+def _is_quant_validation(
+    code_bundle: CodeBundle, mode: Optional[str]
+) -> bool:
+    """
+    v1.0.5: True iff this validation run targets Quant mode.
+
+    Resolution order: explicit ``mode`` argument → ``code_bundle.project_type``.
+    Both must agree on the canonical form ``"quant"`` for the helper to return
+    True. Lookup goes through ``_resolve_validation_mode_config`` to honour
+    custom mode aliases registered via :class:`ModeRegistry`.
+    """
+    mode_cfg = _resolve_validation_mode_config(mode=mode, code_bundle=code_bundle)
+    if mode_cfg is not None:
+        canonical = str(mode_cfg.name or "").strip().lower()
+        if canonical == "quant":
+            return True
+        # If the registered mode does not advertise as quant, trust the registry.
+        if canonical:
+            return False
+    project_type = str(getattr(code_bundle, "project_type", "") or "").strip().lower()
+    return project_type == "quant"
+
+
+def _run_quant_import_smoke(
+    py_files: List[str],
+    tmp_dir: str,
+    env: Dict[str, str],
+    *,
+    timeout_seconds: int = 15,
+) -> Tuple[List[ReviewIssue], str]:
+    """
+    v1.0.5: import every Quant-entrypoint module in a fresh subprocess.
+
+    Failures are returned as high-severity ReviewIssues (one per failing file).
+    A successful import-only check is necessary but not sufficient — the caller
+    is expected to follow up with ``crucible.features.quant_smoke`` for the
+    synthetic dry-run.
+    """
+    issues: List[ReviewIssue] = []
+    log_lines: List[str] = []
+    quant_entries = _detect_quant_entrypoints(py_files)
+    if not quant_entries:
+        return issues, ""
+    for entry in quant_entries:
+        label = os.path.basename(entry.path)
+        code = (
+            "import importlib.util, sys; "
+            f"path={json.dumps(entry.path)}; "
+            "spec=importlib.util.spec_from_file_location('quant_entry', path); "
+            "mod=importlib.util.module_from_spec(spec); "
+            "spec.loader.exec_module(mod)"
+        )
+        try:
+            result = subprocess.run(
+                [sys.executable, "-c", code],
+                capture_output=True,
+                text=True,
+                cwd=tmp_dir,
+                env=env,
+                timeout=timeout_seconds,
+            )
+        except subprocess.TimeoutExpired:
+            issues.append(
+                ReviewIssue(
+                    severity="high",
+                    category="bug",
+                    description=(
+                        f"Quant import smoke timed out after {timeout_seconds}s for {label}. "
+                        "Avoid blocking work at import time."
+                    ),
+                    file=label,
+                    suggestion=(
+                        "Move side effects (network calls, file IO, broker connections) "
+                        "into a guarded `if __name__ == '__main__':` block."
+                    ),
+                )
+            )
+            log_lines.append(f"[quant_import {label}] timeout after {timeout_seconds}s")
+            continue
+        if result.returncode != 0:
+            issues.append(
+                ReviewIssue(
+                    severity="high",
+                    category="bug",
+                    description=(
+                        f"Quant import smoke failed for {label}: {result.returncode=}. "
+                        "Module raised an exception at import time."
+                    ),
+                    file=label,
+                    suggestion=(
+                        "Run `python -c 'import "
+                        + os.path.splitext(label)[0]
+                        + "'` from the bundle root to reproduce the traceback locally."
+                    ),
+                )
+            )
+            log_lines.append(_format_proc_result(f"quant_import {label}", result))
+            continue
+        log_lines.append(f"[quant_import {label}] ok")
+    return issues, "\n\n".join(log_lines).strip()
+
+
+def _quant_dryrun_issues_to_review_issues(
+    quant_issues: List[Dict[str, Any]],
+) -> List[ReviewIssue]:
+    """v1.0.5: adapt :class:`QuantSmokeIssue` dicts into ReviewIssue."""
+    out: List[ReviewIssue] = []
+    for raw in quant_issues or []:
+        try:
+            out.append(
+                ReviewIssue(
+                    severity=str(raw.get("severity") or "high"),
+                    category=str(raw.get("category") or "bug"),
+                    description=str(raw.get("description") or ""),
+                    file=raw.get("file") or None,
+                    suggestion=raw.get("suggestion") or None,
+                )
+            )
+        except Exception:
+            continue
+    return out
+
+
+def _cross_reference_issues_to_review_issues(
+    cr_issues: List[Any],
+) -> List[ReviewIssue]:
+    """v1.0.5: adapt :class:`CrossReferenceIssue` instances into ReviewIssue."""
+    out: List[ReviewIssue] = []
+    for issue in cr_issues or []:
+        try:
+            severity = getattr(issue, "severity", None) or "high"
+            category = getattr(issue, "category", None) or "bug"
+            description = getattr(issue, "description", "") or ""
+            file = getattr(issue, "file", None)
+            suggestion = getattr(issue, "suggestion", None)
+            line = getattr(issue, "line", None)
+            if line is not None and description:
+                description = f"{description} (line {line})"
+            out.append(
+                ReviewIssue(
+                    severity=str(severity),
+                    category=str(category),
+                    description=description,
+                    file=file,
+                    suggestion=suggestion,
+                )
+            )
+        except Exception:
+            continue
+    return out
+
+
+def _quant_lint_issues_to_review_issues(lint_issues: List[Any]) -> List[ReviewIssue]:
+    """v1.0.5: adapt :class:`QuantLintIssue` into ReviewIssue."""
+    return _cross_reference_issues_to_review_issues(lint_issues)
+
+
+def _run_cross_reference_check(tmp_dir: str) -> Tuple[List[ReviewIssue], str]:
+    """v1.0.5: lazy-import + run AST cross-reference checks on the bundle."""
+    try:
+        from crucible.features.cross_reference_check import analyse_cross_references
+    except Exception as exc:
+        return [], f"[cross_ref] import failed: {exc}"
+    try:
+        report = analyse_cross_references(tmp_dir)
+    except Exception as exc:
+        return [], f"[cross_ref] analysis failed: {exc}"
+    log = (
+        f"[cross_ref] scanned {report.files_scanned} file(s); "
+        f"{len(report.issues)} issue(s)"
+    )
+    if report.errors:
+        log += f"; errors={len(report.errors)}"
+    return _cross_reference_issues_to_review_issues(report.issues), log
+
+
+def _run_quant_lint(tmp_dir: str) -> Tuple[List[ReviewIssue], str]:
+    """v1.0.5: lazy-import + run Quant-domain AST lint."""
+    try:
+        from crucible.features.quant_lint import analyse_quant_lint
+    except Exception as exc:
+        return [], f"[quant_lint] import failed: {exc}"
+    try:
+        report = analyse_quant_lint(tmp_dir)
+    except Exception as exc:
+        return [], f"[quant_lint] analysis failed: {exc}"
+    log = (
+        f"[quant_lint] scanned {report.files_scanned} file(s); "
+        f"{len(report.issues)} issue(s)"
+    )
+    return _quant_lint_issues_to_review_issues(report.issues), log
+
+
+def _run_quant_synthetic_dryrun(tmp_dir: str) -> Tuple[List[ReviewIssue], str]:
+    """v1.0.5: lazy-import + run a synthetic-data dry-run of the backtest entrypoint."""
+    try:
+        from crucible.features.quant_smoke import quant_smoke_dryrun
+    except Exception as exc:
+        return [], f"[quant_smoke] import failed: {exc}"
+    try:
+        # Per-call timeout is short so a hung subprocess can't wedge the
+        # quality loop. The dry-run only exercises 30 days of GBM data, so
+        # any honest backtest finishes well under this budget.
+        timeout = 60
+        try:
+            timeout = int(os.environ.get("CRUCIBLE_QUANT_DRYRUN_TIMEOUT", "60"))
+        except (TypeError, ValueError):
+            timeout = 60
+        result = quant_smoke_dryrun(tmp_dir, timeout_seconds=max(10, timeout))
+    except Exception as exc:
+        return [], f"[quant_smoke] failed: {exc}"
+    parts: List[str] = []
+    if result.skipped:
+        parts.append(f"[quant_smoke] skipped: {result.skip_reason}")
+    else:
+        parts.append(
+            f"[quant_smoke] entrypoint={result.entrypoint_used} passes={result.passes}"
+        )
+    if result.log:
+        parts.append(result.log)
+    review_issues = _quant_dryrun_issues_to_review_issues(result.issues)
+    return review_issues, "\n\n".join(parts).strip()
+
+
+def _run_quant_validation_track(
+    code_bundle: CodeBundle,
+    py_files: List[str],
+    tmp_dir: str,
+    env: Dict[str, str],
+    mode: Optional[str],
+) -> Tuple[List[ReviewIssue], str]:
+    """
+    v1.0.5: full Quant validation track when no web entrypoints exist.
+
+    Order of checks (cheap → expensive, fail-fast on import errors so the
+    fix-loop has a small actionable signal first):
+
+    1. ``_run_quant_import_smoke`` — import each Quant entrypoint in a fresh
+       subprocess. Catches TypeError/AttributeError at import time.
+    2. ``_run_cross_reference_check`` — AST checks for dataclass kwargs,
+       config attrs, cross-file imports, and positional-arg type sniff.
+    3. ``_run_quant_lint`` — Quant-specific AST lint (lookahead, off-by-one,
+       silently-zeroed spread, fixed slippage).
+    4. ``_run_quant_synthetic_dryrun`` — write 30 rows of GBM OHLCV and run
+       the backtest entrypoint with a hard timeout. This catches the
+       last-mile bugs (range off-by-one, uninitialised state, etc.) that
+       static analysis cannot prove.
+
+    All issues from all four steps are merged so a single fix-round can
+    address everything at once. The function returns even on subprocess
+    failures from individual checks — a transient ImportError in one helper
+    must not silently disable the others.
+    """
+    aggregated_issues: List[ReviewIssue] = []
+    log_lines: List[str] = []
+
+    log_lines.append(
+        "[runtime] Quant mode detected — running pure-Python validation "
+        "track (import smoke + cross-ref + domain lint + synthetic dry-run)."
+    )
+
+    import_issues, import_log = _run_quant_import_smoke(py_files, tmp_dir, env)
+    if import_log:
+        log_lines.append(import_log)
+    aggregated_issues.extend(import_issues)
+
+    cr_issues, cr_log = _run_cross_reference_check(tmp_dir)
+    if cr_log:
+        log_lines.append(cr_log)
+    aggregated_issues.extend(cr_issues)
+
+    lint_issues, lint_log = _run_quant_lint(tmp_dir)
+    if lint_log:
+        log_lines.append(lint_log)
+    aggregated_issues.extend(lint_issues)
+
+    # Run the dry-run only when import-smoke produced no errors. Otherwise we
+    # would just re-discover the same crash through a more expensive path.
+    if not import_issues:
+        dry_issues, dry_log = _run_quant_synthetic_dryrun(tmp_dir)
+        if dry_log:
+            log_lines.append(dry_log)
+        aggregated_issues.extend(dry_issues)
+    else:
+        log_lines.append(
+            "[quant_smoke] skipped: import smoke surfaced errors first; "
+            "fix those before re-running the dry-run."
+        )
+
+    return aggregated_issues, "\n\n".join(log_lines).strip()
+
+
+def _run_universal_cross_reference_track(
+    tmp_dir: str,
+    code_bundle: CodeBundle,
+    mode: Optional[str],
+) -> Tuple[List[ReviewIssue], str]:
+    """v1.0.5 round 3 (final): cross-reference + mode-specific AST lint for
+    every non-Quant pipeline mode (SaaS / Agent / Scientist).
+
+    cross_reference_check is mode-agnostic — the X001-X004 / W001-W003 rules
+    are pure structural consistency checks that apply to any Python bundle.
+    Until round 3 they only ran on Quant; SaaS/Agent/Scientist bundles
+    silently shipped with the same kinds of dataclass-kwargs / config-attr /
+    cross-file-import bugs the Quant track had been catching for two rounds.
+
+    On top of that, a small mode-specific lint pass runs:
+
+    - **SaaS** → H001 web-framework imported but undeclared in requirements.
+    - **Agent** → A001 Agent missing role/goal/backstory, A002 Tool no description.
+    - **Scientist** → S001 numeric work missing seed, S002 missing requirements.
+
+    The rules per mode are intentionally narrow; the matrix in
+    ``crucible/features/mode_validation_matrix.py`` documents which deeper
+    checks remain on the v1.0.6 roadmap, so the debt is visible.
+    """
+    issues: List[ReviewIssue] = []
+    logs: List[str] = []
+
+    # 1. cross-reference (universal AST consistency).
+    cr_issues, cr_log = _run_cross_reference_check(tmp_dir)
+    if cr_log:
+        logs.append(cr_log)
+    issues.extend(cr_issues)
+
+    # 2. mode-specific lint.
+    canonical_mode = (mode or "").strip().lower() or str(
+        getattr(code_bundle, "project_type", "") or ""
+    ).strip().lower()
+    bundle_files: List[Tuple[str, str]] = [
+        (str(getattr(f, "path", "") or ""), str(getattr(f, "content", "") or ""))
+        for f in (getattr(code_bundle, "files", []) or [])
+        if getattr(f, "path", None) and getattr(f, "content", None) is not None
+    ]
+
+    try:
+        from crucible.features.mode_validation_matrix import (
+            ModeLintIssue,
+            analyse_agent_lint_from_files,
+            analyse_saas_lint_from_files,
+            analyse_scientist_lint_from_files,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logs.append(f"[mode_lint] import failed: {exc}")
+        return issues, "\n\n".join(logs).strip()
+
+    mode_issues: List[ModeLintIssue] = []
+    if canonical_mode == "saas":
+        mode_issues = analyse_saas_lint_from_files(bundle_files)
+    elif canonical_mode == "agent":
+        mode_issues = analyse_agent_lint_from_files(bundle_files)
+    elif canonical_mode == "scientist":
+        mode_issues = analyse_scientist_lint_from_files(bundle_files)
+
+    if mode_issues:
+        for mi in mode_issues:
+            issues.append(
+                ReviewIssue(
+                    severity=mi.severity,
+                    category=mi.category,
+                    description=mi.description,
+                    file=mi.file,
+                    suggestion=mi.suggestion,
+                )
+            )
+        logs.append(
+            f"[mode_lint:{canonical_mode}] emitted {len(mode_issues)} issue(s)"
+        )
+    elif canonical_mode in ("saas", "agent", "scientist"):
+        logs.append(f"[mode_lint:{canonical_mode}] clean")
+
+    return issues, "\n\n".join(logs).strip()
+
+
+def _check_production_quant_tests(
+    code_bundle: CodeBundle,
+    mode: Optional[str],
+    *,
+    codegen_scope: Optional[str] = None,
+) -> List[ReviewIssue]:
+    """
+    v1.0.5: enforce that production-scope Quant bundles emit a ``tests/`` dir.
+
+    The codegen prompt already lists ``tests/test_strategy.py`` etc. in
+    ``_quant_codegen_rules``, but the post-codegen pipeline never verified the
+    LLM actually produced them — production bundles routinely shipped without
+    any test coverage, and reviewers had no signal to flag the gap. This check
+    closes the loop by emitting a high-severity issue when a Quant production
+    bundle has no Python files under ``tests/``.
+
+    The ``codegen_scope`` argument may be passed explicitly by callers that
+    know the gate's verdict; otherwise it falls back to an attribute lookup on
+    the bundle, then to ``"production"`` (the strictest treatment, so missing
+    tests on an unknown-scope bundle still get flagged).
+    """
+    if not _is_quant_validation(code_bundle, mode):
+        return []
+    if codegen_scope is None:
+        codegen_scope = (
+            str(getattr(code_bundle, "codegen_scope", "") or "production").strip().lower()
+        )
+    project_scope = str(codegen_scope or "production").strip().lower()
+    if project_scope != "production":
+        return []
+    has_tests = False
+    for f in code_bundle.files or []:
+        path = (getattr(f, "path", "") or "").replace("\\", "/").lstrip("./")
+        if not path.lower().endswith(".py"):
+            continue
+        first_part = path.split("/", 1)[0]
+        if first_part.lower() == "tests":
+            has_tests = True
+            break
+    if has_tests:
+        return []
+    return [
+        ReviewIssue(
+            severity="high",
+            category="bug",
+            description=(
+                "Production-scope Quant bundle ships without a tests/ directory. "
+                "The codegen prompt requires tests/test_strategy.py, "
+                "tests/test_backtest.py, tests/test_data_provider.py, "
+                "tests/test_risk_manager.py, tests/test_performance.py, and "
+                "tests/conftest.py for production scope, but none were produced."
+            ),
+            file=None,
+            suggestion=(
+                "Generate the required test files under tests/ — every test must "
+                "pass with `pytest tests/` and must not require network access."
+            ),
+        )
+    ]
+
+
 PY_COMPILE_TIMEOUT_SECS = 10
 
 
@@ -829,13 +1288,94 @@ def run_runtime_validation(
         else:
             entrypoints = _detect_entrypoints(py_files)
 
+        # v1.0.5: Quant-mode bundles never expose a FastAPI/Flask app object,
+        # so the regular detection returns empty. Run a Quant-specific
+        # validation track instead — import-only smoke for every detectable
+        # Quant entrypoint, AST cross-reference checks, AST domain lint, and a
+        # synthetic-data dry-run of the backtest entrypoint.
+        is_quant_run = _is_quant_validation(clean_bundle, mode)
+        if is_quant_run and not entrypoints and not (require_snapshot or require_web):
+            quant_issues, quant_log = _run_quant_validation_track(
+                clean_bundle, py_files, tmp_dir, env, mode
+            )
+            if quant_log:
+                logs.append(quant_log)
+            issues.extend(quant_issues)
+            # The production tests/ check is opt-in — only fires when the
+            # caller (typically the analysis-stage gate) explicitly signals
+            # that the bundle is supposed to be production scope. The signal
+            # is either the env var ``CRUCIBLE_QUANT_REQUIRE_TESTS=1`` or a
+            # bundle attribute ``codegen_scope='production'``. Defaulting to
+            # off here keeps backwards compatibility for existing tests and
+            # callers that have not yet plumbed scope through.
+            require_tests = os.environ.get(
+                "CRUCIBLE_QUANT_REQUIRE_TESTS", ""
+            ).strip().lower() in ("1", "true", "yes", "on")
+            bundle_scope = (
+                str(getattr(clean_bundle, "codegen_scope", "") or "").strip().lower()
+            )
+            if require_tests or bundle_scope == "production":
+                production_test_issues = _check_production_quant_tests(
+                    clean_bundle,
+                    mode,
+                    codegen_scope=(
+                        "production" if (require_tests or bundle_scope == "production") else None
+                    ),
+                )
+                if production_test_issues:
+                    issues.extend(production_test_issues)
+                    logs.append(
+                        "[runtime] Production-scope Quant bundle missing tests/ — see issues."
+                    )
+            if issues:
+                return False, issues, "\n\n".join(logs).strip()
+            return True, [], "\n\n".join(logs).strip()
+
+        # v1.0.5 round 3 (final): universal cross-reference + mode-specific
+        # lint for non-Quant modes. Defaults ON; opt-out via
+        # CRUCIBLE_UNIVERSAL_CROSSREF=0 for callers that have legacy fixtures
+        # they cannot update yet. The matrix in
+        # crucible/features/mode_validation_matrix.py documents which rules
+        # apply per mode and which deeper checks remain on the v1.0.6 list.
+        universal_enabled = os.environ.get(
+            "CRUCIBLE_UNIVERSAL_CROSSREF", "1"
+        ).strip().lower() not in ("0", "false", "no", "off")
+        if universal_enabled and not is_quant_run:
+            try:
+                universal_issues, universal_log = _run_universal_cross_reference_track(
+                    tmp_dir, clean_bundle, mode
+                )
+                if universal_log:
+                    logs.append(universal_log)
+                issues.extend(universal_issues)
+            except Exception as exc:  # pragma: no cover - defensive
+                logs.append(
+                    f"[runtime] universal cross-reference track failed: {exc}"
+                )
+
         if not entrypoints:
             logs.append("[runtime] No entrypoints detected; smoke test skipped.")
             logs.append("[runtime] " + _entrypoint_detection_hint())
-            logs.append(
-                "[runtime] Override with --entrypoint path/to/app.py:app "
-                f"or {ENTRYPOINT_OVERRIDE_ENV}=app.py:app."
-            )
+            if is_quant_run:
+                # v1.0.5 (P2-9): the previous message told users to set
+                # `--entrypoint app.py:app`, which is misleading for Quant
+                # bundles that have no ASGI/WSGI app object at all. The Quant
+                # validation track above runs unless require_snapshot /
+                # require_web is forced; reaching this branch means the
+                # caller asked for web validation on a Quant bundle, which is
+                # itself a configuration error.
+                logs.append(
+                    "[runtime] Quant mode detected: smoke checks would be "
+                    "import-all-modules + dry-run backtest.py with synthetic "
+                    "data. Web validation was requested for a pure-Python "
+                    "Quant bundle — re-route to a web-capable mode or unset "
+                    "the snapshot/web requirement."
+                )
+            else:
+                logs.append(
+                    "[runtime] Override with --entrypoint path/to/app.py:app "
+                    f"or {ENTRYPOINT_OVERRIDE_ENV}=app.py:app."
+                )
             if require_snapshot or require_web:
                 if require_snapshot and not require_web:
                     desc = (
@@ -2143,6 +2683,33 @@ def run_quality_loop(
                 print(
                     f"[Warn] Early stopping: no improvement for {stagnation_rounds} rounds."
                 )
+                # v1.0.5 (P2-11): mark the report so downstream readers
+                # (saved_project/README, run_meta.json) can distinguish
+                # "loop gave up while issues remained" from "loop converged".
+                # Round 2: also set the structured ``failure_type`` so
+                # observability tools that read review_report.json don't have
+                # to grep the summary string.
+                last_report = ReviewReport(
+                    passes=False,
+                    summary=(
+                        f"{last_report.summary} [{FailureType.QUALITY_LOOP_GAVE_UP.value}: "
+                        f"runtime validation failed for {stagnation_rounds} consecutive "
+                        "rounds without improvement; the bundle is NOT production-ready.]"
+                    ),
+                    issues=last_report.issues,
+                    failure_type=FailureType.QUALITY_LOOP_GAVE_UP.value,
+                )
+                if last_runtime_log:
+                    last_runtime_log = (
+                        last_runtime_log
+                        + f"\n\n[quality_loop] {FailureType.QUALITY_LOOP_GAVE_UP.value}: "
+                        f"stagnation_rounds={stagnation_rounds}"
+                    )
+                else:
+                    last_runtime_log = (
+                        f"[quality_loop] {FailureType.QUALITY_LOOP_GAVE_UP.value}: "
+                        f"stagnation_rounds={stagnation_rounds}"
+                    )
                 return current_code, last_report, last_runtime_log
             if round_idx == effective_max_rounds - 1:
                 return current_code, last_report, last_runtime_log
@@ -2238,6 +2805,33 @@ def run_quality_loop(
             print(
                 f"[Warn] Early stopping: no improvement for {stagnation_rounds} rounds."
             )
+            # v1.0.5 (P2-11): tag the bundle as gave-up so saved_project
+            # README banners flag it as failed rather than deliverable.
+            # Round 2: also set structured ``failure_type`` so observability
+            # tools can read the gave-up state without grepping summary text.
+            if last_report is not None:
+                last_report = ReviewReport(
+                    passes=False,
+                    summary=(
+                        f"{last_report.summary} [{FailureType.QUALITY_LOOP_GAVE_UP.value}: "
+                        f"quality review issues failed to decrease for "
+                        f"{stagnation_rounds} consecutive rounds; the bundle is "
+                        "NOT production-ready.]"
+                    ),
+                    issues=last_report.issues,
+                    failure_type=FailureType.QUALITY_LOOP_GAVE_UP.value,
+                )
+            if last_runtime_log:
+                last_runtime_log = (
+                    last_runtime_log
+                    + f"\n\n[quality_loop] {FailureType.QUALITY_LOOP_GAVE_UP.value}: "
+                    f"stagnation_rounds={stagnation_rounds}"
+                )
+            else:
+                last_runtime_log = (
+                    f"[quality_loop] {FailureType.QUALITY_LOOP_GAVE_UP.value}: "
+                    f"stagnation_rounds={stagnation_rounds}"
+                )
             return current_code, last_report, last_runtime_log
 
         if round_idx == effective_max_rounds - 1:

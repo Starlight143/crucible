@@ -981,6 +981,14 @@ function _detectAgentActivity(sessId, line) {
     [/analysis_kickoff_start/i,                           null,         'stage5_active'],
     // analysis_phase_done: mark stages 5-7 done (analysts + assembler + gate controller)
     [/analysis_kickoff_done/i,                            null,         'analysis_phase_done' ],
+    // v1.0.5 frontend↔backend audit: backend emits ``analysis_kickoff_failed``
+    // when the analysis crew raises during kickoff.  Without this mapping
+    // the analysts node would stay ``active`` indefinitely after a crash.
+    [/analysis_kickoff_failed|analysis_kickoff.*fail/i,   null,         'analysis_phase_error'],
+    // librarian_kickoff_failed: backend section_02 emits this when the
+    // research crew kickoff raises.  Map it to the librarian node so the
+    // graph turns red instead of staying green-active for the rest of run.
+    [/librarian_kickoff_failed|librarian_kickoff.*fail/i, 'librarian',  'error'       ],
     [/codegen_kickoff_start/i,                            null,         'stage8_active'],
     // codegen_kickoff_done dispatches to the ``codegen_phase_done`` state
     // handler (below): it first marks every stage-8 node ``done``, then
@@ -990,6 +998,18 @@ function _detectAgentActivity(sessId, line) {
     // for the rest of the run because nothing else closed them).
     [/codegen_kickoff_done/i,                             null,         'codegen_phase_done'],
     [/codegen_kickoff_failed/i,                           'code_gen',   'error'       ],
+    // v1.0.5 frontend↔backend audit: project_fix is the quality loop's
+    // re-codegen phase, fired by section_07 when self_check finds issues
+    // and the loop has retry budget left.  Backend emits 3 structured
+    // events: project_fix_kickoff_{start,done,failed}.  Without these
+    // mappings the agent flow goes silent for the full duration of the
+    // quality loop (often 30-60s × N rounds — the entire v1.0.5 round
+    // 2/3 work area).  Light up code_gen during the fix so the operator
+    // sees re-codegen is in progress; dispatch ``codegen_phase_done`` on
+    // completion so self_check re-activates and the loop visibly cycles.
+    [/project_fix_kickoff_start/i,                        'code_gen',   'active'      ],
+    [/project_fix_kickoff_done/i,                         null,         'codegen_phase_done'],
+    [/project_fix_kickoff_failed|project_fix_kickoff.*fail/i, 'code_gen', 'error'      ],
     // direction_feedback_start fires when GateController requests a
     // direction-debate refinement after analysis.  Activating dir_judge
     // (stage 0 / debate node) for the duration of the rerun gives the
@@ -1129,6 +1149,20 @@ function _detectAgentActivity(sessId, line) {
         const _s8 = graphDef.nodes.filter(n => n.stage === 8);
         if (_s8.length) _inferPriorDone(_s8[0].id);
         _s8.forEach(n => { sess.agentStates[n.id] = 'active'; changed = true; });
+      } else if (state === 'analysis_phase_error') {
+        // v1.0.5 audit: ``analysis_kickoff_failed`` fires when the
+        // analysis crew (analysts + assembler + gate_controller) crashes
+        // during kickoff.  Mark every stage-5/6/7 node currently active or
+        // waiting as ``error`` so the operator sees a red dot exactly
+        // where the crash happened, not a stuck green-active node.  We
+        // never auto-promote ``done`` nodes back to ``error`` — once a
+        // node is closed cleanly its history is preserved.
+        graphDef.nodes.filter(n => n.stage >= 5 && n.stage <= 7).forEach(n => {
+          if (sess.agentStates[n.id] !== undefined &&
+              sess.agentStates[n.id] !== 'done') {
+            sess.agentStates[n.id] = 'error'; changed = true;
+          }
+        });
       } else if (state === 'codegen_phase_done') {
         // Close all stage-8 nodes (code_arch, code_gen, …) and activate
         // self_check so stage 9 visibly takes over.  Without the explicit
@@ -1607,7 +1641,15 @@ async function loadDashboard() {
     const data = await resp.json();
 
     document.getElementById('stat-runs').textContent    = data.total_saved_runs ?? '—';
-    const _cost = Number(data.total_cost); document.getElementById('stat-cost').textContent = (data.total_cost != null && isFinite(_cost)) ? '$' + _cost.toFixed(4) : '—';
+    // v1.0.5 round 4: render cost at 6 decimals to match the cost_tracker's
+    // persistence precision (OpenRouter per-call costs reach the 6th
+    // decimal; toFixed(4) silently truncated cheap-model spend to $0.0000).
+    // Prefer the explicit ``total_cost_usd`` alias when present so future
+    // wire-format changes that disambiguate USD from legacy cost-units do
+    // not silently degrade the dashboard.
+    const _costRaw = (data.total_cost_usd != null) ? data.total_cost_usd : data.total_cost;
+    const _cost = Number(_costRaw);
+    document.getElementById('stat-cost').textContent = (_costRaw != null && isFinite(_cost)) ? '$' + _cost.toFixed(6) : '—';
     const _qual = Number(data.avg_quality); document.getElementById('stat-quality').textContent = (data.avg_quality != null && isFinite(_qual)) ? _qual.toFixed(2) : '—';
     document.getElementById('stat-session').textContent = (data.session_runs || []).length;
 
@@ -1631,6 +1673,27 @@ function filterRunsTable(q) {
   renderRunsTable(runs.filter(r => r.id && r.id.toLowerCase().includes(lower)));
 }
 
+// v1.0.5: Render the quality-loop outcome badge based on the structured
+// fields written by section_07 (run_meta.quality_passed +
+// run_meta.quality_loop_failure_type, or review_report.passes /
+// review_report.failure_type as fallback).  We deliberately do NOT
+// substring-match "QUALITY_LOOP_GAVE_UP" against any free-form summary
+// text — backend section_07 dropped that fallback in v1.0.5 round 3, and
+// the frontend must not silently re-introduce it.
+function _qualityBadgeHtml(passed, failureType) {
+  const ft = (typeof failureType === 'string') ? failureType.trim().toUpperCase() : '';
+  if (ft === 'QUALITY_LOOP_GAVE_UP') {
+    return '<span class="quality-badge gaveup" title="Quality loop exhausted its retry budget without passing review">⚠ Gave up</span>';
+  }
+  if (passed === true) {
+    return '<span class="quality-badge passed" title="Quality loop converged: review_report.passes = true">✓ Passed</span>';
+  }
+  if (passed === false) {
+    return '<span class="quality-badge failed" title="Quality loop did not pass review (no structured failure_type)">✗ Failed</span>';
+  }
+  return '';  // null / undefined → run predates v1.0.5 fields, render nothing
+}
+
 function renderRunsTable(runs) {
   const wrap = document.getElementById('runs-table-wrap');
   const badge = document.getElementById('runs-count-badge');
@@ -1641,10 +1704,12 @@ function renderRunsTable(runs) {
   }
   const rows = runs.map(r => {
     const hasBt = r.has_backtest ? `<span style="color:var(--success);font-size:10px;">✓ BT</span>` : '';
+    const qBadge = _qualityBadgeHtml(r.quality_passed, r.quality_loop_failure_type);
+    const qNum = r.quality != null ? ((n => isFinite(n) ? n.toFixed(2) : '—')(Number(r.quality))) : '—';
     return `<tr style="cursor:pointer;" data-run-id="${escHtml(r.id)}" onclick="openRunDetail(this.dataset.runId)">
       <td class="mono">${escHtml(r.id)} ${hasBt}</td>
-      <td>${r.cost != null ? ((n => isFinite(n) ? '$'+n.toFixed(5) : '—')(Number(r.cost))) : '—'}</td>
-      <td>${r.quality != null ? ((n => isFinite(n) ? n.toFixed(2) : '—')(Number(r.quality))) : '—'}</td>
+      <td>${r.cost != null ? ((n => isFinite(n) ? '$'+n.toFixed(6) : '—')(Number(r.cost))) : '—'}</td>
+      <td>${qNum}${qBadge ? ' ' + qBadge : ''}</td>
       <td>${r.tokens != null ? ((n => isFinite(n) ? n.toLocaleString() : '—')(Number(r.tokens))) : '—'}</td>
       <td>${r.mtime ? new Date(r.mtime * 1000).toLocaleString() : '—'}</td>
     </tr>`;
@@ -1910,8 +1975,27 @@ function renderRunDetailModal(runId, detail, chartData) {
   const files = detail.files || {};
   const analysis  = files.analysis  || {};
   const meta      = files.meta      || {};
+  const review    = files.review    || {};
   const backtest  = files.backtest  || {};
   const codeFiles = detail.code_files || [];
+
+  // v1.0.5: Resolve the quality outcome from the structured fields ONLY.
+  // ``run_meta.quality_passed`` (bool) is the canonical top-level field
+  // promoted in v1.0.5 round 2; we fall back to ``review_report.passes`` /
+  // ``review_report.failure_type`` for older saved_projects/ entries that
+  // predate the promotion.  The frontend mirrors the backend's strict
+  // validation: only ``QUALITY_LOOP_GAVE_UP`` is recognised as a structured
+  // failure_type.  We deliberately avoid substring-matching the summary
+  // (matching backend section_07's removal of that fallback in round 3).
+  const qPassedRaw = (typeof meta.quality_passed === 'boolean')
+    ? meta.quality_passed
+    : (typeof review.passes === 'boolean' ? review.passes : null);
+  const qFailureRaw =
+    (typeof meta.quality_loop_failure_type === 'string' && meta.quality_loop_failure_type.trim())
+      ? meta.quality_loop_failure_type
+      : ((typeof review.failure_type === 'string' && review.failure_type.trim())
+         ? review.failure_type : '');
+  const qBadgeHtml = _qualityBadgeHtml(qPassedRaw, qFailureRaw);
 
   // Build KV grid for meta/analysis
   const kvPairs = [
@@ -1921,18 +2005,34 @@ function renderRunDetailModal(runId, detail, chartData) {
     { label: 'Risk Level',   value: analysis.risk_level || '—' },
     { label: 'Gate Decision',value: analysis.gate_decision || '—' },
     { label: 'Score',        value: (() => { const n = Number(analysis.score); return (analysis.score != null && isFinite(n)) ? n.toFixed(3) : '—'; })() },
-    { label: 'Total Cost',   value: (() => { const n = Number(meta.total_cost); return (meta.total_cost != null && isFinite(n)) ? '$' + n.toFixed(5) : '—'; })() },
+    // v1.0.5 round 4: prefer the USD-explicit field (``total_cost_usd``)
+    // promoted into run_meta.json by section_07.  Fall back to the legacy
+    // ``total_cost`` key for older saved_projects/ that predate the
+    // promotion.  Display at 6 decimals to match persistence precision.
+    { label: 'Total Cost',   value: (() => {
+        const raw = (meta.total_cost_usd != null) ? meta.total_cost_usd : meta.total_cost;
+        if (raw == null) return '—';
+        const n = Number(raw);
+        return isFinite(n) ? '$' + n.toFixed(6) : '—';
+      })() },
     { label: 'Total Tokens', value: (() => { const n = Number(meta.total_tokens); return (meta.total_tokens != null && isFinite(n)) ? n.toLocaleString() : '—'; })() },
   ];
   // Feature 8: schema_version
   const sv = analysis.schema_version || meta.schema_version;
   if (sv != null) kvPairs.push({ label: 'Schema Version', value: 'v' + sv });
 
+  // The Quality Status cell is rendered as raw HTML (not escaped via
+  // escHtml) so the badge span survives intact; build it separately and
+  // splice into the KV grid as a final cell.
   const kvHtml = kvPairs.map(kv => `
     <div class="detail-kv">
       <div class="detail-kv-label">${escHtml(kv.label)}</div>
       <div class="detail-kv-value">${escHtml(String(kv.value))}</div>
-    </div>`).join('');
+    </div>`).join('') + (qBadgeHtml ? `
+    <div class="detail-kv">
+      <div class="detail-kv-label">Quality Status</div>
+      <div class="detail-kv-value">${qBadgeHtml}</div>
+    </div>` : '');
 
   // Backtest metrics
   let btHtml = '';
@@ -1998,6 +2098,48 @@ function renderRunDetailModal(runId, detail, chartData) {
     ? `<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:12px;font-size:12px;color:var(--text-2);line-height:1.6;max-height:120px;overflow-y:auto;">${escHtml(String(consensusRaw).slice(0, 600))}${String(consensusRaw).length > 600 ? '…' : ''}</div>`
     : '';
 
+  // v1.0.5: Review section — surface the structured review_report.json
+  // payload (summary + issues) that backend section_07 emits.  Only
+  // rendered when the file actually exists; older runs that predate the
+  // file simply skip the section.
+  const reviewSummaryRaw = (typeof review.summary === 'string') ? review.summary : '';
+  const reviewSummaryHtml = reviewSummaryRaw
+    ? `<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:8px;padding:12px;font-size:12px;color:var(--text-2);line-height:1.6;max-height:160px;overflow-y:auto;">${escHtml(String(reviewSummaryRaw).slice(0, 1200))}${String(reviewSummaryRaw).length > 1200 ? '…' : ''}</div>`
+    : '';
+
+  const issuesArr = Array.isArray(review.issues) ? review.issues : [];
+  const _SEV_RANK = { high: 0, medium: 1, low: 2 };
+  // Sort high → medium → low so the most actionable items appear first.
+  const issuesSorted = issuesArr.slice().sort((a, b) => {
+    const ra = _SEV_RANK[String((a && a.severity) || '').toLowerCase()] ?? 3;
+    const rb = _SEV_RANK[String((b && b.severity) || '').toLowerCase()] ?? 3;
+    return ra - rb;
+  });
+  const ISSUE_CAP = 20;
+  const issuesShown = issuesSorted.slice(0, ISSUE_CAP);
+  const issuesOverflow = Math.max(0, issuesSorted.length - ISSUE_CAP);
+  const issuesHtml = issuesShown.length
+    ? `<div class="review-issue-list">${issuesShown.map(it => {
+        const sev = String((it && it.severity) || '').toLowerCase();
+        const sevClass = (sev === 'high' || sev === 'medium' || sev === 'low')
+          ? `review-issue-severity-${sev}` : 'review-issue-severity-unknown';
+        const sevLabel = sev ? sev.toUpperCase() : '—';
+        const file = (typeof it.file === 'string' && it.file.trim()) ? it.file : '';
+        const desc = (typeof it.description === 'string') ? it.description : '';
+        const sug  = (typeof it.suggestion === 'string') ? it.suggestion : '';
+        const cat  = (typeof it.category === 'string' && it.category.trim()) ? it.category : '';
+        return `<div class="review-issue-item">
+          <div class="review-issue-head">
+            <span class="review-issue-sev ${sevClass}">${escHtml(sevLabel)}</span>
+            ${cat ? `<span class="review-issue-cat">${escHtml(cat)}</span>` : ''}
+            ${file ? `<span class="review-issue-file mono">${escHtml(file)}</span>` : ''}
+          </div>
+          <div class="review-issue-desc">${escHtml(desc)}</div>
+          ${sug ? `<div class="review-issue-sug"><span class="review-issue-sug-label">Suggestion</span> ${escHtml(sug)}</div>` : ''}
+        </div>`;
+      }).join('')}${issuesOverflow > 0 ? `<div class="review-issue-overflow">+${issuesOverflow} more issue${issuesOverflow !== 1 ? 's' : ''} not shown — see <code>review_report.json</code></div>` : ''}</div>`
+    : '';
+
   document.getElementById('modal-body').innerHTML = `
     <div class="detail-section">
       <div class="detail-section-title">Run Info</div>
@@ -2006,6 +2148,14 @@ function renderRunDetailModal(runId, detail, chartData) {
     ${consensusRaw ? `<div class="detail-section">
       <div class="detail-section-title">Analysis Consensus</div>
       ${consensusHtml}
+    </div>` : ''}
+    ${reviewSummaryHtml ? `<div class="detail-section">
+      <div class="detail-section-title">Review Summary ${qBadgeHtml ? qBadgeHtml : ''}</div>
+      ${reviewSummaryHtml}
+    </div>` : ''}
+    ${issuesHtml ? `<div class="detail-section">
+      <div class="detail-section-title">Review Issues (${issuesSorted.length})</div>
+      ${issuesHtml}
     </div>` : ''}
     ${btHtml}
     <div class="detail-section">
@@ -2928,7 +3078,10 @@ function renderComparePage(idA, idB, dataA, dataB) {
     { label: 'Risk Level',    va: anA.risk_level,              vb: anB.risk_level,              type: 'str' },
     { label: 'Gate Decision', va: anA.gate_decision,           vb: anB.gate_decision,           type: 'str' },
     { label: 'Quality Score', va: anA.score,                   vb: anB.score,                   type: 'num', higherBetter: true },
-    { label: 'Total Cost',    va: meA.total_cost,              vb: meB.total_cost,              type: 'num', higherBetter: false, fmt: v => v != null ? '$' + Number(v).toFixed(5) : '—' },
+    // v1.0.5 round 4: prefer USD-explicit cost field with legacy fallback;
+    // 6 decimals to match cost_tracker precision (toFixed(5) silently
+    // dropped per-call OpenRouter costs at the 6th decimal to $0).
+    { label: 'Total Cost',    va: (meA.total_cost_usd != null ? meA.total_cost_usd : meA.total_cost), vb: (meB.total_cost_usd != null ? meB.total_cost_usd : meB.total_cost), type: 'num', higherBetter: false, fmt: v => v != null ? '$' + Number(v).toFixed(6) : '—' },
     { label: 'Total Tokens',  va: meA.total_tokens,            vb: meB.total_tokens,            type: 'num', higherBetter: false, fmt: v => v != null ? Number(v).toLocaleString() : '—' },
     { label: 'Code Files',    va: (dataA.code_files || []).length, vb: (dataB.code_files || []).length, type: 'num', higherBetter: true },
   ];
@@ -3156,7 +3309,7 @@ function renderABResults(data) {
     const items = [
       ['Status',        escHtml(runData.status  || '—')],
       ['Quality Score', fmtF2(runData.quality)],
-      ['Total Cost',    runData.cost != null ? '$' + Number(runData.cost).toFixed(5) : '—'],
+      ['Total Cost',    runData.cost != null ? '$' + Number(runData.cost).toFixed(6) : '—'],
       ['Return Code',   runData.returncode != null ? String(runData.returncode) : '—'],
     ];
     return items.map(([l, v]) => `
@@ -3231,12 +3384,14 @@ async function loadBudgetStatus() {
     const capPct     = document.getElementById('budget-cap-pct');
 
     // Display "—" when there is genuinely no cost data yet (cost === null from server)
+    // v1.0.5 round 4: 6 decimals to match cost_tracker precision (toFixed(4)
+    // silently dropped per-call OpenRouter cost at the 6th decimal to $0).
     const _fmtCost = (obj) => {
       if (obj == null) return '—';
       const v = typeof obj === 'object' ? obj.cost : obj;
       if (v == null) return '—';
       const n = Number(v);
-      return isFinite(n) ? '$' + n.toFixed(4) : '—';
+      return isFinite(n) ? '$' + n.toFixed(6) : '—';
     };
     if (todayBadge) todayBadge.textContent = `Today: ${_fmtCost(data.today_cost ?? data.today)}`;
     if (monthBadge) monthBadge.textContent = `Month: ${_fmtCost(data.month_cost ?? data.month)}`;
