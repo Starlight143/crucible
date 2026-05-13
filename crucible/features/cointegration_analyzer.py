@@ -142,7 +142,8 @@ def _variance(series: List[float], ddof: int = 0) -> float:
 
 def _std(series: List[float], ddof: int = 0) -> float:
     v = _variance(series, ddof=ddof)
-    return math.sqrt(v) if v > 0.0 else 0.0
+    # v1.1.0 fourth-pass: align subnormal guard with CLAUDE.md rule.
+    return math.sqrt(v) if v > 1e-14 else 0.0
 
 
 def _covariance(x: List[float], y: List[float], ddof: int = 0) -> float:

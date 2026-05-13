@@ -29,6 +29,23 @@ Data source resolution order
 5. Last resort → generate synthetic GBM data (marked as ``synthetic`` in the
    report).
 
+Data integrity guard
+--------------------
+The synthetic-GBM fallback at step 5 is meaningless for any real backtest:
+Sharpe / drawdown / win-rate computed against ``random.gauss``-driven prices
+are statistically random and must not flow into v1.2.0 retrieval or any
+ranking that influences future strategy generation.
+
+``BACKTEST_REQUIRE_REAL_DATA=1`` (the default) raises
+``BacktestDataIntegrityError`` instead of silently falling back to synthetic
+data — both when ``BACKTEST_DATA_SOURCE=synthetic`` is requested explicitly
+AND when ``auto`` resolution exhausts every real-data path.  Operators who
+deliberately want synthetic data (CI smoke tests, plumbing checks) must
+opt-in by setting ``BACKTEST_REQUIRE_REAL_DATA=0`` in ``.env``; the resulting
+backtest will carry a loud warning in ``report.warnings`` and the
+``data_source`` field stays ``"synthetic"`` so downstream consumers can
+filter it out.
+
 Usage::
 
     from crucible.features.backtest_runner import run_backtest_pipeline
@@ -59,10 +76,15 @@ BACKTEST_TARGET_METRIC     Metric to optimise for (default "sharpe_ratio").
 BACKTEST_BAYESIAN_N_TRIALS Number of Optuna trials for Bayesian search (default 30).
 BACKTEST_FIX_MAX_ROUNDS    Max LLM fix iterations if backtest fails (default 3).
 BACKTEST_INITIAL_CAPITAL   Starting capital for synthetic runs (default 100000).
+BACKTEST_REQUIRE_REAL_DATA Refuse synthetic-GBM fallback when set to truthy
+                           (default ``1``).  Set to ``0`` only for plumbing
+                           smoke tests / offline CI where strategy quality
+                           is not being evaluated.
 """
 from __future__ import annotations
 
 import csv
+import hashlib
 import importlib.util
 import io
 import json
@@ -71,21 +93,38 @@ import os
 import random
 import subprocess
 import threading
+import time
 import sys
 import textwrap
+import concurrent.futures
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from itertools import product as iter_product
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, NamedTuple, Optional, Set, Tuple
 
 from crucible.output_validation import strip_reasoning_blocks
 
 _UTC = timezone.utc
 
-# Module-level RNG used for non-reproducible sampling (e.g. random parameter
-# search).  Kept separate from the local RNG in generate_synthetic_ohlcv so
-# that seeded synthetic data generation never shares state with param search.
-_PARAM_RNG: random.Random = random.Random()
+# Module-level RNG used for random parameter search.  Kept separate from
+# the local RNG in generate_synthetic_ohlcv so that seeded synthetic data
+# generation never shares state with param search.
+#
+# v1.1.0 fifth-pass (G-13): seeded by default.  Previously
+# ``random.Random()`` constructed the RNG with the OS time at import,
+# making the optuna-disabled fallback random-search path
+# non-deterministic — best_params drifted across re-runs of the same
+# strategy code, breaking quant retrospective analysis and the v1.2.0
+# retrieval rank tests.  Set ``BACKTEST_PARAM_SEED`` to override (or
+# ``random`` for the legacy non-deterministic behaviour).
+_PARAM_SEED_RAW = os.environ.get("BACKTEST_PARAM_SEED", "4242").strip().lower()
+if _PARAM_SEED_RAW in {"", "random", "none", "null"}:
+    _PARAM_RNG: random.Random = random.Random()
+else:
+    try:
+        _PARAM_RNG = random.Random(int(_PARAM_SEED_RAW))
+    except (TypeError, ValueError):
+        _PARAM_RNG = random.Random(4242)  # malformed → safe default
 _PARAM_RNG_LOCK: threading.Lock = threading.Lock()
 
 
@@ -110,6 +149,24 @@ def _env_str(name: str, default: str) -> str:
     return _env.env_str(name, default)
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    return _env.env_bool(name, default)
+
+
+# ─── Data integrity guard ─────────────────────────────────────────────────────
+class BacktestDataIntegrityError(RuntimeError):
+    """Raised when the backtest pipeline would otherwise produce metrics
+    against synthetic-GBM data while ``BACKTEST_REQUIRE_REAL_DATA`` is on.
+
+    The message includes the diagnosis (what was tried, what failed) and the
+    explicit opt-in step the operator must take to allow synthetic.  This
+    error is intentionally NOT a subclass of ``ValueError`` / generic
+    ``Exception``-with-bland-message so downstream consumers can pattern-match
+    on the type if they want to surface a different UI (e.g. "install
+    yfinance" tooltip vs. generic "backtest failed").
+    """
+
+
 BACKTEST_TIMEOUT = _env_int("BACKTEST_TIMEOUT", 120)
 BACKTEST_SYMBOL = _env_str("BACKTEST_SYMBOL", "SPY")
 BACKTEST_DATA_SOURCE = _env_str("BACKTEST_DATA_SOURCE", "auto")
@@ -122,6 +179,328 @@ BACKTEST_TARGET_METRIC = _env_str("BACKTEST_TARGET_METRIC", "sharpe_ratio")
 BACKTEST_BAYESIAN_N_TRIALS = _env_int("BACKTEST_BAYESIAN_N_TRIALS", 30)
 BACKTEST_FIX_MAX_ROUNDS = _env_int("BACKTEST_FIX_MAX_ROUNDS", 3)
 BACKTEST_INITIAL_CAPITAL = _env_float("BACKTEST_INITIAL_CAPITAL", 100_000.0)
+# Default-on integrity guard: refuse synthetic-GBM fallback when no real data
+# can be fetched.  See module docstring "Data integrity guard" section.  The
+# value is re-read inside ``prepare_data`` (not cached at import time) so
+# subprocess env overrides via ``_run_worker`` actually take effect per-run.
+BACKTEST_REQUIRE_REAL_DATA_DEFAULT = _env_bool("BACKTEST_REQUIRE_REAL_DATA", True)
+
+# Minimum number of OHLCV rows required for a fetched dataset to be considered
+# usable.  yfinance is known to occasionally return 1-2 partial rows for stale
+# / suspended tickers; treating those as success silently corrupts metrics.
+BACKTEST_MIN_REAL_DATA_ROWS_DEFAULT = _env_int("BACKTEST_MIN_REAL_DATA_ROWS", 30)
+
+# Data cache: when a real-data provider succeeds, write the CSV to a
+# user-level cache directory keyed by ``sha1(symbol|period|interval|today)``.
+# Subsequent runs on the same day reuse the cache (no API call, no rate-limit
+# risk).  TTL is in hours; 0 disables the cache entirely.
+BACKTEST_DATA_CACHE_TTL_HOURS_DEFAULT = _env_int("BACKTEST_DATA_CACHE_TTL_HOURS", 24)
+BACKTEST_DATA_CACHE_DIR_DEFAULT = _env_str("BACKTEST_DATA_CACHE_DIR", "")
+
+# Maximum data staleness in days before a warning is appended to the report.
+# Useful for catching cases where the strategy is being evaluated against a
+# data window that ends months in the past (different market regime).
+BACKTEST_DATA_MAX_STALENESS_DAYS_DEFAULT = _env_int("BACKTEST_DATA_MAX_STALENESS_DAYS", 7)
+
+# Synthetic-data seed (only used when ``BACKTEST_REQUIRE_REAL_DATA=0``).  The
+# literal string ``"random"`` (case-insensitive) selects a fresh seed each
+# run; any integer is used verbatim for reproducibility.  Default ``42`` is
+# retained for backwards compatibility with the v1.0.x behaviour.
+BACKTEST_SYNTHETIC_SEED_DEFAULT = _env_str("BACKTEST_SYNTHETIC_SEED", "42")
+
+# Dry-run flag: when ``1``, ``run_backtest_pipeline`` exits immediately after
+# ``prepare_data`` returns, before running any strategy subprocess.  Lets the
+# operator confirm that the data path is wired up without paying the cost of
+# the actual backtest + optimisation loop.
+BACKTEST_PREPARE_DATA_ONLY_DEFAULT = _env_bool("BACKTEST_PREPARE_DATA_ONLY", False)
+
+# Optional parallel fetch: when ``1``, the auto cascade fires both yfinance
+# and Binance concurrently and uses whichever returns valid data first
+# (priority tie-break: yfinance for non-crypto, Binance for crypto).  Default
+# off — sequential cascade is friendlier to provider rate limits.
+BACKTEST_PARALLEL_FETCH_DEFAULT = _env_bool("BACKTEST_PARALLEL_FETCH", False)
+
+
+def _require_real_data_active() -> bool:
+    """Live-read the integrity guard at call time so subprocess env overrides
+    propagate correctly.  Caching at module import time would let a stale
+    process-global value override a fresh per-run subprocess env.
+    """
+    return _env_bool("BACKTEST_REQUIRE_REAL_DATA", True)
+
+
+def _min_real_data_rows() -> int:
+    """Live-read minimum-row threshold; subprocess env overrides take effect."""
+    return _env_int("BACKTEST_MIN_REAL_DATA_ROWS", BACKTEST_MIN_REAL_DATA_ROWS_DEFAULT)
+
+
+def _data_cache_ttl_seconds() -> int:
+    """Cache TTL in seconds; 0 disables caching."""
+    hours = _env_int("BACKTEST_DATA_CACHE_TTL_HOURS", BACKTEST_DATA_CACHE_TTL_HOURS_DEFAULT)
+    return max(0, hours) * 3600
+
+
+def _data_cache_dir() -> str:
+    """Resolve cache directory; expand ``~``; default to ``~/.crucible/data_cache``."""
+    raw = _env_str("BACKTEST_DATA_CACHE_DIR", BACKTEST_DATA_CACHE_DIR_DEFAULT).strip()
+    if raw:
+        return os.path.expanduser(raw)
+    return os.path.join(os.path.expanduser("~"), ".crucible", "data_cache")
+
+
+def _data_max_staleness_days() -> int:
+    return _env_int("BACKTEST_DATA_MAX_STALENESS_DAYS", BACKTEST_DATA_MAX_STALENESS_DAYS_DEFAULT)
+
+
+def _synthetic_seed() -> Optional[int]:
+    """Resolve synthetic seed env value to ``int`` (reproducible) or ``None``
+    (fresh randomness each call).  Invalid values fall back to ``42``."""
+    raw = _env_str("BACKTEST_SYNTHETIC_SEED", BACKTEST_SYNTHETIC_SEED_DEFAULT).strip().lower()
+    if raw in ("random", "none", ""):
+        return None
+    try:
+        return int(raw)
+    except (ValueError, TypeError):
+        return 42
+
+
+def _prepare_data_only() -> bool:
+    return _env_bool("BACKTEST_PREPARE_DATA_ONLY", BACKTEST_PREPARE_DATA_ONLY_DEFAULT)
+
+
+def _parallel_fetch_active() -> bool:
+    return _env_bool("BACKTEST_PARALLEL_FETCH", BACKTEST_PARALLEL_FETCH_DEFAULT)
+
+
+# ─── Fetch diagnostics ────────────────────────────────────────────────────────
+class FetchOutcome(NamedTuple):
+    """Structured result of a single real-data provider fetch attempt.
+
+    ``error_kind`` is one of:
+      - "ok"            — csv_text is valid and contains usable data
+      - "not_installed" — required dependency missing (yfinance / ccxt)
+      - "empty"         — provider returned but no usable rows
+      - "rate_limit"    — HTTP 429 or equivalent throttling response
+      - "network"       — connection / DNS / timeout error
+      - "auth"          — HTTP 401/403 (rare; some endpoints require key)
+      - "invalid_data"  — schema mismatch (missing OHLCV columns)
+      - "unknown"       — anything else (exception class included in detail)
+
+    ``detail`` is a one-line human-readable explanation used to enrich the
+    ``BacktestDataIntegrityError`` message at the auto-cascade exhaustion
+    point.  ``csv_text`` is the empty string when ``error_kind != "ok"``.
+    """
+
+    csv_text: str
+    error_kind: str
+    detail: str
+
+
+# Per-thread last-seen diagnostic per provider, populated by the public
+# ``fetch_*`` functions.  v1.1.0 hardening: the diagnostics dict used to be
+# a single module-global protected by a lock; two concurrent ``prepare_data``
+# calls (e.g. the WebUI running a backtest while a CLI compares reports)
+# would both call ``_LAST_FETCH_DIAGNOSTICS.clear()`` at the top of
+# prepare_data and clobber each other's provider outcomes, surfacing the
+# wrong error message in ``BacktestDataIntegrityError``.  Switching to
+# ``threading.local`` gives every caller their own dict; the cascade order
+# (yfinance → binance → ccxt) within a single call is preserved.
+#
+# The module-level lock + dict are retained as a legacy global mirror so
+# any external caller that imports ``_LAST_FETCH_DIAGNOSTICS`` directly
+# (no known callers, but a stable backstop) still sees the most-recent
+# write.  All public accessors route through the thread-local first.
+_LAST_FETCH_DIAGNOSTICS: Dict[str, FetchOutcome] = {}
+_LAST_FETCH_DIAGNOSTICS_LOCK: threading.Lock = threading.Lock()
+_FETCH_DIAGNOSTICS_TLS: threading.local = threading.local()
+
+
+def _tls_diagnostics() -> Dict[str, FetchOutcome]:
+    """Return the per-thread diagnostics dict, creating it on first access."""
+    d = getattr(_FETCH_DIAGNOSTICS_TLS, "store", None)
+    if d is None:
+        d = {}
+        _FETCH_DIAGNOSTICS_TLS.store = d
+    return d
+
+
+def _record_fetch_diagnostic(provider: str, outcome: FetchOutcome) -> None:
+    """Thread-safe write to the diagnostics snapshot.  Stores both in the
+    per-thread bucket (used by ``_get_fetch_diagnostic`` / ``prepare_data``)
+    and in the legacy module-global (kept as a backstop for external code)."""
+    _tls_diagnostics()[provider] = outcome
+    with _LAST_FETCH_DIAGNOSTICS_LOCK:
+        _LAST_FETCH_DIAGNOSTICS[provider] = outcome
+
+
+def _get_fetch_diagnostic(provider: str) -> Optional[FetchOutcome]:
+    """Read the most recent ``FetchOutcome`` recorded for *provider* in the
+    current thread.  Returns ``None`` when ``fetch_*`` was never called in
+    this thread (e.g. test mocks bypass it).  Cross-thread reads are not
+    supported by design — diagnostics are call-scoped to prevent two
+    concurrent backtests from clobbering each other's error messages."""
+    return _tls_diagnostics().get(provider)
+
+
+def _clear_fetch_diagnostics() -> None:
+    """Reset the per-thread diagnostics dict.  Called at the top of every
+    ``prepare_data`` invocation so each cascade starts from a clean slate
+    without leaking outcomes from a previous backtest in the same thread."""
+    _tls_diagnostics().clear()
+
+
+def _classify_fetch_exception(exc: BaseException) -> Tuple[str, str]:
+    """Map a Python exception to ``(error_kind, detail)``.  Used by every
+    real-data fetch implementation so the integrity guard's error message
+    can tell the operator *why* a provider failed (network vs. throttling
+    vs. data-format mismatch) rather than just "returned no data"."""
+    import urllib.error
+    name = type(exc).__name__
+    detail = f"{name}: {exc!s}".strip()
+    if isinstance(exc, urllib.error.HTTPError):
+        code = getattr(exc, "code", 0)
+        if code == 429:
+            return "rate_limit", detail
+        if code in (401, 403):
+            return "auth", detail
+        return "network", detail
+    if isinstance(exc, (urllib.error.URLError, OSError, TimeoutError)):
+        return "network", detail
+    if isinstance(exc, (ValueError, KeyError, TypeError)):
+        return "invalid_data", detail
+    return "unknown", detail
+
+
+def _csv_row_count(csv_text: str) -> int:
+    """Count non-empty data rows (header excluded) in a CSV string."""
+    if not csv_text:
+        return 0
+    total = 0
+    saw_header = False
+    for line in csv_text.splitlines():
+        if not line.strip():
+            continue
+        if not saw_header:
+            saw_header = True
+            continue
+        total += 1
+    return total
+
+
+def _validate_fetched_csv(
+    csv_text: str,
+    *,
+    profile: Optional[Dict[str, Any]] = None,
+    min_rows_override: Optional[int] = None,
+) -> Tuple[bool, str, int]:
+    """Check whether a fetched CSV string is usable.  Returns ``(ok, reason,
+    row_count)``.  *profile* is the timeframe profile dict; the threshold is
+    ``max(_min_real_data_rows(), 0.3 * profile['synthetic_rows'])`` so that
+    long-interval profiles (1d → 500 syn rows) accept ~150 rows while
+    short-interval profiles (1m → 5000 syn rows) require more substance.
+    """
+    if not csv_text:
+        return False, "empty", 0
+    row_count = _csv_row_count(csv_text)
+    if min_rows_override is not None:
+        threshold = max(1, int(min_rows_override))
+    else:
+        base = _min_real_data_rows()
+        if profile is not None:
+            profile_thresh = int(profile.get("synthetic_rows", base) * 0.3)
+            threshold = max(base, profile_thresh)
+        else:
+            threshold = base
+    if row_count < threshold:
+        return False, f"only {row_count} rows (need ≥ {threshold})", row_count
+    return True, "ok", row_count
+
+
+# ─── Data cache (disk-level) ──────────────────────────────────────────────────
+def _data_cache_path(symbol: str, period: str, interval: str) -> str:
+    """Deterministic cache filename for ``(symbol, period, interval)``.
+
+    v1.1.0: the previous implementation embedded ``today_utc`` in the cache
+    key so the cache was day-grained.  Combined with TTL this meant APAC
+    operators (UTC+8) starting work at 08:00 local (= 00:00 UTC) saw the
+    cache invalidate every morning mid-trading-day even though yesterday's
+    data was still perfectly usable.  We now rely solely on file mtime +
+    ``BACKTEST_DATA_CACHE_TTL_HOURS`` for expiry — a single rolling-window
+    mechanism rather than two overlapping ones.
+    """
+    key = f"{symbol}|{period}|{interval}"
+    digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+    cache_dir = _data_cache_dir()
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+    except OSError:
+        # Best-effort: if cache dir can't be created (read-only HOME etc.),
+        # callers will just see cache misses; never fail prepare_data over this.
+        pass
+    return os.path.join(cache_dir, f"{digest}.csv")
+
+
+def _read_data_cache(symbol: str, period: str, interval: str) -> Optional[str]:
+    """Return cached CSV text or ``None`` if absent / expired / disabled."""
+    ttl = _data_cache_ttl_seconds()
+    if ttl <= 0:
+        return None
+    path = _data_cache_path(symbol, period, interval)
+    try:
+        if not os.path.isfile(path):
+            return None
+        age = time.time() - os.path.getmtime(path)
+        if age > ttl:
+            return None
+        with open(path, "r", encoding="utf-8") as fh:
+            return fh.read()
+    except OSError:
+        return None
+
+
+def _write_data_cache(symbol: str, period: str, interval: str, csv_text: str) -> None:
+    """Persist *csv_text* to the cache; best-effort (silent on failure)."""
+    if not csv_text or _data_cache_ttl_seconds() <= 0:
+        return
+    path = _data_cache_path(symbol, period, interval)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="") as fh:
+            fh.write(csv_text)
+        os.replace(tmp, path)
+    except OSError:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+def _synthetic_refusal_message(reason: str) -> str:
+    """Standardised error message for synthetic-data refusal.  Tells the
+    operator both how to fix the root cause (install yfinance / ccxt) and
+    how to opt out of the guard if they genuinely want synthetic.
+    """
+    return (
+        "Backtest data integrity check failed: " + reason + "\n\n"
+        "The backtest pipeline refuses to silently fall back to synthetic-GBM "
+        "data because the resulting Sharpe / drawdown / win-rate metrics are "
+        "statistically random and would corrupt downstream analytics, the run "
+        "insights ledger, and (in v1.2.0+) the retrieval layer used to bias "
+        "future strategy generation.\n\n"
+        "To proceed, choose ONE of the following:\n"
+        "  1. Install at least one real-data provider:\n"
+        "       pip install yfinance        (for stocks / ETFs)\n"
+        "       pip install ccxt            (for crypto via Binance / others)\n"
+        "  2. Provide a custom ``data_provider.py`` in the generated project\n"
+        "     that returns real OHLCV CSV (see the existing test fixtures for\n"
+        "     the expected signature).\n"
+        "  3. Place a pre-fetched CSV at ``<project>/data/sample_data.csv``\n"
+        "     (the runner auto-detects ``code/data/*.csv``).\n"
+        "  4. (Smoke-test / plumbing only) Set "
+        "``BACKTEST_REQUIRE_REAL_DATA=0`` in ``.env``; the resulting run will "
+        "carry a loud warning in ``report.warnings`` and ``data_source`` will "
+        "stay ``synthetic`` so downstream consumers can filter it out."
+    )
 
 
 # ── Timeframe profiles ──────────────────────────────────────────────────────
@@ -329,9 +708,18 @@ class BacktestReport:
     success: bool = False
     run_dir: str = ""
     data_source: str = ""           # "existing" | "yfinance" | "binance" | "project_provider" | "synthetic"
-    data_symbol: str = ""           # ticker/symbol used for download
+    data_symbol: str = ""           # ticker/symbol the user/auto-detection intended
     data_interval: str = ""         # candle interval used (e.g. "1d", "1h", "5m")
     data_rows: int = 0
+    # ── Data freshness / actual-symbol provenance (HIGH 1 / MEDIUM 10) ─────────
+    # data_actual_symbol records the *exact* symbol string passed to the
+    # provider that succeeded (may differ from data_symbol in formatting —
+    # e.g. ``BTC/USDT`` requested → ``BTCUSDT`` actually fetched).  Empty
+    # string means it matches data_symbol or is irrelevant (synthetic).
+    data_actual_symbol: str = ""
+    data_start_date: str = ""       # ISO date of the first row in the data file
+    data_end_date: str = ""         # ISO date of the last row in the data file
+    data_staleness_days: Optional[int] = None  # days between data_end_date and now (UTC)
     baseline_metrics: Optional[BacktestMetrics] = None
     parameter_search: str = "none"  # "grid" | "random" | "none"
     combos_evaluated: int = 0
@@ -341,6 +729,7 @@ class BacktestReport:
     fix_rounds_used: int = 0
     errors: List[str] = field(default_factory=list)
     warnings: List[str] = field(default_factory=list)
+    notes: List[str] = field(default_factory=list)
     _data_file: Optional[str] = field(default=None, repr=False)
     # Stores the runtime target_metric so that report generation uses the same
     # metric that was actually optimised, not the module-level default.
@@ -360,6 +749,16 @@ class BacktestReport:
             # continue to use the same metric that was actually optimised.
             "target_metric": self.target_metric,
         }
+        # Provenance fields are only emitted when populated, to keep the JSON
+        # compact for runs that don't use real-data fetch (e.g. ``existing``).
+        if self.data_actual_symbol and self.data_actual_symbol != self.data_symbol:
+            d["data_actual_symbol"] = self.data_actual_symbol
+        if self.data_start_date:
+            d["data_start_date"] = self.data_start_date
+        if self.data_end_date:
+            d["data_end_date"] = self.data_end_date
+        if self.data_staleness_days is not None:
+            d["data_staleness_days"] = self.data_staleness_days
         if self.baseline_metrics:
             d["baseline_metrics"] = self.baseline_metrics.to_dict()
         if self.best_params:
@@ -376,6 +775,8 @@ class BacktestReport:
             d["errors"] = self.errors
         if self.warnings:
             d["warnings"] = self.warnings
+        if self.notes:
+            d["notes"] = self.notes
         return d
 
     def summary_text(self) -> str:
@@ -384,6 +785,16 @@ class BacktestReport:
         symbol_info = f" [{self.data_symbol}]" if self.data_symbol else ""
         interval_info = f" @{self.data_interval}" if self.data_interval else ""
         lines.append(f"Data source: {self.data_source}{symbol_info}{interval_info} ({self.data_rows} rows)")
+        if self.data_actual_symbol and self.data_actual_symbol != self.data_symbol:
+            lines.append(f"  Actual symbol fetched: {self.data_actual_symbol}")
+        if self.data_start_date or self.data_end_date:
+            stale = ""
+            if self.data_staleness_days is not None:
+                stale = f" ({self.data_staleness_days}d stale)"
+            lines.append(
+                f"  Data window: {self.data_start_date or '?'} → "
+                f"{self.data_end_date or '?'}{stale}"
+            )
         if self.baseline_metrics:
             bm = self.baseline_metrics
             lines.append("── Baseline metrics ──")
@@ -819,9 +1230,15 @@ def fetch_yfinance_ohlcv(
 
     For intraday intervals, timestamps include HH:MM:SS.
 
-    Returns CSV text on success, None on failure.
+    Returns CSV text on success, None on failure.  The detailed diagnosis
+    (network vs. throttling vs. invalid-symbol vs. not-installed) is
+    recorded via ``_record_fetch_diagnostic("yfinance", ...)`` so the
+    integrity guard can surface an actionable error message.
     """
     if not _yfinance_available():
+        _record_fetch_diagnostic("yfinance", FetchOutcome(
+            "", "not_installed", "yfinance is not installed (pip install yfinance)",
+        ))
         import warnings
         warnings.warn(
             "yfinance is not installed; falling back to synthetic data. "
@@ -836,6 +1253,10 @@ def fetch_yfinance_ohlcv(
         ticker = yf.Ticker(symbol)
         df = ticker.history(period=period, interval=interval)
         if df is None or df.empty:
+            _record_fetch_diagnostic("yfinance", FetchOutcome(
+                "", "empty",
+                f"yfinance returned no rows for {symbol!r} (symbol invalid / delisted / no data)",
+            ))
             return None
 
         # Normalise column names to lowercase
@@ -859,6 +1280,10 @@ def fetch_yfinance_ohlcv(
 
         required = {"date", "open", "high", "low", "close", "volume"}
         if not required.issubset(set(df.columns)):
+            _record_fetch_diagnostic("yfinance", FetchOutcome(
+                "", "invalid_data",
+                f"yfinance result missing required OHLCV columns (got {sorted(df.columns)})",
+            ))
             return None
 
         df = df[["date", "open", "high", "low", "close", "volume"]]
@@ -871,12 +1296,22 @@ def fetch_yfinance_ohlcv(
         # Drop rows with NaN
         df = df.dropna(subset=["open", "high", "low", "close", "volume"])
         if df.empty:
+            _record_fetch_diagnostic("yfinance", FetchOutcome(
+                "", "empty",
+                f"yfinance returned only NaN rows for {symbol!r}",
+            ))
             return None
 
         buf = io.StringIO()
         df.to_csv(buf, index=False)
-        return buf.getvalue()
-    except Exception:
+        csv_text = buf.getvalue()
+        _record_fetch_diagnostic("yfinance", FetchOutcome(
+            csv_text, "ok", f"yfinance fetched {symbol!r} period={period} interval={interval}",
+        ))
+        return csv_text
+    except Exception as exc:  # noqa: BLE001 — diagnose and return None
+        kind, detail = _classify_fetch_exception(exc)
+        _record_fetch_diagnostic("yfinance", FetchOutcome("", kind, detail))
         return None
 
 
@@ -891,17 +1326,33 @@ def fetch_binance_ohlcv(
     No API key required — uses the public /api/v3/klines endpoint.
     Falls back to ``ccxt`` if installed.
 
-    Returns CSV text on success, None on failure.
+    Returns CSV text on success, None on failure.  Records the most
+    informative diagnostic via ``_record_fetch_diagnostic("binance", ...)``
+    so the integrity guard can render an actionable error.
     """
-    # Strategy 1: direct REST call (no dependencies)
+    # Strategy 1: direct REST call (no dependencies).  ``_fetch_binance_rest``
+    # already records its own diagnostic, so we only override on success.
     csv_text = _fetch_binance_rest(symbol, interval, limit)
     if csv_text:
         return csv_text
 
-    # Strategy 2: ccxt library
+    # Strategy 2: ccxt library — only attempted when REST failed.  ccxt also
+    # records its own diagnostic on success/failure.
     if _ccxt_available():
-        return _fetch_ccxt_ohlcv(symbol, interval, limit)
+        csv_text = _fetch_ccxt_ohlcv(symbol, interval, limit)
+        if csv_text:
+            return csv_text
+        return None
 
+    # Both strategies exhausted.  Preserve the REST diagnostic (most likely
+    # the more informative of the two) — ccxt-not-installed is appended for
+    # completeness so the operator sees both gaps in one shot.
+    rest_diag = _get_fetch_diagnostic("binance")
+    if rest_diag is None:
+        _record_fetch_diagnostic("binance", FetchOutcome(
+            "", "unknown",
+            "Binance REST returned no data and ccxt is not installed (pip install ccxt)",
+        ))
     return None
 
 
@@ -926,10 +1377,16 @@ def _fetch_binance_rest(
         req = urllib.request.Request(url, headers={"User-Agent": "Crucible-BacktestRunner/1.0"})
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-    except (urllib.error.URLError, json.JSONDecodeError, OSError, ValueError):
+    except Exception as exc:  # noqa: BLE001 — classify and report
+        kind, detail = _classify_fetch_exception(exc)
+        _record_fetch_diagnostic("binance", FetchOutcome("", kind, detail))
         return None
 
     if not isinstance(data, list) or len(data) == 0:
+        _record_fetch_diagnostic("binance", FetchOutcome(
+            "", "empty",
+            f"Binance REST returned no candles for {clean_symbol!r}",
+        ))
         return None
 
     intraday = _is_intraday_interval(interval)
@@ -960,7 +1417,15 @@ def _fetch_binance_rest(
     result = buf.getvalue()
     # Validate we got at least some rows
     if result.count("\n") < 3:
+        _record_fetch_diagnostic("binance", FetchOutcome(
+            "", "empty",
+            f"Binance REST returned only {result.count(chr(10))} usable rows for {clean_symbol!r}",
+        ))
         return None
+    _record_fetch_diagnostic("binance", FetchOutcome(
+        result, "ok",
+        f"Binance REST fetched {clean_symbol!r} interval={interval} limit={effective_limit}",
+    ))
     return result
 
 
@@ -976,6 +1441,10 @@ def _fetch_ccxt_ohlcv(
     not destabilise the main process on locked-down Windows environments.
     """
     if not _ccxt_available():
+        _record_fetch_diagnostic("binance", FetchOutcome(
+            "", "not_installed",
+            "ccxt is not installed (pip install ccxt) — no fallback available after REST failed",
+        ))
         import warnings
         warnings.warn(
             "ccxt is not installed; falling back to Binance public API or synthetic data. "
@@ -1045,12 +1514,26 @@ def _fetch_ccxt_ohlcv(
             check=False,
         )
         if result.returncode != 0:
+            _record_fetch_diagnostic("binance", FetchOutcome(
+                "", "unknown",
+                f"ccxt subprocess exit={result.returncode} stderr={(result.stderr or '').strip()[:200]!r}",
+            ))
             return None
         csv_text = result.stdout.strip()
         if not csv_text:
+            _record_fetch_diagnostic("binance", FetchOutcome(
+                "", "empty", f"ccxt fetch returned no rows for {symbol!r}",
+            ))
             return None
-        return csv_text + ("\n" if not csv_text.endswith("\n") else "")
-    except Exception:
+        final_text = csv_text + ("\n" if not csv_text.endswith("\n") else "")
+        _record_fetch_diagnostic("binance", FetchOutcome(
+            final_text, "ok",
+            f"ccxt fetched {symbol!r} interval={interval} limit={limit}",
+        ))
+        return final_text
+    except Exception as exc:  # noqa: BLE001 — classify and report
+        kind, detail = _classify_fetch_exception(exc)
+        _record_fetch_diagnostic("binance", FetchOutcome("", kind, detail))
         return None
 
 
@@ -1061,6 +1544,17 @@ def _run_project_data_provider(code_dir: str, timeout: int = 60) -> Optional[str
     The data_provider is expected to write a CSV file to ``data/`` and print
     the output path to stdout.  Returns the path to the data file on success,
     None on failure.
+
+    Security hardening (HIGH 5):
+      * Subprocess runs with ``cwd=code_dir`` and ``_make_safe_env`` so the
+        provider cannot accidentally see operator-private env vars.
+      * ``stdout`` is capped at 1 MB to defend against a runaway provider
+        that prints gigabytes of data.
+      * A path emitted via ``stdout`` MUST resolve to a real file *inside*
+        ``code_dir`` (after ``os.path.realpath``).  Anything escaping the
+        sandbox (e.g. ``/etc/passwd``, ``~/.aws/credentials``) is rejected.
+      * Non-zero ``returncode`` is treated as failure even if stdout has a
+        plausible path — provider partial success is not silent success.
     """
     provider_path = os.path.join(code_dir, "data_provider.py")
     if not os.path.isfile(provider_path):
@@ -1074,151 +1568,227 @@ def _run_project_data_provider(code_dir: str, timeout: int = 60) -> Optional[str
             text=True,
             timeout=timeout,
             env=_make_safe_env(code_dir),
+            check=False,
         )
         if result.returncode != 0:
             return None
 
-        # Check if data was created
+        # Reject runaway stdout (defence against memory bombs / log floods).
+        stdout_text = result.stdout or ""
+        if len(stdout_text) > 1_000_000:
+            return None
+
+        # Resolve code_dir once for path-safety comparisons below.
+        try:
+            abs_code = os.path.realpath(code_dir)
+        except OSError:
+            return None
+
+        def _within_code_dir(candidate: str) -> bool:
+            try:
+                abs_c = os.path.realpath(candidate)
+            except OSError:
+                return False
+            try:
+                rel = os.path.relpath(abs_c, abs_code)
+            except ValueError:
+                # Different drives on Windows -> ValueError; reject.
+                return False
+            # Reject paths that escape via ``..`` or are absolute outside code_dir
+            return not rel.startswith("..") and not os.path.isabs(rel)
+
+        # Prefer a CSV in code_dir/data/ — the documented convention.
         data_dir = os.path.join(code_dir, "data")
         if os.path.isdir(data_dir):
-            for f in os.listdir(data_dir):
-                if f.lower().endswith(".csv"):
-                    return os.path.join(data_dir, f)
+            try:
+                for f in os.listdir(data_dir):
+                    if f.lower().endswith(".csv"):
+                        cand = os.path.join(data_dir, f)
+                        if _within_code_dir(cand) and os.path.isfile(cand):
+                            return cand
+            except OSError:
+                pass
 
-        # Also check stdout for file path
-        stdout_path = result.stdout.strip()
-        if stdout_path and os.path.isfile(stdout_path):
-            return stdout_path
+        # Fall back to a stdout-emitted path.  Accept absolute (must be
+        # inside code_dir) and relative (resolved against code_dir).  This
+        # is the only place where provider output influences which file the
+        # backtest reads, so path validation has to be strict.
+        first_line = stdout_text.strip().splitlines()[0] if stdout_text.strip() else ""
+        if first_line:
+            if os.path.isabs(first_line):
+                cand = first_line
+            else:
+                cand = os.path.join(code_dir, first_line)
+            if _within_code_dir(cand) and os.path.isfile(cand):
+                return cand
 
         return None
     except (subprocess.TimeoutExpired, OSError):
         return None
 
 
-def _detect_symbol_from_code(code_dir: str) -> Optional[str]:
-    """
-    Attempt to detect the trading symbol from the project's source code.
+# ── Combined code-metadata scan (MEDIUM 8) ──────────────────────────────────
+#
+# ``_detect_symbol_from_code`` and ``_detect_timeframe_from_code`` previously
+# each walked the directory and opened every ``.py`` file independently —
+# doubling I/O on medium-sized projects.  ``_scan_code_metadata`` performs a
+# single pass, capping each file at 8 KB (enough to catch top-level constants
+# without reading the full strategy body), and the two public functions are
+# thin wrappers around it.  The wrappers are preserved because they are part
+# of the documented test surface (and imported by ``tests/test_backtest_runner.py``).
+import re as _re_mod
 
-    Scans for patterns like:
-      - SYMBOL = "BTCUSDT"
-      - ticker = "AAPL"
-      - pair = "ETH/USDT"
-    """
-    import re
+_SYMBOL_RE = _re_mod.compile(
+    r"""(?:SYMBOL|TICKER|PAIR|ASSET|INSTRUMENT)\s*=\s*['"]([\w/.-]+)['"]""",
+    _re_mod.IGNORECASE,
+)
+_TIMEFRAME_RE = _re_mod.compile(
+    r"""(?:TIMEFRAME|TIME_FRAME|INTERVAL|CANDLE_INTERVAL|CANDLE_SIZE|KLINE_INTERVAL|GRANULARITY|RESOLUTION|BAR_SIZE)\s*=\s*['"]([\w]+)['"]""",
+    _re_mod.IGNORECASE,
+)
+_PERIOD_TF_RE = _re_mod.compile(
+    r"""(?:PERIOD|TF)\s*=\s*['"](\d+[mhdwM](?:in)?(?:ute)?(?:our)?(?:ay)?(?:eek)?)['"]""",
+    _re_mod.IGNORECASE,
+)
+_TIMEFRAME_NORMALISE: Dict[str, str] = {
+    "1min": "1m", "1minute": "1m", "1m": "1m",
+    "3min": "3m", "3minute": "3m", "3m": "3m",
+    "5min": "5m", "5minute": "5m", "5m": "5m",
+    "15min": "15m", "15minute": "15m", "15m": "15m",
+    "30min": "30m", "30minute": "30m", "30m": "30m",
+    "60min": "1h", "60m": "1h",
+    "1hour": "1h", "1h": "1h",
+    "2hour": "2h", "2h": "2h",
+    "4hour": "4h", "4h": "4h",
+    "6hour": "6h", "6h": "6h",
+    "8hour": "8h", "8h": "8h",
+    "12hour": "12h", "12h": "12h",
+    "1day": "1d", "1d": "1d", "daily": "1d",
+    "3day": "3d", "3d": "3d",
+    "1week": "1w", "1w": "1w", "1wk": "1w", "weekly": "1w",
+    "1month": "1M", "1mo": "1M", "1M": "1M", "monthly": "1M",
+}
 
-    symbol_re = re.compile(
-        r"""(?:SYMBOL|TICKER|PAIR|ASSET|INSTRUMENT)\s*=\s*['"]([\w/.-]+)['"]""",
-        re.IGNORECASE,
-    )
+
+def _scan_code_metadata(code_dir: str) -> Tuple[Optional[str], Optional[str]]:
+    """Single-pass scan returning ``(symbol, timeframe)``.  Stops opening
+    further files as soon as both pieces are found."""
+    found_symbol: Optional[str] = None
+    found_tf: Optional[str] = None
+
+    def _normalise_tf(raw: str) -> Optional[str]:
+        # Preserve "1M" (monthly) case before lowercasing.
+        if raw in _TIMEFRAME_NORMALISE:
+            return _TIMEFRAME_NORMALISE[raw]
+        return _TIMEFRAME_NORMALISE.get(raw.lower())
+
     try:
-        for f in os.listdir(code_dir):
-            if not f.endswith(".py"):
-                continue
-            fpath = os.path.join(code_dir, f)
-            try:
-                with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
-                    content = fh.read(5000)
-                m = symbol_re.search(content)
-                if m:
-                    return m.group(1)
-            except OSError:
-                continue
+        files = sorted(f for f in os.listdir(code_dir) if f.endswith(".py"))
     except OSError:
-        pass
-    return None
+        return None, None
+
+    for f in files:
+        if found_symbol is not None and found_tf is not None:
+            break
+        fpath = os.path.join(code_dir, f)
+        try:
+            with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
+                content = fh.read(8000)
+        except OSError:
+            continue
+        if found_symbol is None:
+            m = _SYMBOL_RE.search(content)
+            if m:
+                found_symbol = m.group(1)
+        if found_tf is None:
+            m = _TIMEFRAME_RE.search(content)
+            if m:
+                cand = _normalise_tf(m.group(1))
+                if cand:
+                    found_tf = cand
+            if found_tf is None:
+                m = _PERIOD_TF_RE.search(content)
+                if m:
+                    cand = _normalise_tf(m.group(1))
+                    if cand:
+                        found_tf = cand
+    return found_symbol, found_tf
+
+
+def _detect_symbol_from_code(code_dir: str) -> Optional[str]:
+    """Backward-compat wrapper.  Delegates to ``_scan_code_metadata``."""
+    sym, _ = _scan_code_metadata(code_dir)
+    return sym
 
 
 def _detect_timeframe_from_code(code_dir: str) -> Optional[str]:
-    """
-    Attempt to detect the candle interval / timeframe from the project's source code.
+    """Backward-compat wrapper.  Delegates to ``_scan_code_metadata``."""
+    _, tf = _scan_code_metadata(code_dir)
+    return tf
 
-    Scans for patterns like:
-      - TIMEFRAME = "1h"
-      - INTERVAL = "5m"
-      - CANDLE_INTERVAL = "15m"
-      - interval = "4h"
-      - PERIOD = "1d"  (when clearly a candle interval, not a date range)
 
-    Returns a canonical interval string (e.g. "1h", "5m", "1d") or None.
-    """
-    import re
+# ── Symbol classification (LOW 12) ──────────────────────────────────────────
+#
+# The original heuristic flagged any symbol whose *start* matched a common
+# crypto base (BTC, ETH, ATOM, LINK …) — even though several of those overlap
+# with equity tickers ("ATOM" = Atomera, "LINK" historically used by other
+# issuers).  The refined rule below requires either:
+#   1. A separator (``/`` or ``-``) — e.g. ``BTC/USDT`` / ``BTC-USD``
+#   2. A crypto quote suffix (USDT/USDC/BUSD/TUSD/DAI/USD/PERP) AND a base
+#      of at least 2 letters, AND total length ≥ 5 (so that bare "BTC" /
+#      "ETH" don't crash the heuristic into reporting True for an equity
+#      ticker that happens to start with the same letters).
+# Pure 3-4 letter bases that ambiguously map to both an equity ticker and a
+# crypto base ("ATOM", "LINK") are now reported as ``False`` — the auto
+# cascade will still try yfinance first, and Binance only kicks in when the
+# symbol *clearly* looks like a crypto pair.
 
-    # Patterns that strongly indicate a candle interval
-    tf_re = re.compile(
-        r"""(?:TIMEFRAME|TIME_FRAME|INTERVAL|CANDLE_INTERVAL|CANDLE_SIZE|KLINE_INTERVAL|GRANULARITY|RESOLUTION|BAR_SIZE)\s*=\s*['"]([\w]+)['"]""",
-        re.IGNORECASE,
-    )
-    # Secondary pattern: period-like variable but with interval values
-    period_re = re.compile(
-        r"""(?:PERIOD|TF)\s*=\s*['"](\d+[mhdwM](?:in)?(?:ute)?(?:our)?(?:ay)?(?:eek)?)['"]""",
-        re.IGNORECASE,
-    )
-
-    # Canonical normalisation map
-    normalise = {
-        "1min": "1m", "1minute": "1m", "1m": "1m",
-        "3min": "3m", "3minute": "3m", "3m": "3m",
-        "5min": "5m", "5minute": "5m", "5m": "5m",
-        "15min": "15m", "15minute": "15m", "15m": "15m",
-        "30min": "30m", "30minute": "30m", "30m": "30m",
-        "60min": "1h", "60m": "1h",
-        "1hour": "1h", "1h": "1h",
-        "2hour": "2h", "2h": "2h",
-        "4hour": "4h", "4h": "4h",
-        "6hour": "6h", "6h": "6h",
-        "8hour": "8h", "8h": "8h",
-        "12hour": "12h", "12h": "12h",
-        "1day": "1d", "1d": "1d", "daily": "1d",
-        "3day": "3d", "3d": "3d",
-        "1week": "1w", "1w": "1w", "1wk": "1w", "weekly": "1w",
-        "1month": "1M", "1mo": "1M", "1M": "1M", "monthly": "1M",
-    }
-
-    try:
-        for f in os.listdir(code_dir):
-            if not f.endswith(".py"):
-                continue
-            fpath = os.path.join(code_dir, f)
-            try:
-                with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
-                    content = fh.read(8000)
-                # Try strong pattern first
-                m = tf_re.search(content)
-                if m:
-                    raw = m.group(1)
-                    # Try exact match first (preserves "1M" vs "1m")
-                    canonical = normalise.get(raw) or normalise.get(raw.lower())
-                    if canonical:
-                        return canonical
-                # Try secondary pattern
-                m = period_re.search(content)
-                if m:
-                    raw = m.group(1)
-                    canonical = normalise.get(raw) or normalise.get(raw.lower())
-                    if canonical:
-                        return canonical
-            except OSError:
-                continue
-    except OSError:
-        pass
-    return None
+_CRYPTO_QUOTES_STRICT = ("USDT", "USDC", "BUSD", "TUSD", "DAI", "USD", "PERP")
+_CRYPTO_BASES_KNOWN = (
+    "BTC", "ETH", "BNB", "SOL", "ADA", "DOT", "AVAX", "MATIC", "DOGE",
+    "SHIB", "XRP", "LTC",
+)
 
 
 def _is_crypto_symbol(symbol: str) -> bool:
-    """Heuristic: check if a symbol looks like a crypto pair."""
-    upper = symbol.upper().replace("/", "").replace("-", "")
-    crypto_quotes = ("USDT", "BUSD", "USDC", "BTC", "ETH", "BNB", "TUSD", "DAI")
-    crypto_bases = (
-        "BTC", "ETH", "BNB", "SOL", "ADA", "DOT", "AVAX", "MATIC", "LINK",
-        "UNI", "DOGE", "SHIB", "XRP", "LTC", "ATOM",
-    )
-    for quote in crypto_quotes:
+    """Strict crypto-pair heuristic.
+
+    A symbol is classified as crypto when ANY of the following holds:
+      * It contains ``/`` or ``-`` separators (e.g. ``BTC/USDT``, ``ETH-USD``)
+      * It ends in a crypto quote suffix AND the remaining base has length
+        ≥ 2 AND total length ≥ 5 (filters single equities like "USD" itself
+        or short ambiguous tickers)
+      * It starts with one of the unambiguous, widely-known crypto bases
+        listed in ``_CRYPTO_BASES_KNOWN`` AND has total length ≥ 5 (so
+        bare 3-letter tickers don't trigger crypto mode)
+
+    Ambiguous bases like ``ATOM`` / ``LINK`` are deliberately NOT in the
+    known list — they will route to yfinance first, and the auto cascade
+    will still try Binance only when the yfinance fetch returns empty AND
+    the integrity guard is opted out of.
+    """
+    if not symbol or not isinstance(symbol, str):
+        return False
+    raw = symbol.strip()
+    if "/" in raw or "-" in raw:
+        # Separators are an unambiguous crypto-pair marker.  Avoid false
+        # positives on equity tickers like "BRK-B" by additionally requiring
+        # the right side to look like a recognised quote currency.
+        head, _, tail = raw.upper().replace("/", "-").rpartition("-")
+        tail_clean = tail.strip()
+        if tail_clean in _CRYPTO_QUOTES_STRICT or tail_clean.startswith("USD"):
+            return True
+        # Fall through — "BRK-B" should NOT be classified crypto.
+    upper = raw.upper().replace("/", "").replace("-", "")
+    if len(upper) < 5:
+        return False
+    for quote in _CRYPTO_QUOTES_STRICT:
         if upper.endswith(quote):
             base = upper[: -len(quote)]
             if base and len(base) >= 2:
                 return True
-    for base in crypto_bases:
-        if upper.startswith(base):
+    for base in _CRYPTO_BASES_KNOWN:
+        if upper.startswith(base) and len(upper) >= 5:
             return True
     return False
 
@@ -1238,6 +1808,203 @@ def _period_to_candles(period: str, interval: str) -> int:
     return max(candles, 10)
 
 
+class PrepareDataResult(NamedTuple):
+    """Structured result of ``prepare_data``.
+
+    Compatible with the legacy ``(source_label, data_path, row_count)`` 3-tuple
+    unpacking via slicing (``result[:3]``) — see ``run_backtest_pipeline`` for
+    the canonical usage pattern.  Direct 3-element ``a, b, c = prepare_data(...)``
+    unpacking is no longer supported and must be updated to either NamedTuple
+    field access or explicit slice.
+
+    Fields
+    ------
+    source_label : str
+        One of ``"project_provider"`` / ``"yfinance"`` / ``"binance"`` /
+        ``"synthetic"``.  The pipeline never returns ``"existing"`` from
+        prepare_data — that label is set by ``run_backtest_pipeline`` when
+        the project ships its own usable data file.
+    data_path : str
+        Absolute path to the CSV written by this call.
+    row_count : int
+        Number of data rows (header excluded) in the prepared CSV.
+    actual_symbol : str
+        Exact symbol string passed to the provider that succeeded.  Used by
+        ``BacktestReport.data_actual_symbol`` so retrieval can detect cases
+        where the cascade rewrote a request (e.g. ``BTC/USDT`` → ``BTCUSDT``).
+        Empty string for ``synthetic`` and ``project_provider``.
+    start_date / end_date : str
+        ISO-format date of the first / last row in the CSV (``YYYY-MM-DD`` for
+        daily+ intervals, ``YYYY-MM-DD HH:MM:SS`` for intraday).  Used by
+        MEDIUM 10 staleness detection.
+    profile : Dict[str, Any]
+        The resolved timeframe profile (period, yf_interval, binance_interval
+        …) that drove the fetch.  Exposed for diagnostics and tests.
+    """
+
+    source_label: str
+    data_path: str
+    row_count: int
+    actual_symbol: str = ""
+    start_date: str = ""
+    end_date: str = ""
+    # ``profile`` defaults to ``None``: NamedTuple defaults are class-level
+    # singletons, so a mutable ``{}`` default would be shared between all
+    # callers — every call site must pass an explicit profile dict.
+    profile: Optional[Dict[str, Any]] = None
+
+
+def _read_csv_date_range(path: str) -> Tuple[str, str]:
+    """Read the first and last non-empty date column from a CSV.  Returns
+    empty strings when the file is unreadable or has no ``date`` column."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace", newline="") as fh:
+            reader = csv.reader(fh)
+            header = next(reader, [])
+            try:
+                idx = [c.strip().lower() for c in header].index("date")
+            except ValueError:
+                return "", ""
+            first = ""
+            last = ""
+            for row in reader:
+                if len(row) <= idx:
+                    continue
+                cell = (row[idx] or "").strip()
+                if not cell:
+                    continue
+                if not first:
+                    first = cell
+                last = cell
+            return first, last
+    except (OSError, csv.Error, StopIteration):
+        return "", ""
+
+
+def _parallel_real_data_fetch(
+    *,
+    effective_symbol: str,
+    is_crypto: bool,
+    eff_period: str,
+    yf_interval: str,
+    bn_interval: str,
+    bn_limit: int,
+) -> Tuple[Optional[str], str, str]:
+    """Concurrently probe yfinance + Binance; return the first valid CSV.
+
+    Returns ``(csv_text, source_label, actual_symbol)``.  ``csv_text`` is
+    ``None`` when both providers returned empty.  Priority tie-break: for
+    non-crypto symbols yfinance wins; for crypto symbols Binance wins.
+    Validation is deferred to the caller (so the same min-rows threshold
+    applies whether sequential or parallel).
+    """
+    binance_symbol_attempt = effective_symbol if is_crypto else None
+
+    # v1.1.0 third-pass fix: each worker thread has its own
+    # ``threading.local`` diagnostics bucket.  Without explicit propagation,
+    # the main thread's ``_get_fetch_diagnostic`` lookup would always return
+    # ``None`` and ``BacktestDataIntegrityError`` would report every provider
+    # as ``not_attempted`` — silently swallowing the actionable cause.  We
+    # capture the worker's TLS snapshot at the end of each fetch and merge
+    # it back into the main thread's bucket below.
+    def _yf() -> Tuple[Optional[str], str, Dict[str, FetchOutcome]]:
+        text = fetch_yfinance_ohlcv(
+            effective_symbol, period=eff_period, interval=yf_interval,
+        )
+        # Snapshot the worker's per-thread diagnostics so the main thread
+        # can merge them (TLS does not cross thread boundaries by design).
+        return text or None, effective_symbol, dict(_tls_diagnostics())
+
+    def _bn() -> Tuple[Optional[str], str, Dict[str, FetchOutcome]]:
+        if not binance_symbol_attempt:
+            # No Binance attempt for non-crypto in parallel mode — sequential
+            # cascade handled this case separately.  Return None instantly.
+            return None, "", {}
+        text = fetch_binance_ohlcv(
+            binance_symbol_attempt, interval=bn_interval, limit=bn_limit,
+        )
+        return text or None, binance_symbol_attempt, dict(_tls_diagnostics())
+
+    # v1.1.0 fifth-pass (G-14): hard timeout on the worker futures.
+    # yfinance's per-version timeout behaviour is unreliable (some
+    # versions historically defaulted to no read timeout); a hostile
+    # or stalled endpoint could hang the entire backtest pipeline
+    # waiting on ``.result()`` with no upper bound.  90 s caps the
+    # wall-clock damage and surfaces a TimeoutError as a fetch
+    # failure rather than a deadlock.
+    _FETCH_HARD_TIMEOUT = float(_env_int("BACKTEST_FETCH_HARD_TIMEOUT_SEC", 90))
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        fut_yf = pool.submit(_yf)
+        fut_bn = pool.submit(_bn)
+        try:
+            yf_text, yf_sym, yf_diags = fut_yf.result(timeout=_FETCH_HARD_TIMEOUT)
+        except concurrent.futures.TimeoutError:
+            yf_text, yf_sym, yf_diags = None, "", {"yfinance": FetchOutcome(
+                "", "timeout", "yfinance fetch exceeded hard timeout",
+            )}
+        except Exception:  # noqa: BLE001
+            yf_text, yf_sym, yf_diags = None, "", {}
+        try:
+            bn_text, bn_sym, bn_diags = fut_bn.result(timeout=_FETCH_HARD_TIMEOUT)
+        except concurrent.futures.TimeoutError:
+            bn_text, bn_sym, bn_diags = None, "", {"binance": FetchOutcome(
+                "", "timeout", "binance fetch exceeded hard timeout",
+            )}
+        except Exception:  # noqa: BLE001
+            bn_text, bn_sym, bn_diags = None, "", {}
+
+    # Merge worker-thread diagnostics into the main thread's TLS bucket so
+    # the subsequent ``_build_cascade_diagnostic_lines`` call (running on
+    # the main thread) sees the real provider outcomes rather than empty
+    # "not_attempted" lines.
+    main_tls = _tls_diagnostics()
+    main_tls.update(yf_diags)
+    main_tls.update(bn_diags)
+
+    # Priority: yfinance for non-crypto, Binance for crypto.
+    if not is_crypto and yf_text:
+        return yf_text, "yfinance", yf_sym
+    if is_crypto and bn_text:
+        return bn_text, "binance", bn_sym
+    # Fall back to whichever returned data.
+    if yf_text:
+        return yf_text, "yfinance", yf_sym
+    if bn_text:
+        return bn_text, "binance", bn_sym
+    return None, "", ""
+
+
+def _build_cascade_diagnostic_lines() -> List[str]:
+    """Render the latest fetch diagnostics into human-readable lines for the
+    BacktestDataIntegrityError message."""
+    lines: List[str] = []
+    yf_diag = _get_fetch_diagnostic("yfinance")
+    if yf_diag is not None:
+        lines.append(f"yfinance: {yf_diag.error_kind} — {yf_diag.detail}")
+    elif not _yfinance_available():
+        lines.append("yfinance: not_installed — pip install yfinance")
+    else:
+        lines.append("yfinance: not_attempted")
+    bn_diag = _get_fetch_diagnostic("binance")
+    if bn_diag is not None:
+        lines.append(f"binance: {bn_diag.error_kind} — {bn_diag.detail}")
+    elif not _ccxt_available():
+        lines.append("binance: ccxt not installed (REST also unreachable) — pip install ccxt")
+    else:
+        lines.append("binance: not_attempted")
+    return lines
+
+
+def _raise_synthetic_refusal(reason: str) -> None:
+    """Raise ``BacktestDataIntegrityError`` with a synthesized actionable
+    message that splices the most recent fetch diagnostics into the body."""
+    diag_lines = _build_cascade_diagnostic_lines()
+    diag = "\n    " + "\n    ".join(diag_lines) if diag_lines else ""
+    raise BacktestDataIntegrityError(_synthetic_refusal_message(
+        reason + diag,
+    ))
+
+
 def prepare_data(
     code_dir: str,
     *,
@@ -1245,121 +2012,282 @@ def prepare_data(
     data_source: str = BACKTEST_DATA_SOURCE,
     period: str = BACKTEST_PERIOD,
     interval: str = BACKTEST_INTERVAL,
-    fallback_rows: int = BACKTEST_DATA_ROWS,
-) -> Tuple[str, str, int]:
-    """
-    Prepare backtest data using the resolution cascade.
+    fallback_rows: Optional[int] = None,
+) -> PrepareDataResult:
+    """Prepare backtest data using the resolution cascade.
 
-    Returns (data_source_label, data_file_path, row_count).
+    The ``interval`` and ``period`` parameters support ``"auto"``, in which
+    case the function auto-detects the strategy's timeframe from source code
+    and selects appropriate defaults via ``resolve_timeframe_profile()``.
 
-    The ``interval`` and ``period`` parameters support "auto", in which case
-    the function auto-detects the strategy's timeframe from source code and
-    selects appropriate defaults via ``resolve_timeframe_profile()``.
+    Resolution order when ``data_source="auto"``:
+      1. Project's own ``data_provider.py``
+      2. yfinance (for stocks/ETFs)
+      3. Binance REST API / ccxt (for crypto, or as crypto-fallback yfinance)
+      4. Synthetic GBM data (only when ``BACKTEST_REQUIRE_REAL_DATA=0``)
 
-    Resolution order (when data_source="auto"):
-    1. Project's own data_provider.py
-    2. yfinance (for stocks/ETFs)
-    3. Binance REST API / ccxt (for crypto)
-    4. Synthetic GBM data (last resort)
+    Behavioural contract (v1.1.x hardening — see CHANGELOG):
+      * ``fallback_rows=None`` (default) uses the timeframe profile's
+        ``synthetic_rows``.  Pass an explicit integer to override.  This
+        replaces the v1.0.x ``fallback_rows == BACKTEST_DATA_ROWS`` sentinel
+        which silently misfired when callers passed a value equal to the
+        module default.
+      * ``data_source="yfinance" / "binance" / "project"`` are *strict* —
+        if the requested provider returns nothing usable, the call raises
+        ``BacktestDataIntegrityError`` (unless ``BACKTEST_REQUIRE_REAL_DATA=0``,
+        in which case it falls through to the synthetic path with a warning).
+      * Non-crypto symbols no longer fall back to ``BTCUSDT`` on yfinance
+        failure.  The cascade either fetches the actual requested symbol or
+        raises.
+      * Every fetched CSV is validated against the minimum-row threshold
+        (``BACKTEST_MIN_REAL_DATA_ROWS``, default 30) before being accepted.
+        Tiny / degenerate responses (1-2 stale rows from delisted tickers)
+        are rejected and treated as a failure of that provider.
     """
     data_dir = os.path.join(code_dir, "data")
     os.makedirs(data_dir, exist_ok=True)
     output_file = os.path.join(data_dir, "sample_data.csv")
 
-    # ── Auto-detect symbol from code if not explicitly set ──────────────────
-    detected_symbol = _detect_symbol_from_code(code_dir)
+    # ── Reset per-call diagnostics (so previous-run failures don't leak) ─────
+    # v1.1.0: thread-local clear; two parallel prepare_data calls no longer
+    # clobber each other's provider outcomes.
+    _clear_fetch_diagnostics()
+
+    # ── Auto-detect symbol + timeframe via single-pass walk (MEDIUM 8) ──────
+    detected_symbol, detected_tf = _scan_code_metadata(code_dir)
     effective_symbol = symbol
     if detected_symbol and symbol == "SPY":
         effective_symbol = detected_symbol
 
-    # ── Auto-detect timeframe from code ─────────────────────────────────────
     effective_interval = interval
     if effective_interval == "auto":
-        detected_tf = _detect_timeframe_from_code(code_dir)
         effective_interval = detected_tf or "1d"
 
-    # Resolve the full profile (period, yf_interval, binance_interval, etc.)
     profile = resolve_timeframe_profile(effective_interval, period)
     eff_period: str = profile["period"]
     yf_interval: str = profile["yf_interval"]
     bn_interval: str = profile["binance_interval"]
-    syn_rows: int = profile["synthetic_rows"] if fallback_rows == BACKTEST_DATA_ROWS else fallback_rows
+    syn_rows: int = (
+        profile["synthetic_rows"] if fallback_rows is None else int(fallback_rows)
+    )
 
-    # ── Forced source ────────────────────────────────────────────────────────
+    # ── Cached real-data helpers ─────────────────────────────────────────────
+    def _try_yfinance(symbol_arg: str) -> Tuple[Optional[str], int, str, str]:
+        """Cache-aware yfinance attempt.  Returns
+        ``(csv_text, row_count, start_date, end_date)`` on success; row_count=0
+        when validation fails (caller treats as miss)."""
+        cached = _read_data_cache(symbol_arg, eff_period, yf_interval)
+        csv_text = cached or fetch_yfinance_ohlcv(
+            symbol_arg, period=eff_period, interval=yf_interval,
+        )
+        if not csv_text:
+            return None, 0, "", ""
+        ok, _reason, count = _validate_fetched_csv(csv_text, profile=profile)
+        if not ok:
+            return None, count, "", ""
+        if not cached:
+            _write_data_cache(symbol_arg, eff_period, yf_interval, csv_text)
+        _write_csv(output_file, csv_text)
+        start, end = _read_csv_date_range(output_file)
+        return csv_text, count, start, end
+
+    def _try_binance(symbol_arg: str) -> Tuple[Optional[str], int, str, str]:
+        limit = _period_to_candles(eff_period, bn_interval)
+        cache_key_period = f"limit={limit}"
+        cached = _read_data_cache(symbol_arg, cache_key_period, bn_interval)
+        csv_text = cached or fetch_binance_ohlcv(
+            symbol_arg, interval=bn_interval, limit=limit,
+        )
+        if not csv_text:
+            return None, 0, "", ""
+        ok, _reason, count = _validate_fetched_csv(csv_text, profile=profile)
+        if not ok:
+            return None, count, "", ""
+        if not cached:
+            _write_data_cache(symbol_arg, cache_key_period, bn_interval, csv_text)
+        _write_csv(output_file, csv_text)
+        start, end = _read_csv_date_range(output_file)
+        return csv_text, count, start, end
+
+    # ── Forced source paths (HIGH 2: respect integrity guard on failure) ────
     if data_source == "project":
         path = _run_project_data_provider(code_dir)
         if path:
-            return "project_provider", path, _count_csv_rows_file(path)
+            start, end = _read_csv_date_range(path)
+            return PrepareDataResult(
+                "project_provider", path, _count_csv_rows_file(path),
+                "", start, end, profile,
+            )
+        if _require_real_data_active():
+            _raise_synthetic_refusal(
+                "BACKTEST_DATA_SOURCE=project was requested but "
+                "data_provider.py is missing, failed, or wrote no usable CSV."
+            )
+        # Fall through to synthetic only when guard is off — see end of fn.
 
     if data_source == "yfinance":
-        csv_text = fetch_yfinance_ohlcv(
-            effective_symbol, period=eff_period, interval=yf_interval,
-        )
+        csv_text, count, start, end = _try_yfinance(effective_symbol)
         if csv_text:
-            _write_csv(output_file, csv_text)
-            return "yfinance", output_file, _count_lines(csv_text)
+            return PrepareDataResult(
+                "yfinance", output_file, count,
+                effective_symbol, start, end, profile,
+            )
+        if _require_real_data_active():
+            _raise_synthetic_refusal(
+                f"BACKTEST_DATA_SOURCE=yfinance was requested for "
+                f"{effective_symbol!r} but the fetch returned no usable rows."
+            )
 
     if data_source == "binance":
-        limit = _period_to_candles(eff_period, bn_interval)
-        csv_text = fetch_binance_ohlcv(
-            effective_symbol, interval=bn_interval, limit=limit,
-        )
+        csv_text, count, start, end = _try_binance(effective_symbol)
         if csv_text:
-            _write_csv(output_file, csv_text)
-            return "binance", output_file, _count_lines(csv_text)
+            return PrepareDataResult(
+                "binance", output_file, count,
+                effective_symbol, start, end, profile,
+            )
+        if _require_real_data_active():
+            _raise_synthetic_refusal(
+                f"BACKTEST_DATA_SOURCE=binance was requested for "
+                f"{effective_symbol!r} but the fetch returned no usable rows."
+            )
 
     if data_source == "synthetic":
-        csv_text = generate_synthetic_ohlcv(
-            rows=syn_rows, seed=42, interval=effective_interval,
+        # Explicit synthetic request — block when integrity guard is on.
+        if _require_real_data_active():
+            _raise_synthetic_refusal(
+                "BACKTEST_DATA_SOURCE=synthetic was requested but "
+                "BACKTEST_REQUIRE_REAL_DATA is on (default)."
+            )
+        return _synthetic_path(
+            output_file=output_file,
+            syn_rows=syn_rows,
+            effective_interval=effective_interval,
+            profile=profile,
         )
-        _write_csv(output_file, csv_text)
-        return "synthetic", output_file, syn_rows
 
     # ── Auto resolution ──────────────────────────────────────────────────────
-
-    # 1. Try project's own data_provider
+    # 1. Project's own data_provider
     path = _run_project_data_provider(code_dir)
     if path:
-        return "project_provider", path, _count_csv_rows_file(path)
+        start, end = _read_csv_date_range(path)
+        return PrepareDataResult(
+            "project_provider", path, _count_csv_rows_file(path),
+            "", start, end, profile,
+        )
 
-    # 2. Decide yfinance vs Binance based on symbol
+    # 2. Real-data providers (sequential or parallel)
     is_crypto = _is_crypto_symbol(effective_symbol)
 
-    if not is_crypto:
-        # 2a. Try yfinance first (stocks/ETFs)
-        csv_text = fetch_yfinance_ohlcv(
-            effective_symbol, period=eff_period, interval=yf_interval,
-        )
-        if csv_text:
-            _write_csv(output_file, csv_text)
-            return "yfinance", output_file, _count_lines(csv_text)
+    if _parallel_fetch_active():
+        # Parallel mode: probe both providers concurrently for crypto; for
+        # non-crypto, only yfinance is probed because the BTCUSDT fallback
+        # is no longer allowed (HIGH 1).
+        if is_crypto:
+            text, source, actual_sym = _parallel_real_data_fetch(
+                effective_symbol=effective_symbol,
+                is_crypto=True,
+                eff_period=eff_period,
+                yf_interval=yf_interval,
+                bn_interval=bn_interval,
+                bn_limit=_period_to_candles(eff_period, bn_interval),
+            )
+            if text:
+                ok, _r, count = _validate_fetched_csv(text, profile=profile)
+                if ok:
+                    _write_csv(output_file, text)
+                    start, end = _read_csv_date_range(output_file)
+                    return PrepareDataResult(
+                        source, output_file, count,
+                        actual_sym, start, end, profile,
+                    )
+        else:
+            csv_text, count, start, end = _try_yfinance(effective_symbol)
+            if csv_text:
+                return PrepareDataResult(
+                    "yfinance", output_file, count,
+                    effective_symbol, start, end, profile,
+                )
+    else:
+        # Sequential cascade.
+        if not is_crypto:
+            # 2a. Non-crypto: yfinance only.  HIGH 1 — no BTCUSDT fallback.
+            csv_text, count, start, end = _try_yfinance(effective_symbol)
+            if csv_text:
+                return PrepareDataResult(
+                    "yfinance", output_file, count,
+                    effective_symbol, start, end, profile,
+                )
+        else:
+            # 2b. Crypto: Binance first.
+            csv_text, count, start, end = _try_binance(effective_symbol)
+            if csv_text:
+                return PrepareDataResult(
+                    "binance", output_file, count,
+                    effective_symbol, start, end, profile,
+                )
+            # 2c. Crypto fallback: try yfinance with dash-normalised symbol
+            # (yfinance accepts e.g. BTC-USD).  This is allowed because we
+            # are still trying to honour the *user-requested* asset.
+            yf_symbol = effective_symbol.replace("/", "-").upper()
+            csv_text, count, start, end = _try_yfinance(yf_symbol)
+            if csv_text:
+                return PrepareDataResult(
+                    "yfinance", output_file, count,
+                    yf_symbol, start, end, profile,
+                )
 
-    # 2b. Try Binance (crypto or yfinance failed)
-    limit = _period_to_candles(eff_period, bn_interval)
-    binance_symbol = effective_symbol if is_crypto else "BTCUSDT"
-    csv_text = fetch_binance_ohlcv(
-        binance_symbol, interval=bn_interval, limit=limit,
+    # 3. Last resort: synthetic data — only if the integrity guard is off.
+    if _require_real_data_active():
+        _raise_synthetic_refusal(
+            f"auto-resolution exhausted every real-data path for "
+            f"{effective_symbol!r}."
+        )
+    return _synthetic_path(
+        output_file=output_file,
+        syn_rows=syn_rows,
+        effective_interval=effective_interval,
+        profile=profile,
     )
-    if csv_text:
-        _write_csv(output_file, csv_text)
-        return "binance", output_file, _count_lines(csv_text)
 
-    # 2c. If crypto failed with Binance, still try yfinance (some crypto tickers work)
-    if is_crypto:
-        yf_symbol = effective_symbol.replace("/", "-").upper()
-        csv_text = fetch_yfinance_ohlcv(
-            yf_symbol, period=eff_period, interval=yf_interval,
+
+def _synthetic_path(
+    *,
+    output_file: str,
+    syn_rows: int,
+    effective_interval: str,
+    profile: Dict[str, Any],
+) -> PrepareDataResult:
+    """Write a synthetic-GBM CSV and return the corresponding ``PrepareDataResult``.
+
+    Honors ``BACKTEST_SYNTHETIC_SEED`` (LOW 13) — an explicit integer (default
+    ``42``) for reproducibility, ``"random"`` for a fresh seed each call.
+    The seed actually used is appended to ``profile["synthetic_seed_used"]``
+    so the operator can re-create the run when investigating a fluke.
+    """
+    seed = _synthetic_seed()
+    if seed is None:
+        seed = random.SystemRandom().randint(0, 2**31 - 1)
+    profile = dict(profile)
+    profile["synthetic_seed_used"] = seed
+    try:
+        import logging as _logging
+        _logging.getLogger(__name__).warning(
+            "Backtest using synthetic-GBM data (seed=%s, rows=%d, interval=%s)"
+            " — metrics WILL NOT be representative of real-market behaviour."
+            " BACKTEST_REQUIRE_REAL_DATA is off; this run is for plumbing"
+            " purposes only.", seed, syn_rows, effective_interval,
         )
-        if csv_text:
-            _write_csv(output_file, csv_text)
-            return "yfinance", output_file, _count_lines(csv_text)
-
-    # 3. Last resort: synthetic data
+    except Exception:  # noqa: BLE001 — never break pipeline over a log
+        pass
     csv_text = generate_synthetic_ohlcv(
-        rows=syn_rows, seed=42, interval=effective_interval,
+        rows=syn_rows, seed=seed, interval=effective_interval,
     )
     _write_csv(output_file, csv_text)
-    return "synthetic", output_file, syn_rows
+    start, end = _read_csv_date_range(output_file)
+    return PrepareDataResult(
+        "synthetic", output_file, syn_rows,
+        "", start, end, profile,
+    )
 
 
 def _write_csv(path: str, text: str) -> None:
@@ -1448,30 +2376,114 @@ def _find_backtest_entry(code_dir: str) -> Optional[str]:
     return None
 
 
-def _has_data_file(code_dir: str) -> bool:
-    """Check whether the code directory already contains data files."""
-    data_extensions = {".csv", ".json", ".parquet", ".xlsx", ".h5", ".hdf5"}
-    data_dirs = ["data", "datasets", "sample_data"]
-    # Check root
+# ── Existing-data detection (HIGH 3) ────────────────────────────────────────
+#
+# ``_has_data_file`` originally returned ``True`` for *any* file with a
+# data-like extension.  This let schema stubs (``schema.csv`` with only a
+# header) and unrelated configuration JSON files short-circuit the cascade,
+# bypassing the integrity guard entirely.  ``_find_usable_data_file`` now
+# performs the same walk but additionally validates CSV content — required
+# OHLCV columns + minimum row count — before accepting a file.  Non-CSV
+# data extensions (parquet / hdf5 / xlsx / json) are still accepted because
+# we cannot cheaply validate them at this layer, but their *presence alone*
+# is no longer a free pass; the runner will still call the backtest
+# entrypoint with that file's directory in scope.
+
+_REQUIRED_OHLCV_COLS = {"open", "high", "low", "close"}
+_OHLCV_DATA_EXTS = {".csv", ".json", ".parquet", ".xlsx", ".h5", ".hdf5"}
+_OHLCV_DATA_SUBDIRS = ("data", "datasets", "sample_data")
+
+
+def _csv_has_required_columns(path: str) -> bool:
+    """Return ``True`` when *path* is a CSV whose header contains at least
+    open/high/low/close (case-insensitive).  ``volume`` is optional because
+    some equity-only feeds omit it on dividend-event rows."""
     try:
-        for f in os.listdir(code_dir):
-            _, ext = os.path.splitext(f)
-            if ext.lower() in data_extensions:
-                return True
+        with open(path, "r", encoding="utf-8", errors="replace", newline="") as fh:
+            reader = csv.reader(fh)
+            header = next(reader, None)
+            if not header:
+                return False
+            cols = {c.strip().lower() for c in header}
+            return _REQUIRED_OHLCV_COLS.issubset(cols)
+    except (OSError, csv.Error, StopIteration):
+        return False
+
+
+def _csv_data_row_count(path: str) -> int:
+    """Count non-empty CSV data rows (header excluded); ``0`` on read error."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace", newline="") as fh:
+            count = sum(1 for line in fh if line.strip()) - 1
+        return max(count, 0)
     except OSError:
-        pass
-    # Check known subdirectories
-    for subdir in data_dirs:
-        data_path = os.path.join(code_dir, subdir)
-        if os.path.isdir(data_path):
-            try:
-                for f in os.listdir(data_path):
-                    _, ext = os.path.splitext(f)
-                    if ext.lower() in data_extensions:
-                        return True
-            except OSError:
-                pass
-    return False
+        return 0
+
+
+def _find_usable_data_file(code_dir: str, *, min_rows: Optional[int] = None) -> Optional[str]:
+    """Return the path to a usable OHLCV CSV inside *code_dir* (root + data
+    subdirs), or ``None`` if no candidate satisfies both the schema check and
+    the minimum-row threshold.  Non-CSV data files (parquet/json/...) are
+    accepted on file-presence only because their schema cannot be validated
+    cheaply here.
+
+    Use ``min_rows=0`` to skip the row-count requirement (keeps backward
+    compat with the old ``_has_data_file`` behaviour for callers that just
+    need a file-presence check).
+    """
+    threshold = _min_real_data_rows() if min_rows is None else max(0, int(min_rows))
+
+    def _scan(directory: str) -> Optional[str]:
+        try:
+            entries = os.listdir(directory)
+        except OSError:
+            return None
+        for f in entries:
+            _, ext = os.path.splitext(f)
+            ext_lower = ext.lower()
+            if ext_lower not in _OHLCV_DATA_EXTS:
+                continue
+            fpath = os.path.join(directory, f)
+            if not os.path.isfile(fpath):
+                continue
+            if ext_lower == ".csv":
+                if not _csv_has_required_columns(fpath):
+                    continue
+                if threshold > 0 and _csv_data_row_count(fpath) < threshold:
+                    continue
+                return fpath
+            # Non-CSV: accept presence only (HDF5 / parquet validation is
+            # out of scope here — the strategy entry point owns it).
+            return fpath
+        return None
+
+    hit = _scan(code_dir)
+    if hit:
+        return hit
+    for subdir in _OHLCV_DATA_SUBDIRS:
+        sub_path = os.path.join(code_dir, subdir)
+        if os.path.isdir(sub_path):
+            hit = _scan(sub_path)
+            if hit:
+                return hit
+    return None
+
+
+def _has_data_file(code_dir: str) -> bool:
+    """Backward-compat boolean wrapper.
+
+    Returns ``True`` if a *usable* OHLCV CSV is present (or any non-CSV data
+    file).  Operators upgrading from v1.0.x who have a stub CSV in their
+    project will now see the integrity guard reject the stub and trigger
+    the real-data cascade — this is the intended behaviour.
+
+    The legacy permissive check (any file with a data extension counts) is
+    available via ``_find_usable_data_file(code_dir, min_rows=0)``: a CSV
+    will still need to have OHLC columns, but the row-count threshold is
+    waived.  No internal callers use that path; it exists for external
+    integrations that opt out of the strict check.
+    """
+    return _find_usable_data_file(code_dir) is not None
 
 
 def _detect_param_space(code_dir: str) -> Dict[str, List[Any]]:
@@ -2378,6 +3390,20 @@ def _generate_analysis_markdown(report: BacktestReport) -> str:
     lines.append(f"**Status:** {'✅ SUCCESS' if report.success else '❌ FAILED'}")
     symbol_info = f" [{report.data_symbol}]" if report.data_symbol else ""
     lines.append(f"**Data Source:** {report.data_source}{symbol_info} ({report.data_rows} rows)")
+    # Provenance / freshness — surfaced when populated so operators can audit
+    # whether the metrics correspond to the symbol they asked for and a
+    # recent-enough data window.
+    if report.data_actual_symbol and report.data_actual_symbol != report.data_symbol:
+        lines.append(
+            f"**Actual symbol fetched:** `{report.data_actual_symbol}` "
+            f"(differs from requested `{report.data_symbol}`)"
+        )
+    if report.data_start_date or report.data_end_date:
+        date_range = f"{report.data_start_date or '?'} → {report.data_end_date or '?'}"
+        stale = ""
+        if report.data_staleness_days is not None:
+            stale = f" ({report.data_staleness_days} days stale)"
+        lines.append(f"**Data window:** {date_range}{stale}")
     lines.append("")
 
     if report.baseline_metrics:
@@ -2648,36 +3674,114 @@ def run_backtest_pipeline(
         effective_interval = detected_tf or "1d"
     report.data_interval = effective_interval
 
-    if _has_data_file(code_dir):
+    # Single-pass code metadata scan — shared with prepare_data when we
+    # delegate, used directly when an existing CSV short-circuits the cascade.
+    _detected_sym, _detected_tf = _scan_code_metadata(code_dir)
+
+    existing_path = _find_usable_data_file(code_dir)
+    if existing_path is not None:
         report.data_source = "existing"
-        report.data_rows = _count_csv_rows(code_dir)
-        # Mirror the symbol-detection logic from the prepare_data branch so
-        # data_symbol is populated even when the strategy ships its own data file.
-        _detected_sym_ex = _detect_symbol_from_code(code_dir)
-        report.data_symbol = _detected_sym_ex if (_detected_sym_ex and symbol == "SPY") else symbol
+        report.data_rows = _csv_data_row_count(existing_path)
+        # Mirror prepare_data's symbol-resolution rule so data_symbol records
+        # the EFFECTIVE ticker (auto-detected from code) rather than the raw
+        # env-default "SPY".
+        report.data_symbol = _detected_sym if (_detected_sym and symbol == "SPY") else symbol
+        # Capture freshness / actual symbol for the existing-data branch too.
+        start_date, end_date = _read_csv_date_range(existing_path)
+        report.data_start_date = start_date
+        report.data_end_date = end_date
+        report._data_file = existing_path
     else:
         try:
-            source_label, data_file, row_count = prepare_data(
+            result = prepare_data(
                 code_dir,
                 symbol=symbol,
                 data_source=data_source_pref,
                 period=period,
                 interval=interval,
-                fallback_rows=data_rows,
+                fallback_rows=None if data_rows == BACKTEST_DATA_ROWS else data_rows,
             )
-            report.data_source = source_label
-            # Replicate prepare_data's auto-detection logic so data_symbol
-            # records the EFFECTIVE ticker (auto-detected from code) rather
-            # than the raw env-default "SPY".  prepare_data does not return
-            # effective_symbol, so we re-derive it here with the same rule.
-            _detected_sym = _detect_symbol_from_code(code_dir)
-            _effective_sym = _detected_sym if (_detected_sym and symbol == "SPY") else symbol
-            report.data_symbol = _effective_sym if source_label != "project_provider" else ""
-            report.data_rows = row_count
-            report._data_file = data_file  # passed to env_overrides, not os.environ
+            report.data_source = result.source_label
+            # ``data_symbol`` records what the user/auto-detection INTENDED.
+            # ``data_actual_symbol`` (populated below) records what was
+            # actually fetched — they may differ when the crypto fallback
+            # path rewrites BTC/USDT → BTCUSDT or BTC-USDT.
+            _intended_sym = _detected_sym if (_detected_sym and symbol == "SPY") else symbol
+            report.data_symbol = _intended_sym if result.source_label != "project_provider" else ""
+            if result.actual_symbol and result.actual_symbol != report.data_symbol:
+                report.data_actual_symbol = result.actual_symbol
+            report.data_rows = result.row_count
+            report.data_start_date = result.start_date
+            report.data_end_date = result.end_date
+            report._data_file = result.data_path
+            if result.source_label == "synthetic":
+                seed_used = (result.profile or {}).get("synthetic_seed_used")
+                report.warnings.append(
+                    "BACKTEST_REQUIRE_REAL_DATA is off and the backtest ran "
+                    f"against synthetic-GBM data (seed={seed_used}). Sharpe / "
+                    "drawdown / win-rate / equity curve here are statistically "
+                    "random and MUST NOT be used to evaluate strategy quality, "
+                    "compare variants, or seed retrieval/ranking. Treat this "
+                    "run as a plumbing smoke test only."
+                )
+        except BacktestDataIntegrityError as exc:
+            # Keep the integrity-guard refusal distinct in the error list so
+            # the WebUI / report layer can render the multi-line explanation
+            # without truncating it as a generic "Failed to prepare ..." prefix.
+            report.errors.append(str(exc))
+            return report
         except Exception as exc:
             report.errors.append(f"Failed to prepare backtest data: {exc}")
             return report
+
+    # ── Data-staleness probe (MEDIUM 10) ─────────────────────────────────────
+    # Compute the gap between the most recent data row and today (UTC).  When
+    # the gap exceeds BACKTEST_DATA_MAX_STALENESS_DAYS, surface a warning so
+    # operators know they're evaluating a strategy against an old regime.
+    #
+    # v1.1.0: pin both sides of the subtraction to UTC.  The previous
+    # implementation used ``datetime.strptime(...)`` which returns a naive
+    # datetime and then compared its ``.date()`` against the UTC-aware
+    # ``datetime.now(_UTC).date()`` — fine arithmetic, but the conversion
+    # silently treated naive timestamps as local time, so operators in
+    # UTC+8 running at 23:30 local saw "1 day stale" warnings flip on/off
+    # at midnight UTC.  By tagging the parsed timestamp with UTC explicitly,
+    # both sides live in the same frame and the off-by-one disappears.
+    if report.data_end_date:
+        try:
+            end_iso = report.data_end_date.strip()
+            if len(end_iso) >= 19:
+                end_dt = datetime.strptime(end_iso[:19], "%Y-%m-%d %H:%M:%S")
+            else:
+                end_dt = datetime.strptime(end_iso[:10], "%Y-%m-%d")
+            end_dt = end_dt.replace(tzinfo=_UTC)
+            now_utc = datetime.now(_UTC)
+            gap_days = max(0, (now_utc.date() - end_dt.date()).days)
+            report.data_staleness_days = gap_days
+            max_stale = _data_max_staleness_days()
+            if max_stale > 0 and gap_days > max_stale:
+                report.warnings.append(
+                    f"Backtest data ends {report.data_end_date} — {gap_days} "
+                    f"days stale (threshold {max_stale}). Sharpe / drawdown "
+                    "may not reflect current market regime."
+                )
+        except (ValueError, TypeError):
+            # Unparseable date column — skip the staleness check rather than
+            # fail the pipeline.
+            pass
+
+    # ── Dry-run short-circuit (LOW 14) ───────────────────────────────────────
+    # When BACKTEST_PREPARE_DATA_ONLY=1, the operator wants confirmation that
+    # the data path is wired up — no need to execute the strategy or run the
+    # optimisation loop.  Persist the report and return early.
+    if _prepare_data_only():
+        report.notes.append(
+            "BACKTEST_PREPARE_DATA_ONLY=1 — strategy execution + parameter "
+            "optimisation skipped."
+        )
+        report.success = True
+        _persist_report(run_dir, report)
+        return report
 
     # ── Step 3: Baseline backtest ────────────────────────────────────────────
     # Guard initial_capital against NaN/Inf before converting to string:

@@ -1,0 +1,34 @@
+{
+  "project_name": "SyntheticGoldenRun",
+  "mode_used": "Quant",
+  "score": 78,
+  "risk_level": "medium",
+  "gate_decision": "ship",
+  "blocking_risks": [
+    {
+      "title": "Sample blocking risk for regression harness",
+      "severity": "medium"
+    }
+  ],
+  "experiments": [
+    {
+      "name": "baseline",
+      "metric": "sharpe_ratio",
+      "value": 1.4
+    },
+    {
+      "name": "ablation",
+      "metric": "sharpe_ratio",
+      "value": 1.2
+    }
+  ],
+  "consensus": {
+    "agreed": true,
+    "rationale": "Synthetic consensus block — exercises regression schema checks without requiring a real pipeline run."
+  },
+  "direction_decision": {
+    "selected_direction": "momentum-mean-reversion-hybrid",
+    "rationale": "Synthetic direction — fixture-only."
+  },
+  "_fixture_note": "This is a deterministic synthetic run shipped with the repo so the regression test suite always has SOMETHING to validate. Do not edit by hand; if the schema changes, regenerate via tests/regression/regenerate_fixture.py (if added) or rewrite this file to match the new schema."
+}

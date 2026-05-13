@@ -7,8 +7,12 @@
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
-<link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}">
+<script
+  src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"
+  integrity="sha384-JUh163oCRItcbPme8pYnROHQMC6fNKTBWtRG3I3I0erJkzNgL7uxKlNwcrcFKeqF"
+  crossorigin="anonymous"
+  referrerpolicy="no-referrer"></script>
+<link rel="stylesheet" href="{{ url_for('static', filename='css/app.css') }}?v={{ asset_css_v }}">
 </head>
 <body>
 
@@ -131,6 +135,7 @@
         <div class="view-tab-bar">
           <button class="view-tab vt-active" id="vtab-terminal-project" onclick="switchView('project','terminal',this)">⬛ Terminal</button>
           <button class="view-tab" id="vtab-agentflow-project" onclick="switchView('project','agentflow',this)">⬡ Agent Flow</button>
+          <button class="view-tab" id="vtab-insights-project" onclick="switchView('project','insights',this)">📚 Insights</button>
         </div>
         <div class="terminal-wrap" id="terminal-wrap-project">
           <div class="terminal-header">
@@ -160,6 +165,16 @@
           </div>
           <div id="agentflow-svg-wrap-project" style="overflow-x:auto;padding:12px 16px 16px;">
             <div class="af-empty">Start a run to see the agent flow</div>
+          </div>
+        </div>
+        <div class="insights-panel" id="insights-panel-project">
+          <div class="insights-toolbar">
+            <span class="insights-title">📚 Run Insights</span>
+            <span class="insights-meta" id="insights-meta-project">no run selected</span>
+            <button class="btn btn-secondary btn-sm" onclick="_refreshInsightsPanel('project')">⟳ Refresh</button>
+          </div>
+          <div class="insights-body" id="insights-body-project">
+            <div class="af-empty">Insights appear here once events are recorded for the active run.</div>
           </div>
         </div>
       </div>
@@ -219,6 +234,7 @@
         <div class="view-tab-bar">
           <button class="view-tab vt-active" id="vtab-terminal-idea" onclick="switchView('idea','terminal',this)">⬛ Terminal</button>
           <button class="view-tab" id="vtab-agentflow-idea" onclick="switchView('idea','agentflow',this)">⬡ Agent Flow</button>
+          <button class="view-tab" id="vtab-insights-idea" onclick="switchView('idea','insights',this)">📚 Insights</button>
         </div>
         <div class="terminal-wrap" id="terminal-wrap-idea">
           <div class="terminal-header">
@@ -248,6 +264,16 @@
           </div>
           <div id="agentflow-svg-wrap-idea" style="overflow-x:auto;padding:12px 16px 16px;">
             <div class="af-empty">Start a run to see the agent flow</div>
+          </div>
+        </div>
+        <div class="insights-panel" id="insights-panel-idea">
+          <div class="insights-toolbar">
+            <span class="insights-title">📚 Run Insights</span>
+            <span class="insights-meta" id="insights-meta-idea">no run selected</span>
+            <button class="btn btn-secondary btn-sm" onclick="_refreshInsightsPanel('idea')">⟳ Refresh</button>
+          </div>
+          <div class="insights-body" id="insights-body-idea">
+            <div class="af-empty">Insights appear here once events are recorded for the active run.</div>
           </div>
         </div>
       </div>
@@ -304,6 +330,17 @@
         <div class="chart-card">
           <div class="chart-title">Pipeline Stages (avg)</div>
           <canvas id="chart-stages"></canvas>
+        </div>
+      </div>
+
+      <!-- v1.1.0: Run Insights ledger summary widget -->
+      <div class="card insights-dashboard-card">
+        <div class="card-header">
+          <div class="card-title"><span class="icon">📚</span> Run Insights Ledger</div>
+          <button class="btn btn-secondary btn-sm" onclick="loadInsightsDashboard()">↻ Refresh</button>
+        </div>
+        <div id="insights-dashboard-body">
+          <div class="empty-state"><div class="em-icon">📚</div>Loading insights…</div>
         </div>
       </div>
 
@@ -558,6 +595,6 @@
   also handles the empty-string case (rendered as ``""``).
 -->
 <script>window.WEBUI_URL = {{ webui_url | tojson }};</script>
-<script src="{{ url_for('static', filename='js/app.js') }}"></script>
+<script src="{{ url_for('static', filename='js/app.js') }}?v={{ asset_js_v }}"></script>
 </body>
 </html>

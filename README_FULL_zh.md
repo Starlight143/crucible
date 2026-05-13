@@ -329,6 +329,9 @@ Project Path 與 Idea 兩個頁面均提供可展開的旗標分組面板:
 | GET | `/api/budget/status` | 今日 / 本月 / 累計成本統計 |
 | GET | `/api/webhook/history` | Webhook 投遞歷史(最近 50 筆) |
 | POST | `/api/notify/test` | 測試通知 Webhook 連線(含重試回報) |
+| GET | `/api/insights/summary` | Run Insights ledger 摘要:各 stream 事件計數 + 跨 stream 最近事件 |
+| GET | `/api/insights/events` | 分頁事件列表;支援 `?stream=output\|error\|debate\|params&run_id=&kind=&limit=&since=` |
+| GET | `/api/run/<id>/insights` | 單一 run 的全部 ledger 事件,依 stream 分組 |
 
 ### 生產部署(Gunicorn)
 
@@ -452,6 +455,24 @@ graph TD
 | `CRUCIBLE_ENV_FILE=.env` | 自訂 env 檔案路徑 |
 | `CODEX_ENTRYPOINT=api/main.py:app` | Runtime validation entrypoint override |
 | `API_VERSION_CHECK_ENABLED=1` | 啟用 API 版本檢查 |
+
+### Run Insights Ledger
+
+| 變數 | 預設 | 說明 |
+|------|------|------|
+| `CRUCIBLE_RUN_INSIGHTS_ENABLED` | `1` | 主開關。設 `0` 即整個子系統停用(recorder 回 `_NullRecorder`、所有 emit 點變 no-op、WebUI 顯示「subsystem is disabled」)。 |
+| `CRUCIBLE_RUN_INSIGHTS_RECORD_OUTPUT` | `1` | section 07 成功儲存專案時記錄 `output_method` 事件。 |
+| `CRUCIBLE_RUN_INSIGHTS_RECORD_ERRORS` | `1` | `resilience.kickoff_crew_with_retry` 重試耗盡時記錄 `error_record` 事件。 |
+| `CRUCIBLE_RUN_INSIGHTS_RECORD_DEBATE` | `1` | Stage 0 force-none 或所有 fallback 後仍 parse 失敗時,記錄 `direction_debate_rejection` 事件。 |
+| `CRUCIBLE_RUN_INSIGHTS_RECORD_PARAMS` | `auto` | `auto` = 僅 Quant 模式記錄(對應「Quant 記錄運行參數、非 Quant 不記錄」需求);`1` 強制開、`0` 強制關。拼錯的值 fallback 回 `auto`(不會被 truthy-coerce)。 |
+| `CRUCIBLE_RUN_INSIGHTS_REDACT` | `1` | 寫入前對敏感欄位(`api_key`、`token`、`secret`、`webhook_url`、`auth` 等)做遞迴遮蔽。設 `0` 寫入原始 payload。 |
+| `CRUCIBLE_RUN_INSIGHTS_BACKEND` | `local` | 儲存後端:`local`(`.crucible_insights/` 下的 JSONL streams)。`cloudflare` / `dual` 為保留名稱 — protocol seam 已就位,但實作會 raise `NotImplementedError`。 |
+| `CRUCIBLE_RUN_INSIGHTS_DIR` | `.crucible_insights` | Ledger 根目錄(相對路徑會錨定到 `PROJECT_ROOT`)。 |
+| `CRUCIBLE_RUN_INSIGHTS_INLINE_MAX_BYTES` | `4096` | 大於此值的 payload 寫到 `blobs/<content_id>.json`,事件以 `payload_blob` hash 引用。 |
+| `CRUCIBLE_RUN_INSIGHTS_MAX_ENTRIES_PER_STREAM` | `2000` | 每條 stream 的 FIFO 上限,超過時以原子 temp-file swap 刪除最舊項目。 |
+| `CRUCIBLE_RUN_ID` | — | WebUI spawn pipeline subprocess 時自動注入,綁定 `run_correlation.set_run_id()` 使 telemetry / logs / ledger 共用同一 run_id。直接從 CLI 執行時會自動產生 UUID4。 |
+
+`.env.example` 內另保留給規劃中的 retrieval + LLM skill distillation 層的 key 目前尚未生效:`CRUCIBLE_RUN_INSIGHTS_API_URL`、`CRUCIBLE_RUN_INSIGHTS_API_TOKEN`、`CRUCIBLE_RUN_INSIGHTS_RETRIEVAL_*`、`CRUCIBLE_RUN_INSIGHTS_INJECT_*`、`CRUCIBLE_RUN_INSIGHTS_DISTILLATION_*`。
 
 ### Direction Debate / Gate 相關
 
@@ -1216,6 +1237,30 @@ Dashboard **Budget Bar** 顯示今日花費、月度累計、可選每日上限(
 
 ### Run 詳情視圖(WebUI)
 完整 run 檢視 modal:`analysis_result.json`、`review_report.json`、`security_report.json`、`backtest_report.json`、生成的程式碼檔案清單 — 全部可在瀏覽器中存取。runs 列表支援搜尋與模式過濾。
+
+### Run Insights Ledger
+跨每個 pipeline run 捕捉「什麼有效、什麼失敗、為什麼」的四條 JSONL 流帳本 — 設計上讓未來的 retrieval 層能讀取這些紀錄,避免重蹈覆轍並重複使用成功 pattern。記錄是 mode 感知的:Quant 模式記錄產出方式、錯誤、direction debate 拒絕**以及**運行參數;非 Quant 模式記錄除運行參數外的全部(`CRUCIBLE_RUN_INSIGHTS_RECORD_PARAMS=auto`)。
+
+**四條事件 stream**(位於 `.crucible_insights/`):
+
+| Stream | 檔案 | 來源 | 觸發時機 |
+|--------|------|------|----------|
+| 產出方式 | `output.jsonl` | `section_07_selfcheck_output_main.py` | 專案成功儲存時(模型 id、framework、驗證結論、artefact 清單、score) |
+| 錯誤紀錄 | `error.jsonl` | `resilience.py` | 可重試操作所有重試都耗盡時(例外類別、message head、retry 次數) |
+| Direction Debate 拒絕 | `debate.jsonl` | `section_02_research_and_llm.py` | Stage 0 force-none 候選方向,或所有 fallback 後仍 parse 失敗時(judge 評語節錄、拒絕原因) |
+| 運行參數 | `params.jsonl` | `section_07_selfcheck_output_main.py` | 專案儲存**且**為 Quant 模式時(cli flags、gate config、budget policy) |
+
+每個事件帶有 content-addressable 的 `content_id = "sha256:" + sha256(canonical_json(event \ content_id))`、可未來 Jaccard-indexable 檢索用的標籤型 `signals[]` 陣列(`mode:quant`、`asset:gold`、`venue:ftmo`、…)、`env_fingerprint` 區塊(python 版本、platform、arch、模型 id、provider),以及 `outcome` 區塊(`status` ∈ {success/failure/partial/skipped}、`score`、`note`)。Payload 大於 `CRUCIBLE_RUN_INSIGHTS_INLINE_MAX_BYTES`(預設 4 KB)會 spill 到 `blobs/<content_id>.json`,事件以 hash 引用。寫入前敏感欄位會做遞迴遮蔽。
+
+**WebUI 介面:**
+- Project 與 Idea 模式皆有 per-run **📚 Insights** 分頁 — 打 `GET /api/run/<run_id>/insights`,渲染當前 session 的四條 stream,附 outcome badge 與 signal tag。
+- Dashboard **Run Insights Ledger** 卡片 — 打 `GET /api/insights/summary`,顯示全域事件計數與跨 stream 最近 10 筆事件。每次 dashboard 載入時自動更新。
+
+**匯出與停用:**
+- 用 `python -m crucible.features.run_insights.export ./insights.tar.gz` 匯出整個 ledger — 產生含 `manifest.json`、每條 stream 的 sha256、與所有 blob 的 tarball。
+- 設 `CRUCIBLE_RUN_INSIGHTS_ENABLED=0` 完全停用;recorder 回 `_NullRecorder`、所有 emit 點變 no-op。
+
+**未來能力:**儲存層是 `StorageBackend` protocol,Cloudflare Workers + D1 + R2 契約已凍結在 `backends.py` 的 docstring(D1 schema 以 `content_id` 為 PRIMARY KEY、R2 路徑佈局 `insights/<run_id>/<content_id>.json`、相同的 canonical-JSON 演算法 JavaScript 版本)。雲端後端上線後,切換 `CRUCIBLE_RUN_INSIGHTS_BACKEND=cloudflare`(或 `dual` 做安全遷移)即可把寫入導向 Worker,本地端不需改任何程式碼。
 
 ---
 

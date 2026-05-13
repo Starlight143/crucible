@@ -168,16 +168,35 @@ def _regularised_incomplete_beta(a: float, b: float, x: float) -> float:
 
 # ── Sharpe helper ─────────────────────────────────────────────────────────────
 
+def _finite_returns(returns: List[float]) -> List[float]:
+    """Filter NaN / Inf sentinels out of a returns list.
+
+    v1.1.0: ``_equity_to_returns`` now emits ``float('nan')`` for slots where
+    the previous equity was zero / negative / non-finite (previously it
+    silently substituted ``0.0``, contaminating Sharpe and the bootstrap
+    pool with synthetic flat days).  Every consumer that aggregates the
+    list (mean / std / pct / max-dd) must filter NaN first.
+    """
+    return [r for r in returns if math.isfinite(r)]
+
+
 def _sharpe_from_returns(
     returns: List[float],
     risk_free_rate: float = 0.0,
 ) -> Optional[float]:
-    """Annualised Sharpe ratio from a list of period returns."""
-    if len(returns) < 2:
+    """Annualised Sharpe ratio from a list of period returns.
+
+    Non-finite entries (NaN / Inf sentinels emitted by ``_equity_to_returns``
+    when the prior-step equity was invalid) are filtered before the mean /
+    variance computation so a strategy with the occasional invalid bar
+    does not have its Sharpe deflated by synthetic zero returns.
+    """
+    finite = _finite_returns(returns)
+    if len(finite) < 2:
         return None
-    n = len(returns)
-    mean_r = sum(returns) / n
-    variance = sum((r - mean_r) ** 2 for r in returns) / (n - 1)
+    n = len(finite)
+    mean_r = sum(finite) / n
+    variance = sum((r - mean_r) ** 2 for r in finite) / (n - 1)
     std_r = math.sqrt(variance)
     if not (std_r > 1e-14):
         return None
@@ -289,6 +308,23 @@ class SignificanceTestResult:
     n_permutations: int = 0
     observed_sharpe: Optional[float] = None
     p_value: Optional[float] = None
+    # v1.1.0 third-pass: split one-sided / two-sided p-values explicitly.
+    # ``p_value`` continues to track the test that drives
+    # ``is_significant`` (default two-sided so short-only strategies with
+    # observed_sharpe < 0 are correctly evaluated against |SR| ≥ |obs|
+    # rather than always p≈1).  The other two fields are populated for
+    # transparency so downstream consumers can pick whichever direction
+    # matches their hypothesis.
+    p_value_one_sided: Optional[float] = None
+    p_value_two_sided: Optional[float] = None
+    # v1.1.0 fourth-pass: expose BOTH one-sided tails explicitly so
+    # consumers can pick whichever matches their pre-registered
+    # hypothesis without relying on the auto-direction in
+    # ``p_value_one_sided`` (which picks the tail the OBSERVATION
+    # falls into — formally double-dipping for hypothesis testing).
+    p_value_greater: Optional[float] = None  # H1: observed > permuted
+    p_value_less: Optional[float] = None     # H1: observed < permuted
+    alternative: str = "two-sided"  # "two-sided" | "greater" | "less"
     is_significant: bool = False
     sharpe_ci_lower: Optional[float] = None
     sharpe_ci_upper: Optional[float] = None
@@ -303,6 +339,11 @@ class SignificanceTestResult:
             "n_permutations": self.n_permutations,
             "observed_sharpe": _sanitise_float(self.observed_sharpe),
             "p_value": _sanitise_float(self.p_value),
+            "p_value_one_sided": _sanitise_float(self.p_value_one_sided),
+            "p_value_two_sided": _sanitise_float(self.p_value_two_sided),
+            "p_value_greater": _sanitise_float(self.p_value_greater),
+            "p_value_less": _sanitise_float(self.p_value_less),
+            "alternative": self.alternative,
             "is_significant": self.is_significant,
             "sharpe_ci_lower": _sanitise_float(self.sharpe_ci_lower),
             "sharpe_ci_upper": _sanitise_float(self.sharpe_ci_upper),
@@ -382,40 +423,56 @@ def _load_equity_curve(run_dir: str) -> Tuple[List[float], List[str]]:
 
 
 def _equity_to_returns(equity: List[float]) -> List[float]:
-    """Convert equity curve to period return series."""
+    """Convert equity curve to period return series.
+
+    v1.1.0: invalid slots (prev<=0, prev/curr non-finite) emit
+    ``float('nan')`` rather than a silent ``0.0`` substitution.  The
+    output list keeps the same length as the input minus one, preserving
+    positional alignment with any external timestamp list; downstream
+    consumers in this module call :func:`_finite_returns` to drop NaN
+    before aggregation, so Sharpe / bootstrap / DSR / walk-forward stats
+    no longer mistake a bad-data sentinel for a flat-return day.
+    """
     if len(equity) < 2:
         return []
-    returns = []
+    returns: List[float] = []
     for i in range(1, len(equity)):
         prev = equity[i - 1]
         curr = equity[i]
-        # Guard non-positive and non-finite: negative equity produces
-        # mathematically valid but semantically incorrect returns; NaN/Inf
-        # propagates silently through significance tests and walk-forward stats.
-        if prev > 0 and math.isfinite(prev) and math.isfinite(curr):
+        # v1.1.0 fifth-pass (G-16): tighten denominator floor to 1e-14
+        # per CLAUDE.md § 9.3.  Previous ``prev > 0`` admitted IEEE 754
+        # subnormals (5e-324) which produced 1e+300-magnitude returns
+        # poisoning every downstream stat.
+        if prev > 1e-14 and math.isfinite(prev) and math.isfinite(curr):
             returns.append((curr - prev) / prev)
         else:
-            returns.append(0.0)
+            returns.append(float("nan"))
     return returns
 
 
 def _compute_metrics_from_returns(returns: List[float]) -> BacktestMetrics:
-    """Compute BacktestMetrics from a return series."""
-    if not returns:
+    """Compute BacktestMetrics from a return series.
+
+    Non-finite entries (NaN sentinels from ``_equity_to_returns``) are
+    filtered before aggregation so an invalid bar does not collapse the
+    cumulative product, deflate Sharpe, or invent a synthetic flat day.
+    """
+    finite = _finite_returns(returns)
+    if not finite:
         return BacktestMetrics()
-    n = len(returns)
+    n = len(finite)
     total_return = 1.0
-    for r in returns:
+    for r in finite:
         total_return *= (1.0 + r)
     total_return_pct = (total_return - 1.0) * 100.0
 
-    sharpe = _sharpe_from_returns(returns)
+    sharpe = _sharpe_from_returns(finite)
 
     # Max drawdown
     peak = 1.0
     equity = 1.0
     max_dd = 0.0
-    for r in returns:
+    for r in finite:
         equity *= (1.0 + r)
         if equity > peak:
             peak = equity
@@ -423,10 +480,8 @@ def _compute_metrics_from_returns(returns: List[float]) -> BacktestMetrics:
         if dd > max_dd:
             max_dd = dd
 
-    win_rate: Optional[float] = None
-    if returns:
-        wins = sum(1 for r in returns if r > 0)
-        win_rate = wins / n
+    wins = sum(1 for r in finite if r > 0)
+    win_rate: Optional[float] = wins / n if n > 0 else None
 
     return BacktestMetrics(
         sharpe_ratio=sharpe,
@@ -598,7 +653,12 @@ def run_walk_forward(
         and result.avg_oos_sharpe is not None
         and math.isfinite(result.avg_is_sharpe)
         and math.isfinite(result.avg_oos_sharpe)
-        and abs(result.avg_is_sharpe) > 1e-10
+        # v1.1.0 fifth-pass (G-15): tighten denominator floor to
+        # 1e-8 per CLAUDE.md § 9.3 quant rule.  Previous 1e-10 admits
+        # IS Sharpe in the 1e-10..1e-8 band, after which
+        # ``oos_sharpe / is_sharpe`` can balloon to ~1e+8 (same
+        # failure pattern that motivated the DSR denom_sq fix).
+        and abs(result.avg_is_sharpe) > 1e-8
     ):
         ratio = result.avg_oos_sharpe / result.avg_is_sharpe
         result.sharpe_decay_ratio = ratio if math.isfinite(ratio) else None
@@ -668,6 +728,13 @@ def run_significance_test(
         result.errors.append("Insufficient returns for significance test (need >= 5)")
         return result
 
+    # v1.1.0: filter NaN sentinels before computing significance.  Allowing
+    # NaN entries into the permutation pool would silently corrupt the
+    # shuffle (any permutation that placed NaN in the early window would
+    # propagate NaN through std/mean and the entire permutation would be
+    # discarded by _sharpe_from_returns' None return).  Filtering up front
+    # makes the test consume a strictly clean signal.
+    returns = _finite_returns(returns)
     observed_sharpe = _sharpe_from_returns(returns)
     result.observed_sharpe = observed_sharpe
 
@@ -675,31 +742,87 @@ def run_significance_test(
         result.errors.append("Could not compute observed Sharpe ratio (zero std)")
         return result
 
-    rng = random.Random(42)
+    # v1.1.0: independent RNGs for permutation vs bootstrap so reordering
+    # the two blocks during future maintenance does not silently change
+    # the bootstrap CI.  Both seed off the same base for reproducibility.
+    # v1.1.0 fourth-pass: env-overridable seeds so operators running
+    # multi-fold validation (where every fold uses the same observed
+    # series) can opt into different permutations per fold without
+    # touching code.  Defaults match the prior hard-coded values.
+    perm_rng = random.Random(_env_int("SIG_PERMUTATION_SEED", 42))
+    boot_rng = random.Random(_env_int("SIG_BOOTSTRAP_SEED", 43))
 
     # ── Permutation test ──────────────────────────────────────────────────────
     perm_sharpes: List[float] = []
     returns_copy = list(returns)
     for _ in range(n_permutations):
-        rng.shuffle(returns_copy)
+        perm_rng.shuffle(returns_copy)
         s = _sharpe_from_returns(returns_copy)
         if s is not None:
             perm_sharpes.append(s)
 
     if perm_sharpes:
+        # Phipson & Smyth (2010) +1 correction: the observed value is itself
+        # one realisation under H0, so reporting count_ge / N would imply
+        # ``p = 0`` whenever no permutation matched — overstating the
+        # evidence against H0.  ``(count_ge + 1) / (N + 1)`` is the exact
+        # unbiased estimator for a permutation p-value.
+        #
+        # v1.1.0 third-pass: also compute the two-sided variant.  The
+        # original one-sided test gave p ≈ 1 for any strategy with
+        # observed_sharpe < 0 (e.g. a short-only strategy whose
+        # genuine signal lives in the lower tail).  The two-sided
+        # version compares |observed| against |permuted|, so both
+        # tails are credited — and becomes the default
+        # ``p_value``/``is_significant`` driver.
+        n_perm = len(perm_sharpes)
         count_ge = sum(1 for s in perm_sharpes if s >= observed_sharpe)
-        result.p_value = count_ge / len(perm_sharpes)
-        result.is_significant = result.p_value < 0.05
+        count_le = sum(1 for s in perm_sharpes if s <= observed_sharpe)
+        abs_obs = abs(observed_sharpe)
+        count_abs_ge = sum(1 for s in perm_sharpes if abs(s) >= abs_obs)
+
+        p_one_sided_greater = (count_ge + 1) / (n_perm + 1)
+        p_one_sided_less = (count_le + 1) / (n_perm + 1)
+        # Auto-direction one-sided: pick the tail the observation
+        # actually points into.  Useful for the "summarise in one
+        # number" UI lane; consumers running a pre-registered
+        # directional test should read ``p_value_greater`` /
+        # ``p_value_less`` directly.
+        p_one_sided = (
+            p_one_sided_greater if observed_sharpe >= 0 else p_one_sided_less
+        )
+        # ``min(1.0, ...)`` is mathematically unreachable because
+        # ``count_abs_ge ≤ n_perm`` by construction; retained as an
+        # assertion-style backstop in case the input invariant ever
+        # changes (e.g. someone weights the count).
+        p_two_sided = (count_abs_ge + 1) / (n_perm + 1)
+
+        result.p_value_one_sided = p_one_sided
+        result.p_value_two_sided = p_two_sided
+        result.p_value_greater = p_one_sided_greater
+        result.p_value_less = p_one_sided_less
+        result.alternative = "two-sided"
+        # Default ``p_value`` tracks the two-sided test so a sign-flipped
+        # strategy (e.g. short-only) is no longer silently dismissed.
+        result.p_value = p_two_sided
+        result.is_significant = p_two_sided < 0.05
         result.sharpe_distribution = perm_sharpes[:100]  # truncate for storage
     else:
         result.p_value = 1.0
+        result.p_value_one_sided = 1.0
+        result.p_value_two_sided = 1.0
+        result.p_value_greater = 1.0
+        result.p_value_less = 1.0
         result.is_significant = False
+        result.errors.append(
+            "Permutation test produced no valid Sharpe samples — p_value not meaningful"
+        )
 
     # ── Bootstrap CI ─────────────────────────────────────────────────────────
     n = len(returns)
     boot_sharpes: List[float] = []
     for _ in range(n_bootstrap):
-        sample = [rng.choice(returns) for _ in range(n)]
+        sample = [boot_rng.choice(returns) for _ in range(n)]
         s = _sharpe_from_returns(sample)
         if s is not None:
             boot_sharpes.append(s)
@@ -726,7 +849,9 @@ def run_significance_test(
         m3 = sum((r - mean_r) ** 3 for r in returns) / n
         m4 = sum((r - mean_r) ** 4 for r in returns) / n
 
-        std_r = math.sqrt(m2) if m2 > 0 else None
+        # v1.1.0 fourth-pass: tighten subnormal guard (m2 > 1e-28 ↔
+        # std_r > 1e-14, matching the project-wide floor in CLAUDE.md).
+        std_r = math.sqrt(m2) if m2 > 1e-28 else None
 
         if std_r is not None and std_r > 1e-14:
             skew = m3 / (std_r ** 3)
@@ -740,12 +865,29 @@ def run_significance_test(
             # where γ ≈ 0.5772 (Euler-Mascheroni constant) and Z is the inverse standard normal
             euler_gamma = 0.5772156649015328
 
-            # Approximate inverse normal CDF via rational approximation (Beasley-Springer-Moro)
+            # Approximate inverse normal CDF via rational approximation
+            # (Beasley-Springer-Moro / Abramowitz & Stegun 26.2.23).
+            #
+            # v1.1.0: the previous formulation evaluated the rational at
+            # ``t = sqrt(-2 ln p_use)`` and returned ``sign * (t - num/den)``.
+            # At p=0.5 (= ln 0.5 = -0.693, t ≈ 1.1774) the polynomial does
+            # NOT cancel exactly — ``t - num/den`` evaluates to ≈ -1.5e-5
+            # instead of 0.  As p crossed 0.5 the sign flipped, producing a
+            # ~3e-5 discontinuity that mattered for DSR computations with
+            # ``n_trials=2`` where ``sr_0`` already lives near zero.  We now
+            # special-case p == 0.5 exactly (the analytic answer is 0) so
+            # the function is continuous and matches the scipy fallback at
+            # the median.
             def _inv_normal(p: float) -> float:
                 if _HAS_SCIPY:
                     return float(_scipy_stats.norm.ppf(p))
-                # Rational approximation (good for p in (0,1))
+                # Rational approximation (good for p in (0,1)).
                 p = max(1e-12, min(1.0 - 1e-12, p))
+                if abs(p - 0.5) < 1e-12:
+                    # Analytic value at the median; avoids the tiny
+                    # discontinuity in the rational approximation around
+                    # t ≈ 1.1774 (sqrt(-2 ln 0.5)).
+                    return 0.0
                 if p < 0.5:
                     sign = -1.0
                     p_use = p
@@ -773,14 +915,43 @@ def run_significance_test(
             # DSR numerator / denominator
             sr_hat = observed_sharpe / math.sqrt(252.0)  # de-annualise to per-period
             denom_sq = 1.0 - skew * sr_hat + (kurt - 1.0) / 4.0 * sr_hat ** 2
-            # ``> 0`` lets IEEE 754 subnormals through ``math.sqrt``, which
-            # produces an inflated dsr_z that maps to a meaningless p-value.
-            if denom_sq > 1e-14:
-                dsr_z = (sr_hat - sr_0) * math.sqrt(T) / math.sqrt(denom_sq)
+            # v1.1.0 third-pass: previous floor of 1e-14 still admitted
+            # numerically unstable denominators — when ``denom_sq`` was
+            # e.g. 1.5e-14, ``sqrt`` produced ~1.2e-7 and ``dsr_z``
+            # ballooned to 1e+8, saturating ``_normal_cdf`` at 1.0 and
+            # reporting a false-positive DSR p-value of 0.  We now (a)
+            # raise the floor to 1e-8 (matching the practical scale of
+            # ``sr_hat`` × ``sqrt(T)``) and (b) clip the resulting
+            # ``dsr_z`` to ``±10`` so even a borderline denom_sq cannot
+            # produce a saturated probability — ``Φ(10) = 1 − 7.6e-24``
+            # is already indistinguishable from saturation but
+            # preserves a numerically sane score.
+            if denom_sq > 1e-8:
+                raw_dsr_z = (sr_hat - sr_0) * math.sqrt(T) / math.sqrt(denom_sq)
+                # v1.1.0 fourth-pass: clamp lowered from ±10 to ±6.
+                # ``Φ(10) ≈ 1 - 7.6e-24`` round-trips through json.dumps
+                # as the float ``1.0`` exactly — operators couldn't
+                # tell "genuinely huge dsr_z" from "borderline denom_sq
+                # clip" because both produced the same visible score.
+                # ``Φ(6) ≈ 1 - 9.9e-10`` is still saturated for any
+                # practical purpose but stays finite-distinguishable
+                # from 1.0 in JSON.  Additionally append a warning to
+                # ``result.errors`` when the raw value WAS clipped so
+                # consumers know the boundary was hit.
+                if raw_dsr_z > 6.0 or raw_dsr_z < -6.0:
+                    result.errors.append(
+                        f"DSR z-score clipped from {raw_dsr_z:.2f} to ±6 "
+                        "(denominator near numerical floor — score is saturated, "
+                        "interpret with caution)"
+                    )
+                dsr_z = max(-6.0, min(6.0, raw_dsr_z))
                 result.deflated_sharpe_ratio = _normal_cdf(dsr_z)
                 result.dsr_p_value = 1.0 - result.deflated_sharpe_ratio
             else:
-                result.errors.append("DSR denominator <= 0 (degenerate distribution)")
+                result.errors.append(
+                    "DSR denominator below numerical floor "
+                    "(distribution too degenerate for a stable estimate)"
+                )
         else:
             result.errors.append("Cannot compute DSR: zero standard deviation")
     except Exception as exc:

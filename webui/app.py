@@ -44,7 +44,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 
@@ -110,10 +110,175 @@ _SSE_KEEPALIVE_TICKS = int(20 / _SSE_POLL_INTERVAL)       # every ~20 seconds
 
 app = Flask(__name__)
 
+# v1.1.0 fourth-pass (F-3): honour ``X-Forwarded-*`` headers when
+# ``CRUCIBLE_TRUST_FORWARDED=1`` (operator opt-in).  Without this,
+# ``request.host`` returns the internal host (e.g. ``127.0.0.1:5000``)
+# but browsers send ``Referer`` carrying the public host (e.g.
+# ``crucible.example.com``) → the new same-origin check in
+# ``_enforce_xhr_header_on_state_changes`` flags every legitimate
+# same-origin POST as cross-origin → 403.  Opt-in because trusting
+# forwarded headers without a properly-configured proxy is itself an
+# IP-spoofing vector.  Operators behind nginx / Caddy / Cloudflare
+# set the env var; standalone deployments leave it off.
+try:
+    from werkzeug.middleware.proxy_fix import ProxyFix as _ProxyFix
+    _trust_forwarded_raw = (os.environ.get("CRUCIBLE_TRUST_FORWARDED") or "").strip().lower()
+    if _trust_forwarded_raw in {"1", "true", "yes", "on"}:
+        # x_for=1 / x_proto=1 / x_host=1: trust ONE hop of the forwarded
+        # chain (the proxy directly in front of us); refuse to trust
+        # arbitrary client-supplied chains.
+        app.wsgi_app = _ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1)  # type: ignore[method-assign]
+except ImportError:
+    # Werkzeug always ships with Flask; the import is defensive in case
+    # someone strips middleware in a fork.
+    pass
+
+# v1.1.0: hard cap the request body at 1 MB.  None of the default
+# endpoints (POST /api/run with ``idea`` + ``project_path``, POST /api/env
+# with the full settings dict, POST /api/run/<id>/signal with a 4 KB cap
+# already applied inline) need anywhere near 1 MB; the cap kills a class
+# of DoS attempts where a single oversized JSON body buffers in Flask's
+# pre-route parser and OOMs the worker before the route handler can apply
+# its own length guard.
+#
+# v1.1.0 fourth-pass (F-8): operators who paste large idea briefs / CSV
+# uploads can raise the cap via ``CRUCIBLE_MAX_CONTENT_LENGTH_MB``
+# (integer megabytes).  We clamp to [1, 64] MB so an extreme value can't
+# defeat the DoS guard.  Default stays at 1 MB.
+_max_mb_raw = (os.environ.get("CRUCIBLE_MAX_CONTENT_LENGTH_MB") or "").strip()
+try:
+    _max_mb = int(_max_mb_raw) if _max_mb_raw else 1
+except ValueError:
+    _max_mb = 1
+_max_mb = max(1, min(64, _max_mb))
+app.config["MAX_CONTENT_LENGTH"] = _max_mb * 1024 * 1024
+
+
+# v1.1.0: CSRF / drive-by hardening for state-mutating endpoints.
+# We require the ``X-Requested-With: XMLHttpRequest`` header on every
+# unsafe-method request to the API surface.  The frontend already attaches
+# this header to every ``fetch()`` call; a malicious cross-origin page
+# loaded in the operator's browser CANNOT add this header without first
+# triggering a CORS preflight (which Flask answers without state mutation),
+# so the request is blocked at the routing layer before reaching the
+# handler.  Webhook endpoints are exempt because they use HMAC signature
+# verification and are intentionally callable from third-party services.
+_XHR_EXEMPT_PREFIXES = ("/webhook/",)
+_XHR_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+@app.before_request
+def _enforce_xhr_header_on_state_changes() -> Any:
+    """Block cross-origin state-mutating requests that lack ``X-Requested-With``.
+
+    The check is conservative: only POST/PUT/PATCH/DELETE to ``/api/*``
+    are gated.  Read-only GET requests, OPTIONS preflights, the SPA at
+    ``/``, static files, and webhook endpoints (HMAC-verified) are all
+    allowed through unconditionally.
+
+    v1.1.0 refinement: the header requirement only applies when the
+    request carries an ``Origin`` header (i.e. came from a browser).
+    Server-to-server callers (curl, the Flask test client, internal
+    schedulers) do not set ``Origin`` and pass through.  A genuine
+    drive-by attack from a malicious cross-origin page CANNOT suppress
+    the ``Origin`` header (the browser sets it automatically on every
+    cross-origin fetch / form post) so the cross-origin attack surface
+    is still fully covered.  This matches the threat model: same-origin
+    XHR (frontend → backend) is trusted; cross-origin XHR is blocked
+    unless the frontend explicitly adds the header.
+    """
+    method = (request.method or "").upper()
+    if method in _XHR_SAFE_METHODS:
+        return None
+    path = request.path or ""
+    if not path.startswith("/api/"):
+        return None
+    for prefix in _XHR_EXEMPT_PREFIXES:
+        if path.startswith(prefix):
+            return None
+    # v1.1.0 third-pass: decide whether this looks like a browser
+    # cross-origin call.
+    #
+    # * ``Origin`` present and a real host → browser issued; require
+    #   X-Requested-With.
+    # * ``Origin: null`` (sandboxed iframe, data:/file: redirect,
+    #   certain Safari versions, server-pushed pages with opaque
+    #   origin) → untrusted; require X-Requested-With.
+    # * No ``Origin`` but ``Referer`` from a different host →
+    #   privacy-preserving browser flow with origin suppression;
+    #   treat as cross-origin and require X-Requested-With.
+    # * Neither header present (curl, Flask test client, internal
+    #   scheduler) → server-to-server; pass.
+    origin = (request.headers.get("Origin") or "").strip()
+    referer = (request.headers.get("Referer") or "").strip()
+    host = (request.host or "").lower()
+
+    # v1.1.0 fourth-pass (F-3): also consult ``X-Forwarded-Host`` so
+    # comparing Referer against the request host works correctly
+    # behind a reverse proxy.  If ProxyFix is wired up,
+    # ``request.host`` already reflects the forwarded value and this
+    # is a no-op; if ProxyFix is OFF we still try to be lenient on
+    # same-origin requests when an explicit forwarded host matches.
+    fwd_host = (request.headers.get("X-Forwarded-Host") or "").strip().lower()
+
+    requires_xhr_header = False
+    if origin:
+        # Any Origin header — including a literal "null" opaque origin —
+        # signals a browser-initiated request that must carry the XHR
+        # header.  Same-origin POSTs from the SPA carry it automatically
+        # via the fetch shim; cross-origin attackers cannot add it
+        # without triggering a CORS preflight we never approve.
+        requires_xhr_header = True
+    elif referer:
+        # No Origin (privacy mode / older browsers) but Referer present
+        # → still a browser flow.  Compare Referer's netloc against the
+        # request host AND any forwarded host so reverse-proxy
+        # deployments are not falsely cross-origin.
+        try:
+            ref_host = (urllib.parse.urlparse(referer).netloc or "").lower()
+        except Exception:
+            # Malformed Referer (extension-rewritten, ``data:`` scheme
+            # raising in urlparse) — fail closed: require the header.
+            ref_host = None
+        # v1.1.0 fourth-pass: also fail closed when urlparse succeeds
+        # but produces an empty netloc.  ``javascript:alert(1)``,
+        # ``data:,xxx``, ``/relative/path`` all parse cleanly to
+        # ``netloc == ""``.  An empty netloc never legitimately
+        # represents same-origin → require the XHR header.
+        if not ref_host:  # covers None AND ""
+            requires_xhr_header = True
+        elif ref_host not in (host, fwd_host):
+            requires_xhr_header = True
+
+    if not requires_xhr_header:
+        return None
+
+    xhr = (request.headers.get("X-Requested-With") or "").strip().lower()
+    if xhr != "xmlhttprequest":
+        return jsonify({
+            "error": "missing X-Requested-With header",
+            "detail": (
+                "cross-origin state-mutating API calls must include "
+                "X-Requested-With: XMLHttpRequest; same-origin XHR adds "
+                "this header automatically"
+            ),
+        }), 403
+    return None
+
 
 @app.errorhandler(404)
 def _handle_404(exc: Any) -> Any:
     return jsonify({"error": "Not found"}), 404
+
+
+@app.errorhandler(413)
+def _handle_413(exc: Any) -> Any:
+    # Triggered when MAX_CONTENT_LENGTH is exceeded; surface a clear error
+    # instead of Flask's default HTML response.
+    return jsonify({
+        "error": "request body too large",
+        "limit_bytes": app.config.get("MAX_CONTENT_LENGTH", 0),
+    }), 413
 
 
 @app.errorhandler(500)
@@ -1227,9 +1392,65 @@ def _scan_saved_runs(
 
 # ─── Routes ────────────────────────────────────────────────────────────────────
 
+# ── Static asset cache-busting ────────────────────────────────────────────────
+# Without a versioned query string Flask serves ``app.js`` / ``app.css`` with
+# strong ETags; browsers then send ``If-None-Match`` on subsequent loads and
+# receive ``304 Not Modified`` — meaning even Ctrl+F5 can keep an old bundle in
+# disk cache on some Chromium builds.  We compute a short content hash for each
+# static asset and pass it to ``index.html`` so the script / link tags become
+# ``app.js?v=<hash>`` — when the file content changes the URL changes, which
+# guarantees a fresh fetch on the very next page load.
+_STATIC_ASSET_HASH_CACHE: dict[str, str] = {}
+
+
+_EMPTY_FILE_SHA1_HEAD = "da39a3ee5e"  # sha1(b"")[:10] — never cache this
+
+
+def _static_asset_hash(rel_path: str) -> str:
+    """Returns the first 10 hex chars of sha1(file_bytes) for a static asset.
+
+    Result is memoised per-process — restart Flask to pick up new hashes
+    (which is the operator's existing workflow anyway).  Missing files
+    return ``"x"`` so the URL is still well-formed and the browser will
+    fetch it normally.
+
+    v1.1.0 fifth-pass (G-22): NEVER cache the empty-file sha1 prefix.
+    Editor truncate-then-write semantics (VS Code / vim) momentarily
+    leave ``app.js`` at zero bytes during save.  A Flask request hitting
+    ``index()`` in that window would permanently cache the empty-file
+    hash, after which subsequent edits would NOT bust the cache until
+    Flask restart.  The empty-file sentinel is treated as ephemeral
+    and re-read on the next request.
+    """
+    cached = _STATIC_ASSET_HASH_CACHE.get(rel_path)
+    if cached and cached not in (_EMPTY_FILE_SHA1_HEAD, "x"):
+        return cached
+    try:
+        import hashlib
+        full = (PROJECT_ROOT / "webui" / "static" / rel_path)
+        data = full.read_bytes()
+        if not data:
+            # Truncated-during-save snapshot.  Return an ephemeral
+            # sentinel that survives until the file is re-readable;
+            # DO NOT cache so the next request re-reads.
+            return "x"
+        h = hashlib.sha1(data).hexdigest()[:10]
+    except Exception:  # noqa: BLE001 — never break page rendering
+        h = "x"
+    # Only cache once we have a real, non-empty-file hash.
+    if h != "x":
+        _STATIC_ASSET_HASH_CACHE[rel_path] = h
+    return h
+
+
 @app.route("/")
 def index() -> str:
-    return render_template("index.html", webui_url=os.environ.get("WEBUI_URL", ""))
+    return render_template(
+        "index.html",
+        webui_url=os.environ.get("WEBUI_URL", ""),
+        asset_js_v=_static_asset_hash("js/app.js"),
+        asset_css_v=_static_asset_hash("css/app.css"),
+    )
 
 
 # ── Env ───────────────────────────────────────────────────────────────────────
@@ -1267,6 +1488,28 @@ def api_set_env():
 
 @app.route("/api/env/schema")
 def api_env_schema():
+    """Parse .env.example into a schema of {group: [{key, default, type}]}.
+
+    v1.1.0 fifth-pass (G-21): tightened group-header heuristic.  The
+    prior rule (any 1-6 token comment is a header) caused 6-token
+    description sentences (e.g. ``# Alibaba Coding Plan Stage 0
+    direction judge model.``) to hijack adjacent env keys into a
+    description-shaped "group name".  New rules — a comment line is
+    treated as a group header iff ANY of:
+
+      * it is an explicit divider (begins/ends with ``=``, ``-``, ``─``,
+        ``━``, ``#``, ``*``, or has 3+ such characters);
+      * it is an UPPER-CASE-ONLY token sequence of 1-6 tokens (e.g.
+        ``# OPENROUTER`` or ``# RUN INSIGHTS LEDGER``);
+      * it is 1-3 tokens AND none of those tokens contain ``=`` or
+        a colon (single-word section titles like ``# Cache`` still work).
+
+    Everything else is treated as a description — preserving the
+    previous header.  Genuine multi-word section headings should use
+    the explicit divider form ``# === Section name ===``.  This makes
+    the parser stable against a class of description-sentence hijacks
+    that the v1.1.0 fifth-pass audit found.
+    """
     if not ENV_EXAMPLE.exists():
         return jsonify({})
     groups: dict[str, list[dict]] = {}
@@ -1275,12 +1518,49 @@ def api_env_schema():
         _env_text = ENV_EXAMPLE.read_text(encoding="utf-8", errors="replace")
     except OSError:
         return jsonify({})
+
+    def _is_section_header(text: str) -> bool:
+        """Apply the tightened heuristic — see docstring above."""
+        if not text:
+            return False
+        stripped = text.strip()
+        # Strip surrounding divider characters before counting tokens so
+        # ``# === Section ===`` is recognised as the section name "Section".
+        for ch in ("=", "-", "─", "━", "*", "#"):
+            stripped = stripped.strip(ch).strip()
+        if not stripped:
+            return False
+        tokens = stripped.split()
+        n = len(tokens)
+        if n > 6:
+            return False
+        # Reject any token containing ``=`` or a colon (description sentences
+        # frequently mention ``ENV_NAME=value`` or ``Note:`` and would
+        # otherwise hijack the group when terse).
+        if any(("=" in tok or ":" in tok) for tok in tokens):
+            return False
+        # 1-3 tokens of plain identifier-shape: accept (e.g. "Cache",
+        # "Run Insights", "Backtest & Optimisation").
+        if n <= 3:
+            return True
+        # 4-6 tokens: require explicit divider syntax OR all-uppercase.
+        if "=" in text or "─" in text or "━" in text or "*" in text:
+            return True
+        # Allow ALL-CAPS phrasing as a divider convention.
+        if stripped.upper() == stripped and any(ch.isalpha() for ch in stripped):
+            return True
+        return False
+
     for raw in _env_text.splitlines():
         line = raw.strip()
         if line.startswith("#"):
             text = line.lstrip("#").strip()
-            if text and 1 <= len(text.split()) <= 6 and not text.startswith("="):
-                current_group = text
+            if _is_section_header(text):
+                # Normalise: drop surrounding divider chars for display.
+                for ch in ("=", "-", "─", "━", "*", "#"):
+                    text = text.strip(ch).strip()
+                if text:
+                    current_group = text
         elif "=" in line:
             k, _, v = line.partition("=")
             k = k.strip()
@@ -1300,7 +1580,104 @@ _STAGE_MARKER_RE = re.compile(r'\[Stage\s+(\d+)\b|stage=(\w+)|^=+\s*Stage\s+(\d+
 _TOKEN_COUNT_RE = re.compile(r'tokens?[:\s]+(\d+)', re.IGNORECASE)
 
 
-def _run_worker(run_id: str, cmd: list[str], stdin_text: str) -> None:
+# ─── Run Insights env overrides (per-run flag panel) ─────────────────────────
+# The Idea / Path mode flag panels expose five Run Insights boolean toggles
+# (mirrored from the Settings page CRUCIBLE_RUN_INSIGHTS_* keys).  When the
+# operator flips one of those toggles for a single run, we don't want to
+# rewrite ``.env`` — we just override the env var on that one subprocess so
+# the recorder configured at module import time sees the new value.  This
+# helper resolves the override dict; ``_run_worker`` merges it into
+# ``_child_env``.  Boolean None values are intentionally left out so that
+# unset toggles inherit the parent process's env (which itself was loaded
+# from ``.env`` at Flask startup).
+_RUN_INSIGHTS_FLAG_TO_ENV: dict[str, str] = {
+    "run_insights_enabled":       "CRUCIBLE_RUN_INSIGHTS_ENABLED",
+    "run_insights_record_output": "CRUCIBLE_RUN_INSIGHTS_RECORD_OUTPUT",
+    "run_insights_record_errors": "CRUCIBLE_RUN_INSIGHTS_RECORD_ERRORS",
+    "run_insights_record_debate": "CRUCIBLE_RUN_INSIGHTS_RECORD_DEBATE",
+    "run_insights_redact":        "CRUCIBLE_RUN_INSIGHTS_REDACT",
+}
+
+
+# v1.1.0 fourth-pass (F-9): the three ``_STORE_TRUE_ONLY`` flags
+# (``cache``, ``strict_json``, ``cost_trace``) don't have ``--no-``
+# CLI variants because their argparse definitions use the legacy
+# ``store_true`` action.  Unchecking them in the idea/path panel
+# previously had no effect — the subprocess inherited the ``.env``
+# default which is typically ``1``, so the feature ran even though
+# the UI said "off".  This mapping lets us override via env var
+# instead of CLI: unchecking the box sets the corresponding
+# env=``0`` for the subprocess, which the core pipeline reads via
+# ``_env.env_bool()`` and respects.
+#
+# v1.1.0 fifth-pass (G-1): the fourth-pass shipped the WRONG env
+# names — ``CRUCIBLE_CACHE`` / ``CRUCIBLE_STRICT_JSON`` /
+# ``CRUCIBLE_COST_TRACE`` are NOT what the core pipeline reads.
+# The actual read sites use the un-prefixed legacy names
+# (``section_07_selfcheck_output_main.py:323-325`` reads
+# ``env_bool("STRICT_JSON", ...)``, ``env_bool("LOCAL_CACHE", ...)``
+# and ``env_bool("COST_TRACE", ...)``; ``section_02`` /
+# ``section_05`` / ``section_06`` mirror this).  So the F-9 fix
+# silently regressed — per-run uncheck wrote ``CRUCIBLE_STRICT_JSON=0``
+# while the pipeline kept reading ``STRICT_JSON`` from the inherited
+# parent env (still ``1``).  Tests passed because they only
+# verified the mapping was internally self-consistent, never that
+# the RHS keys match what the pipeline actually reads — a textbook
+# "producer is tested, consumer wiring is not" trap (see CLAUDE.md
+# § 9.5 for the test pattern that now pins this).
+_STORE_TRUE_FLAG_TO_ENV: dict[str, str] = {
+    "cache":       "LOCAL_CACHE",
+    "strict_json": "STRICT_JSON",
+    "cost_trace":  "COST_TRACE",
+}
+
+
+def _resolve_run_insights_env_overrides(flags: dict[str, Any]) -> dict[str, str]:
+    """Maps per-run flag toggles → subprocess env vars.
+
+    Returned dict is merged into ``_child_env`` by ``_run_worker``.  Only
+    explicitly True / False values produce an entry; missing / None values
+    leave the parent env (i.e. ``.env`` defaults) in place so the panel's
+    "untouched" state behaves identically to "the user opened Idea mode
+    without changing anything".
+
+    v1.1.0 fourth-pass: also resolves ``_STORE_TRUE_FLAG_TO_ENV`` so the
+    three legacy ``store_true``-only flags (``cache`` / ``strict_json`` /
+    ``cost_trace``) can finally be per-run-disabled.  The function name
+    is kept for backward compatibility with the four call sites; despite
+    the "run_insights" in the name, this is now the canonical
+    flags→env resolver for ALL env-backed bool flags.
+    """
+    out: dict[str, str] = {}
+    if not isinstance(flags, dict):
+        return out
+    # Run-insights toggles (cleanly bidirectional True/False ↔ "1"/"0").
+    for flag_key, env_key in _RUN_INSIGHTS_FLAG_TO_ENV.items():
+        val = flags.get(flag_key)
+        if val is True:
+            out[env_key] = "1"
+        elif val is False:
+            out[env_key] = "0"
+    # Store-true legacy flags that lack ``--no-`` CLI form: same
+    # bidirectional resolution.  Without this branch, the only effect
+    # of unchecking the box was visual — the run_insights ledger and
+    # cache code paths still ran because the env var stayed at its
+    # ``.env`` default.
+    for flag_key, env_key in _STORE_TRUE_FLAG_TO_ENV.items():
+        val = flags.get(flag_key)
+        if val is True:
+            out[env_key] = "1"
+        elif val is False:
+            out[env_key] = "0"
+    return out
+
+
+def _run_worker(
+    run_id: str,
+    cmd: list[str],
+    stdin_text: str,
+    env_overrides: dict[str, str] | None = None,
+) -> None:
     """Shared worker function for starting a subprocess, streaming its output into
     ``_runs[run_id]``, and handling all lifecycle state transitions.
 
@@ -1310,6 +1687,11 @@ def _run_worker(run_id: str, cmd: list[str], stdin_text: str) -> None:
     Features implemented here:
       - Feature 1: AWAIT_INPUT protocol detection, stdin_pipe storage
       - Feature 2: stage timing + token count tracking
+      - Run Insights per-run override: ``env_overrides`` (computed upstream by
+        ``_resolve_run_insights_env_overrides``) is merged into ``_child_env``
+        AFTER the standard PYTHONUTF8 / CRUCIBLE_RUN_ID seed so the operator's
+        single-run toggle wins over ``.env`` defaults but never overwrites the
+        correlation id.
     """
     proc: "subprocess.Popen[str] | None" = None
     try:
@@ -1322,7 +1704,21 @@ def _run_worker(run_id: str, cmd: list[str], stdin_text: str) -> None:
             "PYTHONUTF8": "1",
             "PYTHONIOENCODING": "utf-8",
             "PYTHONUNBUFFERED": "1",
+            # v1.1.0: propagate the WebUI's run_id into the spawned pipeline so
+            # all telemetry, log lines, and run_insights ledger entries share
+            # the same correlation id.  Without this, the pipeline generates
+            # an unrelated UUID and the per-run Insights tab cannot find any
+            # events because the ledger run_id never matches `sess.run_id`.
+            "CRUCIBLE_RUN_ID": run_id,
         }
+        # Per-run Run Insights toggle overrides — never permitted to touch
+        # CRUCIBLE_RUN_ID (defensive: callers should not pass it, but we
+        # strip it just in case to keep correlation intact).
+        if env_overrides:
+            for k, v in env_overrides.items():
+                if k == "CRUCIBLE_RUN_ID":
+                    continue
+                _child_env[k] = v
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -1482,6 +1878,8 @@ def api_start_run():
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
+    env_overrides = _resolve_run_insights_env_overrides(payload.get("flags", {}) or {})
+
     with _runs_lock:
         _runs[run_id] = {
             "id": run_id,
@@ -1504,7 +1902,12 @@ def api_start_run():
             "ab_id":        None,
         }
 
-    threading.Thread(target=_run_worker, args=(run_id, cmd, stdin_text), daemon=True).start()
+    threading.Thread(
+        target=_run_worker,
+        args=(run_id, cmd, stdin_text),
+        kwargs={"env_overrides": env_overrides},
+        daemon=True,
+    ).start()
     return jsonify({"run_id": run_id, "cmd": " ".join(cmd)})
 
 
@@ -1789,6 +2192,175 @@ def api_runs():
     return jsonify(_scan_saved_runs(limit=limit, query=query, mode=mode))
 
 
+# ── Run Insights ledger (v1.1.0) ──────────────────────────────────────────────
+# Browse the .crucible_insights/ ledger written by features/run_insights.
+# Three endpoints:
+#   GET /api/insights/summary          — total event counts per stream + recent
+#   GET /api/insights/events           — paginated event feed (?stream=, ?run_id=,
+#                                        ?project_name=, ?since=, ?cursor=, ?limit=)
+#   GET /api/run/<run_id>/insights     — events filtered to a single run_id
+#
+# These are *read-only* — there is no write endpoint by design.  Recording
+# happens inside the pipeline; the WebUI is purely an observer.
+
+_INSIGHTS_STREAMS = ("output", "error", "debate", "params")
+
+
+def _insights_root() -> Path:
+    """Resolve the ledger root from env, anchored to PROJECT_ROOT."""
+    raw = (os.environ.get("CRUCIBLE_RUN_INSIGHTS_DIR") or ".crucible_insights").strip()
+    p = Path(raw)
+    if not p.is_absolute():
+        p = (PROJECT_ROOT / p).resolve()
+    return p
+
+
+def _read_jsonl_stream(path: Path) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    if not path.exists():
+        return out
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                    if isinstance(obj, dict):
+                        out.append(obj)
+                except json.JSONDecodeError:
+                    continue
+    except OSError as exc:
+        LOGGER.debug("insights: read %s failed: %s", path, exc)
+    return out
+
+
+def _count_jsonl_lines(path: Path) -> int:
+    if not path.exists():
+        return 0
+    try:
+        with open(path, "rb") as fh:
+            return sum(1 for ln in fh if ln.strip())
+    except OSError:
+        return 0
+
+
+@app.route("/api/insights/summary")
+def api_insights_summary():
+    """Return aggregate stats for the insights ledger.
+
+    Output::
+
+        {
+          "enabled": bool,
+          "root": "<absolute path>",
+          "schema_version": 1,
+          "streams": {
+            "output": {"lines": int, "exists": bool},
+            "error":  {"lines": int, "exists": bool},
+            "debate": {"lines": int, "exists": bool},
+            "params": {"lines": int, "exists": bool}
+          },
+          "recent": [<last 5 events across all streams, newest first>]
+        }
+    """
+    enabled = (
+        os.environ.get("CRUCIBLE_RUN_INSIGHTS_ENABLED", "1").strip().lower()
+        not in {"0", "false", "no", "off"}
+    )
+    root = _insights_root()
+    streams: dict[str, dict[str, Any]] = {}
+    recent_pool: list[dict[str, Any]] = []
+    for s in _INSIGHTS_STREAMS:
+        path = root / f"{s}.jsonl"
+        lines = _count_jsonl_lines(path)
+        streams[s] = {"lines": lines, "exists": path.exists()}
+        if lines > 0:
+            # Pull the tail-most ~5 lines per stream for the global recent feed.
+            events = _read_jsonl_stream(path)
+            recent_pool.extend(events[-5:])
+    recent_pool.sort(key=lambda e: str(e.get("ts") or ""), reverse=True)
+    return jsonify({
+        "enabled": enabled,
+        "root": str(root),
+        "schema_version": 1,
+        "streams": streams,
+        "recent": recent_pool[:10],
+    })
+
+
+@app.route("/api/insights/events")
+def api_insights_events():
+    """Paginated event feed.
+
+    Query params:
+        stream       — output|error|debate|params (default: all)
+        run_id       — filter by run_id
+        project_name — filter by project_name (case-insensitive substring)
+        since        — ISO-8601 ts lower bound
+        kind         — filter by event kind (e.g. error_record)
+        limit        — max events to return (1..500, default 100)
+    """
+    try:
+        limit = max(1, min(int(request.args.get("limit", 100)), 500))
+    except (ValueError, TypeError):
+        limit = 100
+
+    target_streams: tuple[str, ...]
+    requested_stream = (request.args.get("stream") or "").strip().lower()
+    if requested_stream and requested_stream in _INSIGHTS_STREAMS:
+        target_streams = (requested_stream,)
+    else:
+        target_streams = _INSIGHTS_STREAMS
+
+    run_id_filter = (request.args.get("run_id") or "").strip()
+    project_filter = (request.args.get("project_name") or "").strip().lower()
+    since_filter = (request.args.get("since") or "").strip()
+    kind_filter = (request.args.get("kind") or "").strip()
+
+    root = _insights_root()
+    collected: list[dict[str, Any]] = []
+    for s in target_streams:
+        for ev in _read_jsonl_stream(root / f"{s}.jsonl"):
+            if run_id_filter and str(ev.get("run_id") or "") != run_id_filter:
+                continue
+            if project_filter:
+                pn = str(ev.get("project_name") or "").lower()
+                if project_filter not in pn:
+                    continue
+            if since_filter and str(ev.get("ts") or "") < since_filter:
+                continue
+            if kind_filter and str(ev.get("kind") or "") != kind_filter:
+                continue
+            collected.append(ev)
+
+    # Sort newest first, then truncate.
+    collected.sort(key=lambda e: str(e.get("ts") or ""), reverse=True)
+    return jsonify({
+        "events": collected[:limit],
+        "total_matched": len(collected),
+        "truncated": len(collected) > limit,
+    })
+
+
+@app.route("/api/run/<run_id>/insights")
+def api_run_insights(run_id: str):
+    """All insight events for a single run_id, grouped by stream."""
+    root = _insights_root()
+    grouped: dict[str, list[dict[str, Any]]] = {s: [] for s in _INSIGHTS_STREAMS}
+    for s in _INSIGHTS_STREAMS:
+        for ev in _read_jsonl_stream(root / f"{s}.jsonl"):
+            if str(ev.get("run_id") or "") == run_id:
+                grouped[s].append(ev)
+    total = sum(len(v) for v in grouped.values())
+    return jsonify({
+        "run_id": run_id,
+        "total": total,
+        "streams": grouped,
+    })
+
+
 # ── Leaderboard ───────────────────────────────────────────────────────────────
 
 # Metrics where lower is better (ascending sort)
@@ -2062,6 +2634,8 @@ def webhook_trigger():
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
 
+    env_overrides = _resolve_run_insights_env_overrides(payload.get("flags", {}) or {})
+
     with _runs_lock:
         _runs[run_id] = {
             "id": run_id,
@@ -2084,7 +2658,12 @@ def webhook_trigger():
             "ab_id":        None,
         }
 
-    threading.Thread(target=_run_worker, args=(run_id, cmd, stdin_text), daemon=True).start()
+    threading.Thread(
+        target=_run_worker,
+        args=(run_id, cmd, stdin_text),
+        kwargs={"env_overrides": env_overrides},
+        daemon=True,
+    ).start()
     return jsonify({"run_id": run_id, "queued": True})
 
 
@@ -2278,6 +2857,84 @@ def _mask_api_key(key: str) -> str:
     return key[:4] + "..." + key[-4:] if len(key) > 8 else "sk-..."
 
 
+def _ipv6_embedded_v4(addr: "ipaddress.IPv6Address") -> Optional["ipaddress.IPv4Address"]:
+    """Extract an embedded IPv4 address from various IPv6 forms.
+
+    v1.1.0 fourth-pass (F-2): closes the SSRF bypass where attackers
+    pass `::10.0.0.1`, `::192.168.1.1` (RFC 4291 §2.5.5.1 deprecated
+    IPv4-compatible form), `2002:0a00:0001::` (RFC 3056 6to4 wrapping
+    a private v4), or `64:ff9b::10.0.0.1` (RFC 6052 NAT64 well-known
+    prefix wrapping a private v4).  Python's
+    ``ipaddress.ip_address.is_global`` reports True for all of these
+    because they fall in the IPv6 unicast space; only the
+    ``::ffff:w.x.y.z`` 4-mapped form has the explicit ``ipv4_mapped``
+    accessor.  This helper detects all four embedding patterns.
+    """
+    # 1. IPv4-mapped (::ffff:w.x.y.z) — handled by stdlib accessor.
+    mapped = getattr(addr, "ipv4_mapped", None)
+    if mapped is not None:
+        return mapped
+    # 2. IPv4-compatible (::w.x.y.z, deprecated RFC 4291 §2.5.5.1).
+    #    Identified by the upper 96 bits being zero.
+    packed = addr.packed  # 16 bytes
+    if packed[:12] == b"\x00" * 12 and packed[12:] != b"\x00\x00\x00\x00":
+        try:
+            return ipaddress.IPv4Address(packed[12:])
+        except (ValueError, ipaddress.AddressValueError):
+            return None
+    # 3. 6to4 (2002:wxyz:abcd::/16, RFC 3056) — wraps an IPv4 in
+    #    bits 16-47 (the next 32 bits after the 0x2002 prefix).
+    if packed[:2] == b"\x20\x02":
+        try:
+            return ipaddress.IPv4Address(packed[2:6])
+        except (ValueError, ipaddress.AddressValueError):
+            return None
+    # 4. NAT64 well-known prefix (64:ff9b::/96, RFC 6052) — wraps an
+    #    IPv4 in the final 32 bits.
+    if packed[:12] == b"\x00\x64\xff\x9b" + b"\x00" * 8:
+        try:
+            return ipaddress.IPv4Address(packed[12:])
+        except (ValueError, ipaddress.AddressValueError):
+            return None
+    return None
+
+
+def _addr_is_safe(addr: "ipaddress._BaseAddress") -> bool:
+    """Return True iff *addr* is a globally-reachable unicast address
+    that we should permit outbound traffic to.
+
+    Recursively unwraps IPv4-embedded-in-IPv6 forms — an IPv6 address
+    that embeds a private IPv4 is itself unsafe, even if the IPv6
+    bits would otherwise pass ``is_global``.
+
+    v1.1.0 fifth-pass (G-2): Python's ``is_global`` returns True for
+    multicast (224.0.0.0/4 IPv4 + ff00::/8 IPv6), reserved, and the
+    "unspecified" 0.0.0.0/:: ranges — verified live with CPython 3.x
+    that ``IPv4Address('224.0.0.1').is_global is True`` and
+    ``IPv4Address('239.255.255.250').is_global is True`` (SSDP/UPnP).
+    Without explicit rejection a NOTIFY_WEBHOOK_URL of
+    ``http://239.255.255.250/`` would broadcast the payload across
+    every host on the LAN.  Reject all non-unicast-global ranges.
+    """
+    if isinstance(addr, ipaddress.IPv6Address):
+        embedded = _ipv6_embedded_v4(addr)
+        if embedded is not None:
+            return _addr_is_safe(embedded)  # recurse for full check
+    # Reject multicast / reserved / unspecified / loopback / link-local
+    # even when is_global would mis-report True.  is_global is a
+    # necessary but not sufficient condition for "safe to make an
+    # outbound request to" — the additional predicates close the gap.
+    if (
+        addr.is_multicast
+        or addr.is_reserved
+        or addr.is_unspecified
+        or addr.is_loopback
+        or addr.is_link_local
+    ):
+        return False
+    return bool(addr.is_global)
+
+
 def _is_safe_url(url: str) -> bool:
     """Return True if *url* points to a public (non-private) HTTPS/HTTP host.
 
@@ -2285,6 +2942,25 @@ def _is_safe_url(url: str) -> bool:
     SSRF when the server makes outbound requests on behalf of a user.
     Ollama (localhost) is intentionally allowed via the ``allow_localhost``
     flag on the caller side — this function is strict by default.
+
+    v1.1.0 third-pass hardening:
+
+    * Reject userinfo components (``http://attacker.com@public.example``
+      pattern) — ``urlparse`` returns the post-@ host as ``hostname``
+      but ``urlopen`` honours the userinfo; without this guard a
+      malicious URL with userinfo could smuggle credentials past the
+      check.
+    * Reject IPv6 zone-id syntax (``fe80::1%eth0``) — these are link-
+      local by definition.
+    * Reject IPv4-mapped IPv6 (``::ffff:10.0.0.1``) whose underlying
+      address is private even if ``is_global`` mis-reports True on
+      older Python builds.
+
+    v1.1.0 fourth-pass hardening (F-2): also unwrap IPv4-compatible
+    IPv6 (``::w.x.y.z``), 6to4 (``2002::/16``), and NAT64
+    (``64:ff9b::/96``) forms — all three can embed private IPv4 while
+    ``addr.is_global`` reports True at the IPv6 layer.  See
+    ``_ipv6_embedded_v4``.
     """
     try:
         parsed = urllib.parse.urlparse(url)
@@ -2292,12 +2968,22 @@ def _is_safe_url(url: str) -> bool:
         return False
     if parsed.scheme not in ("http", "https"):
         return False
+    # Userinfo smuggling: ``http://victim@evil.com/`` makes urlparse
+    # return hostname="evil.com" but exposes the userinfo via Auth
+    # headers downstream.  Treat any userinfo as untrusted
+    # (including empty-string username — ``http://@host/`` is rejected
+    # because the presence of the ``@`` itself is suspicious).
+    if parsed.username is not None or parsed.password is not None:
+        return False
     hostname = parsed.hostname
     if not hostname:
         return False
+    # Reject IPv6 scope-id form (link-local by definition).
+    if "%" in hostname:
+        return False
     try:
         addr = ipaddress.ip_address(hostname)
-        return addr.is_global
+        return _addr_is_safe(addr)
     except ValueError:
         pass
     # Hostname is a DNS name — resolve and check all addresses
@@ -2308,11 +2994,115 @@ def _is_safe_url(url: str) -> bool:
     for _fam, _type, _proto, _canon, sockaddr in infos:
         try:
             addr = ipaddress.ip_address(sockaddr[0])
-            if not addr.is_global:
-                return False
         except ValueError:
             return False
+        if not _addr_is_safe(addr):
+            return False
     return True
+
+
+# v1.1.0 fifth-pass (G-3): the default ``urllib.request`` opener
+# transparently follows 30x redirects, which trivially defeats the
+# ``_is_safe_url`` guard.  An attacker-controlled HTTPS endpoint that
+# passes the SSRF check can respond ``302 Location:
+# http://169.254.169.254/latest/meta-data/...`` (AWS IMDS) or
+# ``http://127.0.0.1:5000/api/env`` and ``urlopen`` will dutifully
+# follow — sending any Authorization Bearer header to the internal
+# host.  ``_safe_urlopen`` rejects 30x responses by default, then
+# manually re-validates the new URL through ``_is_safe_url`` and
+# re-issues the request, capped at ``max_redirects`` hops.
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Suppresses automatic redirect following in the urllib opener.
+
+    Returning ``None`` from ``redirect_request`` causes
+    ``urllib.request.OpenerDirector`` to surface the original 30x
+    response as an ``HTTPError`` to the caller, who can then decide
+    whether the new location is safe.
+    """
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: D401
+        return None
+
+
+_SAFE_URL_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+
+
+def _safe_urlopen(
+    url: str,
+    *,
+    headers: dict[str, str] | None = None,
+    data: bytes | None = None,
+    method: str = "GET",
+    timeout: float = 5.0,
+    max_redirects: int = 3,
+    allow_localhost: bool = False,
+):
+    """Open *url* with SSRF + redirect-loop protection.
+
+    Re-validates the URL via ``_is_safe_url`` on every hop (including
+    after each redirect), preventing both DNS rebinding mid-retry and
+    "redirect to internal" bypasses.  Returns the urllib response
+    object on success.  Raises ``urllib.error.URLError`` if the URL
+    is blocked or the redirect budget is exhausted.
+
+    ``allow_localhost`` is intentionally ``False`` by default; only
+    the Ollama-validation path opts in (Ollama runs on loopback by
+    design).  All other call sites must keep the default.
+    """
+    seen: set[str] = set()
+    current = url
+    for _hop in range(max_redirects + 1):
+        if current in seen:
+            raise urllib.error.URLError("redirect loop detected")
+        seen.add(current)
+
+        if not (allow_localhost and _is_localhost_url(current)):
+            if not _is_safe_url(current):
+                raise urllib.error.URLError(
+                    "blocked: target resolves to a private/internal "
+                    "address (possibly via redirect)"
+                )
+
+        req = urllib.request.Request(
+            current,
+            data=data,
+            headers=headers or {},
+            method=method,
+        )
+        try:
+            return _SAFE_URL_OPENER.open(req, timeout=timeout)
+        except urllib.error.HTTPError as exc:
+            if exc.code in (301, 302, 303, 307, 308):
+                loc = exc.headers.get("Location") if exc.headers else None
+                if not loc:
+                    raise urllib.error.URLError(
+                        "redirect without Location header"
+                    )
+                current = urllib.parse.urljoin(current, loc)
+                # On 303 + GET-with-body, the next hop must be GET-no-body
+                # per RFC 7231 §6.4.4; we also force-clear body on 301/302
+                # for POSTs to avoid replaying the request body to a
+                # potentially-different endpoint.
+                if exc.code in (301, 302, 303):
+                    method = "GET"
+                    data = None
+                continue
+            raise
+    raise urllib.error.URLError(
+        f"too many redirects (>{max_redirects})"
+    )
+
+
+def _is_localhost_url(url: str) -> bool:
+    """Lightweight check used by ``_safe_urlopen(allow_localhost=True)``.
+
+    Conservative: any parse failure → False (default to safe rejection).
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+    except Exception:
+        return False
+    host = (parsed.hostname or "").lower()
+    return host in ("localhost", "127.0.0.1", "::1")
 
 
 @app.route("/api/env/validate", methods=["POST"])
@@ -2338,16 +3128,35 @@ def api_env_validate():
 
     t_start = time.monotonic()
 
-    def _do_request(url: str, headers: dict[str, str], timeout: float) -> tuple[int, str | None]:
-        """Returns (status_code, error_str_or_None)."""
-        req = urllib.request.Request(url, headers=headers, method="GET")
+    def _do_request(
+        url: str,
+        headers: dict[str, str],
+        timeout: float,
+        *,
+        allow_localhost: bool = False,
+    ) -> tuple[int, str | None]:
+        """Returns (status_code, error_str_or_None).
+
+        v1.1.0 fifth-pass (G-3): routed through ``_safe_urlopen`` so
+        that 30x responses from an attacker-controlled endpoint cannot
+        smuggle a request to ``169.254.169.254`` (AWS IMDS) or
+        ``127.0.0.1`` past the SSRF check.  The Authorization header
+        previously rode along on every auto-follow — a real cred-leak
+        primitive.
+        """
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with _safe_urlopen(
+                url,
+                headers=headers,
+                method="GET",
+                timeout=timeout,
+                allow_localhost=allow_localhost,
+            ) as resp:
                 return resp.status, None
         except urllib.error.HTTPError as exc:
             return exc.code, None  # HTTP error but reachable
         except urllib.error.URLError as exc:
-            return -1, str(exc.reason)
+            return -1, str(getattr(exc, "reason", exc))
         except Exception as exc:
             return -1, str(exc)
 
@@ -2378,11 +3187,14 @@ def api_env_validate():
             # Ollama intentionally runs on localhost — only allow loopback
             _parsed = urllib.parse.urlparse(base_url)
             _host = (_parsed.hostname or "").lower()
-            if _host not in ("localhost", "127.0.0.1", "::1"):
+            _is_loopback = _host in ("localhost", "127.0.0.1", "::1")
+            if not _is_loopback:
                 if not _is_safe_url(base_url):
                     return jsonify({"error": "Ollama base_url must be localhost or a public host"}), 400
             url = base_url + "/api/tags"
-            status_code, error_msg = _do_request(url, {}, timeout=3.0)
+            status_code, error_msg = _do_request(
+                url, {}, timeout=3.0, allow_localhost=_is_loopback,
+            )
 
     except Exception as exc:
         # Prevent any accidental key leakage in generic exception messages
@@ -2603,6 +3415,9 @@ def api_ab_test_run():
     except ValueError as exc:
         return jsonify({"error": f"variant_b error: {exc}"}), 400
 
+    env_overrides_a = _resolve_run_insights_env_overrides(variant_a.get("flags", {}) or {})
+    env_overrides_b = _resolve_run_insights_env_overrides(variant_b.get("flags", {}) or {})
+
     run_id_a = uuid.uuid4().hex[:8]
     run_id_b = uuid.uuid4().hex[:8]
 
@@ -2635,8 +3450,18 @@ def api_ab_test_run():
             "created_at": now,
         }
 
-    threading.Thread(target=_run_worker, args=(run_id_a, cmd_a, stdin_a), daemon=True).start()
-    threading.Thread(target=_run_worker, args=(run_id_b, cmd_b, stdin_b), daemon=True).start()
+    threading.Thread(
+        target=_run_worker,
+        args=(run_id_a, cmd_a, stdin_a),
+        kwargs={"env_overrides": env_overrides_a},
+        daemon=True,
+    ).start()
+    threading.Thread(
+        target=_run_worker,
+        args=(run_id_b, cmd_b, stdin_b),
+        kwargs={"env_overrides": env_overrides_b},
+        daemon=True,
+    ).start()
 
     return jsonify({"ab_id": ab_id, "run_id_a": run_id_a, "run_id_b": run_id_b})
 
@@ -2794,31 +3619,75 @@ def _send_notification_with_retry(
     Returns a summary dict: {success, attempts, last_status_code, last_error}.
     Exponential backoff delays: 1s, 2s, 4s (doubling, up to max_attempts).
     Never logs or exposes raw secrets present in ``payload``.
+
+    v1.1.0: pipeline-driven notifications now go through the same SSRF
+    guard used by ``/api/notify/test``.  Any URL resolving to a private,
+    loopback, link-local, or unspecified address is refused without
+    making the outbound request.
     """
-    body_bytes = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    if not _is_safe_url(url):
+        return {
+            "success":          False,
+            "attempts":         0,
+            "last_status_code": -1,
+            "last_error":       "blocked: target resolves to a private/internal address",
+        }
+
+    body_bytes = json.dumps(payload, ensure_ascii=False).encode(
+        "utf-8"
+    )
     last_status = -1
     last_error: str | None = None
     success = False
     attempt = 0  # ensures defined in return even if max_attempts <= 0
 
     for attempt in range(1, max_attempts + 1):
+        # v1.1.0 third-pass: re-validate the URL on every attempt.  A
+        # hostile DNS server with TTL=0 can flip ``example.com`` from
+        # a public address to ``192.168.1.1`` between attempts, and
+        # the up-front ``_is_safe_url`` call would not catch the
+        # second-attempt rebinding.  Re-checking each loop closes the
+        # DNS-rebinding window down to the time between guard and
+        # urlopen (a few milliseconds).
+        if not _is_safe_url(url):
+            last_error = (
+                "blocked: target now resolves to a private/internal "
+                "address (DNS may have rebinded mid-retry)"
+            )
+            last_status = -1
+            break
+
         ts = time.time()
         status_code = -1
         error_msg: str | None = None
 
         try:
-            req = urllib.request.Request(
+            # v1.1.0 fifth-pass (G-3): use the redirect-aware safe
+            # opener so a webhook receiver responding 302 to a
+            # private/internal address can't smuggle the request
+            # body to an internal endpoint.  ``_safe_urlopen`` clears
+            # the body on 301/302/303 per RFC 7231 §6.4 to avoid
+            # replaying the payload to a potentially-different host.
+            with _safe_urlopen(
                 url,
-                data=body_bytes,
+                # v1.1.0 fourth-pass: revert to bare ``application/json``.
+                # RFC 8259 explicitly states JSON's encoding is UTF-8 and
+                # the charset parameter is not part of the registered
+                # media type; some strict webhook receivers (older Slack
+                # / Discord variants) reject ``application/json;
+                # charset=utf-8`` with a 400.  Body bytes are already
+                # UTF-8 (json.dumps → .encode("utf-8")), so the
+                # ``charset=utf-8`` suffix was pure surface area.
                 headers={"Content-Type": "application/json"},
+                data=body_bytes,
                 method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                timeout=timeout,
+            ) as resp:
                 status_code = resp.status
         except urllib.error.HTTPError as exc:
             status_code = exc.code
         except urllib.error.URLError as exc:
-            error_msg = str(exc.reason)
+            error_msg = str(getattr(exc, "reason", exc))
         except Exception as exc:
             error_msg = str(exc)
 
@@ -2864,11 +3733,27 @@ def api_notify_test():
 
     Uses the retry logic from _send_notification_with_retry.
 
+    v1.1.0: SSRF guard.  ``NOTIFY_WEBHOOK_URL`` is operator-controlled, but
+    a malicious page that already passed the X-Requested-With check (e.g. a
+    same-origin XSS) could set the env value to ``http://192.168.1.1/admin``
+    and then trigger ``/api/notify/test`` to make the Flask server fire a
+    request from its own network position.  We refuse to call out to any
+    URL that resolves to a private / loopback / link-local address.
+
     Response: {"success": bool, "attempts": int, "last_status_code": int, "last_error": str|null}
     """
     notify_url = os.environ.get("NOTIFY_WEBHOOK_URL", "").strip()
     if not notify_url:
         return jsonify({"error": "NOTIFY_WEBHOOK_URL is not configured"}), 503
+    if not _is_safe_url(notify_url):
+        return jsonify({
+            "error": "NOTIFY_WEBHOOK_URL resolves to a private or loopback address",
+            "detail": (
+                "Refusing to call out to private network ranges (RFC 1918), "
+                "loopback, link-local, or unspecified addresses. Configure "
+                "NOTIFY_WEBHOOK_URL to a public HTTPS endpoint instead."
+            ),
+        }), 400
 
     result = _send_notification_with_retry(
         url=notify_url,

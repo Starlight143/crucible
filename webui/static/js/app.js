@@ -1,3 +1,66 @@
+// ─── v1.1.0: CSRF hardening — auto-attach X-Requested-With to state-mutating ──
+// fetch calls.  The backend (webui/app.py:_enforce_xhr_header_on_state_changes)
+// requires this header on POST/PUT/PATCH/DELETE to ``/api/*`` so a malicious
+// cross-origin page cannot trigger pipeline runs / settings rewrites / SSRF
+// by initiating a simple-CORS request from the operator's logged-in browser.
+// We patch the global ``fetch`` once at module load so every call site —
+// including any future code that doesn't explicitly set the header — is
+// covered.  The header is harmless for GET / HEAD / OPTIONS (the backend
+// only enforces on unsafe methods); we attach it unconditionally for
+// API URLs because the cost is negligible and the failure mode (header
+// missing → silent 403) is hostile to debug.
+(function _installXhrHeaderShim() {
+  const _MUTATING = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+  const _origFetch = window.fetch.bind(window);
+  window.fetch = function (input, init) {
+    try {
+      const opts = init || {};
+      const method = String(opts.method || (input && input.method) || 'GET').toUpperCase();
+      // Resolve URL for the same-origin / api-prefix check.
+      let urlStr = '';
+      try {
+        urlStr = typeof input === 'string' ? input : (input && input.url) || '';
+      } catch (_e) { urlStr = ''; }
+      if (_MUTATING.has(method) && urlStr) {
+        // v1.1.0 third-pass: pathname-strict, same-origin match.
+        // The previous ``indexOf('/api/')`` test leaked the header
+        // to any third-party endpoint whose URL happened to contain
+        // ``/api/`` (mostly harmless, but a privacy leak — the
+        // operator's XHR pattern is broadcast to arbitrary origins).
+        // Now we resolve the URL against the current origin and
+        // require both ``parsed.origin === location.origin`` AND
+        // ``parsed.pathname.startsWith('/api/')`` before attaching.
+        let isLocalApi = false;
+        try {
+          const parsed = new URL(urlStr, window.location.origin);
+          isLocalApi = parsed.origin === window.location.origin
+            && parsed.pathname.startsWith('/api/');
+        } catch (_e) {
+          // v1.1.0 fourth-pass: fail CLOSED on malformed URLs.  The
+          // previous fallback (``urlStr.indexOf('/api/') === 0``)
+          // re-introduced the exact privacy leak T18 fixed — a
+          // string starting with literal ``/api/`` could be a
+          // cross-origin third-party URL.  Failing closed means a
+          // mutating fetch to an unparseable URL won't carry the
+          // X-Requested-With header — backend rejects with 403,
+          // which is easy to debug; the alternative (leak header
+          // to arbitrary origin) is a privacy regression.
+          isLocalApi = false;
+        }
+        if (isLocalApi) {
+          const headers = new Headers(opts.headers || {});
+          if (!headers.has('X-Requested-With')) {
+            headers.set('X-Requested-With', 'XMLHttpRequest');
+          }
+          const newOpts = Object.assign({}, opts, { headers });
+          return _origFetch(input, newOpts);
+        }
+      }
+    } catch (_e) { /* fall through to original fetch */ }
+    return _origFetch(input, init);
+  };
+})();
+
 // ─── State ──────────────────────────────────────────────────────────────────────
 const State = {
   pages:         { project: { analysisType: 1 }, idea: { analysisType: 1 } },
@@ -211,6 +274,15 @@ const FLAG_META = {
   cointegration:         { label:'Cointegration',        modes:'b', types:[1], desc:{en:'Pure-Python ADF cointegration test (MacKinnon 1994 critical values, AIC lag selection) + OLS hedge ratio + spread half-life + Z-score signal (BUY/SELL/HOLD).\nUse case: identify pairs-trade candidates and generate stat-arb signals.', zh:'純 Python ADF 協整檢定（MacKinnon 1994 臨界值、AIC 選階）+ OLS 對沖比率 + spread 半衰期 + Z-Score 信號（BUY/SELL/HOLD）。\n用途：識別可配對交易的資產對，生成統計套利信號。'} },
   dynamic_correlation:   { label:'Dyn. Correlation',     modes:'b', types:[1], desc:{en:'Rolling-window Pearson correlation matrix snapshots + power-iteration PCA (pure Python, no numpy) + diversification score.\nUse case: track how cross-asset correlations evolve over time; detect correlation spikes (de-diversification) as risk events.', zh:'滾動窗口 Pearson 相關矩陣快照 + power iteration PCA（純 Python，無 numpy）+ 分散化評分。\n用途：追蹤資產間相關性的時間演變，偵測相關性驟升（去分散化）等風險事件。'} },
   lockfile_gen:          { label:'Lockfile Gen',         modes:'b', types:[1], desc:{en:'AST-scan the imports of the generated code, resolve package versions, and emit pyproject.toml + requirements.txt + requirements-dev.txt + .python-version.\nUse case: lock the install environment for reproducible deployment to production or CI.', zh:'AST 掃描產出程式碼的 import，解析套件版本，生成 pyproject.toml + requirements.txt + requirements-dev.txt + .python-version。\n用途：確保產出程式碼可重現安裝環境，適合部署至生產或 CI 環境。'} },
+  // Run Insights Ledger — per-run toggles for the cross-run telemetry recorder.
+  // Each maps to a CRUCIBLE_RUN_INSIGHTS_* env var; checkbox state syncs from
+  // /api/env at startup (see _refreshEnvCacheAndRerender) so the panel always
+  // shows the real recorder state, not just a hardcoded default.
+  run_insights_enabled:       { label:'Run Insights',        modes:'b', types:[1,2,3,4], isDefault:true, desc:{en:'Master switch for the run insights ledger (cross-run telemetry written to .crucible_insights/).\nUse case: turn off all four streams (output / error / debate / params) for a single run without editing .env.\nSyncs from CRUCIBLE_RUN_INSIGHTS_ENABLED on page load.', zh:'Run Insights ledger 總開關（跨 run 遙測，寫入 .crucible_insights/）。\n用途：單次 run 想關掉全部四個 stream（output / error / debate / params）時用，不需改 .env。\n載入時自動從 CRUCIBLE_RUN_INSIGHTS_ENABLED 同步狀態。'} },
+  run_insights_record_output: { label:'Record Output',       modes:'b', types:[1,2,3,4], isDefault:true, desc:{en:'Record output_method events after each save_project_output (primary/judge/librarian model IDs, framework, validation verdict, entrypoint, artefact names).\nUse case: lets v1.2.0 retrieval reproduce which model + config produced a given result.', zh:'每次 save_project_output 後紀錄 output_method 事件（primary/judge/librarian 模型 ID、框架、驗證 verdict、entrypoint、產物名）。\n用途：讓 v1.2.0 retrieval 知道某個結果是哪個模型 + 配置產生的，方便重現。'} },
+  run_insights_record_errors: { label:'Record Errors',       modes:'b', types:[1,2,3,4], isDefault:true, desc:{en:'Record error_record events when kickoff_crew_with_retry exhausts its retry budget (exception class, first 300 chars of the message, retry count).\nUse case: build a failure history to detect systematic regression vs transient flakes.', zh:'kickoff_crew_with_retry 重試次數用盡時紀錄 error_record 事件（exception class、訊息前 300 字元、重試次數）。\n用途：建立失敗歷史，分辨系統性回歸 vs 偶發失敗。'} },
+  run_insights_record_debate: { label:'Record Debate',       modes:'b', types:[1,2,3,4], isDefault:true, desc:{en:'Record direction_debate_rejection events when Stage 0 force-none gate trips or fallback parsing fails.\nUse case: track which directions get rejected so v1.2.0 retrieval can avoid suggesting them again.', zh:'Stage 0 force-none gate 觸發或 fallback parsing 失敗時紀錄 direction_debate_rejection 事件。\n用途：追蹤哪些方向被拒絕，讓 v1.2.0 retrieval 避免再次推薦相同方向。'} },
+  run_insights_redact:        { label:'Redact Secrets',      modes:'b', types:[1,2,3,4], isDefault:true, desc:{en:'Walk every event payload recursively and redact API keys, bearer tokens, OAuth secrets, and password-like fields before writing to disk.\nUse case: safe to keep on for shared dev machines or before pushing the archive to cloud storage.', zh:'寫檔前遞迴遍歷每筆 event payload，遮蓋 API key、bearer token、OAuth secret、password 類欄位。\n用途：共用開發機或上傳 archive 到雲端前都應該保持開啟。'} },
 };
 
 // Extended Modules — 25 optional post-processing modules rendered as a
@@ -289,6 +361,9 @@ const FLAG_GROUPS = [
       { key:'multilang_langs',   label:'Languages (comma-sep)',     ph:'typescript,go',          kind:'text',  modes:'b', types:[2,3], tip:{en:'Comma-separated list of languages for Multilang Codegen. Default: typescript,go. Add python, rust, etc.', zh:'Multilang Codegen 要產出的語言列表，逗號分隔。預設 typescript,go。可加 python, rust 等。'} },
       { key:'github_repo',       label:'GitHub Repo (owner/repo)', ph:'openai/openai-python',   kind:'text',  modes:'b', types:[2,3], tip:{en:'GitHub repository to analyse (format: owner/repo). The system fetches README, issues, and structure as context.', zh:'要分析的 GitHub repository（格式 owner/repo）。系統自動抓取 README、issues、結構作為 context。'} },
     ]},
+  { id:'run_insights', title:'Run Insights Ledger',   icon:'📚', open:false,
+    flags:['run_insights_enabled','run_insights_record_output','run_insights_record_errors',
+           'run_insights_record_debate','run_insights_redact'] },
   { id:'quant',      title:'Quant Analytics Suite',   icon:'📊', open:false,
     flags:['quant_analytics','walk_forward','significance_test','regime_detection',
            'factor_analysis','transaction_cost','monte_carlo','tearsheet',
@@ -319,6 +394,117 @@ const FLAG_GROUPS = [
       { key:'external_end',     label:'End Date',             ph:'',                             kind:'date', modes:'b', types:[1], tip:{en:'End date for historical data (YYYY-MM-DD). Defaults to today if blank.', zh:'歷史數據的結束日期（YYYY-MM-DD）。留空預設為今天。'} },
     ]},
 ];
+
+// ─── /api/env cache for flag-panel sync ─────────────────────────────────────
+// The Idea / Path flag panels render BEFORE any /api/env fetch (renderFlagGroups
+// is synchronous), so we lazily populate this cache after the first fetch and
+// re-render the panels.  Today only the Run Insights ledger flags consult it —
+// they map to CRUCIBLE_RUN_INSIGHTS_* env vars (see ENV_BACKED_FLAGS) and the
+// user expects toggling them in Settings to sync into the flag panel without
+// hard-reloading.  The Settings page maintains its own cache via loadSettings(),
+// so this is a separate, smaller cache that only stores what we actually need.
+let _ENV_CACHE = {};
+
+// Maps a frontend per-run flag key → backend env var name.  Drives the
+// initial checkbox state in the Idea / Path flag panels so toggles that
+// the operator has switched on via Settings (or directly in ``.env``)
+// render as checked + ON badge in the per-run panel.  Must stay in
+// lockstep with ``_FLAG_TO_ENV`` in ``webui/app.py`` — that one drives
+// subprocess env overrides at run time.  Mappings verified against actual
+// ``env_bool(...)`` / ``os.environ.get(...)`` call sites in the pipeline
+// (see ``run_crucible_enhanced.py`` and ``crucible/modules/section_*.py``);
+// flags with no env counterpart (pure per-run CLI flags) — ``dry_run``,
+// ``self_check``, ``direction_debate``, ``direction_debate_only``,
+// ``cost_report``, ``codegen_auto_optimize``, ``diff_aware``, ``notify`` —
+// are intentionally NOT listed: they keep their hardcoded ``isDefault``
+// behaviour because there is no env value to sync from.
+const ENV_BACKED_FLAGS = {
+  // Run Insights ledger
+  run_insights_enabled:       'CRUCIBLE_RUN_INSIGHTS_ENABLED',
+  run_insights_record_output: 'CRUCIBLE_RUN_INSIGHTS_RECORD_OUTPUT',
+  run_insights_record_errors: 'CRUCIBLE_RUN_INSIGHTS_RECORD_ERRORS',
+  run_insights_record_debate: 'CRUCIBLE_RUN_INSIGHTS_RECORD_DEBATE',
+  run_insights_redact:        'CRUCIBLE_RUN_INSIGHTS_REDACT',
+  // Analysis flags
+  strict_json:                'STRICT_JSON',
+  cost_trace:                 'COST_TRACE',
+  cache:                      'LOCAL_CACHE',
+  gate_control:               'GATE_CONTROL_ENABLED',
+  selective_rerun:            'SELECTIVE_RERUN_ENABLED',
+  api_version_check:          'API_VERSION_CHECK_ENABLED',
+  // Post-processing (Enhanced features)
+  use_memory:                 'ENHANCED_PROJECT_MEMORY',
+  security_scan:              'ENHANCED_SECURITY_SCAN',
+  deployment_artifacts:       'ENHANCED_DEPLOYMENT_ARTIFACTS',
+  generate_tests:             'ENHANCED_GENERATE_TESTS',
+  api_autopatch:              'ENHANCED_API_AUTOPATCH',
+  independent_validation:     'ENHANCED_INDEPENDENT_VALIDATION',
+  ci_output:                  'ENHANCED_CI_OUTPUT',
+  auto_remediation:           'ENHANCED_AUTO_REMEDIATION',
+  dependency_audit:           'ENHANCED_DEPENDENCY_AUDIT',
+  html_report:                'ENHANCED_HTML_REPORT',
+  code_quality:               'ENHANCED_CODE_QUALITY',
+  run_registry:               'ENHANCED_RUN_REGISTRY',
+  // Advanced features
+  interactive:                'ENHANCED_INTERACTIVE',
+  dedup_check:                'ENHANCED_DEDUP_CHECK',
+  backtest_runner:            'ENHANCED_BACKTEST_RUNNER',
+  post_chat:                  'ENHANCED_POST_CHAT',
+  agent_metrics:              'ENHANCED_AGENT_METRICS',
+  ingest_docs:                'ENHANCED_INGEST_DOCS',
+  multilang_codegen:          'ENHANCED_MULTILANG_CODEGEN',
+  lockfile_gen:               'ENHANCED_LOCKFILE_GEN',
+  // Quant Analytics Suite
+  quant_analytics:            'ENHANCED_QUANT_ANALYTICS',
+  walk_forward:               'ENHANCED_WALK_FORWARD',
+  significance_test:          'ENHANCED_SIGNIFICANCE_TEST',
+  regime_detection:           'ENHANCED_REGIME_DETECTION',
+  factor_analysis:            'ENHANCED_FACTOR_ANALYSIS',
+  transaction_cost:           'ENHANCED_TRANSACTION_COST',
+  monte_carlo:                'ENHANCED_MONTE_CARLO',
+  tearsheet:                  'ENHANCED_TEARSHEET',
+  signal_analysis:            'ENHANCED_SIGNAL_ANALYSIS',
+  risk_attribution:           'ENHANCED_RISK_ATTRIBUTION',
+  cointegration:              'ENHANCED_COINTEGRATION',
+  dynamic_correlation:        'ENHANCED_DYNAMIC_CORRELATION',
+};
+
+// Mirror of the Python _env_bool whitelist (see ~/.claude/CLAUDE.md "numerical
+// correctness").  Returns true / false for explicit values, null for unset or
+// unrecognised values — caller decides the fallback (usually FLAG_META.isDefault).
+function _envBoolTruthy(raw) {
+  if (raw == null) return null;
+  const s = String(raw).trim().toLowerCase();
+  if (s === '') return null;
+  if (s === '1' || s === 'true' || s === 'yes' || s === 'on')  return true;
+  if (s === '0' || s === 'false' || s === 'no'  || s === 'off') return false;
+  return null;
+}
+
+// For env-backed flags, the env value (when set) wins over FLAG_META.isDefault.
+// For all other flags, the hardcoded default is returned unchanged.
+function _resolveFlagInitialChecked(key, fallbackDefault) {
+  const envKey = ENV_BACKED_FLAGS[key];
+  if (envKey) {
+    const v = _envBoolTruthy(_ENV_CACHE[envKey]);
+    if (v !== null) return v;
+  }
+  return !!fallbackDefault;
+}
+
+// Fetches /api/env once at init, populates _ENV_CACHE, and re-renders both
+// flag panels so the previously hardcoded defaults are replaced by the real
+// env state.  Failure is non-fatal — the panels keep the FLAG_META defaults.
+async function _refreshEnvCacheAndRerender() {
+  try {
+    const r = await fetch('/api/env');
+    if (!r.ok) return;
+    const data = await r.json();
+    if (data && typeof data === 'object') _ENV_CACHE = data;
+  } catch (e) { /* offline / backend down — keep defaults */ }
+  try { renderFlagGroups('project', getCurrentAnalysisType('project')); } catch (e) {}
+  try { renderFlagGroups('idea',    getCurrentAnalysisType('idea'));    } catch (e) {}
+}
 
 // ─── Flag visibility ─────────────────────────────────────────────────────────────
 function _flagVisible(itemModes, itemTypes, pageMode, analysisType) {
@@ -365,7 +551,12 @@ function renderFlagGroups(mode, analysisType) {
       html += '<div class="checkbox-grid">';
       visFlags.forEach(k => {
         const m = FLAG_META[k];
-        html += cbItem(mode, k, m.label, m.desc, !!m.isDefault);
+        // Env-backed flags (run_insights_*) read their initial state from
+        // _ENV_CACHE so the panel reflects the actual recorder configuration
+        // rather than a hardcoded default.  All other flags keep the
+        // FLAG_META.isDefault behaviour unchanged.
+        const initialChecked = _resolveFlagInitialChecked(k, m.isDefault);
+        html += cbItem(mode, k, m.label, m.desc, initialChecked);
       });
       html += '</div>';
     }
@@ -1364,17 +1555,186 @@ function _drawAgentFlow(container, graphDef, agentStates) {
 // ─── View switcher ────────────────────────────────────────────
 function switchView(mode, view, btn) {
   State.activeView[mode] = view;
-  document.getElementById(`vtab-terminal-${mode}`).classList.toggle('vt-active', view==='terminal');
-  document.getElementById(`vtab-agentflow-${mode}`).classList.toggle('vt-active', view==='agentflow');
+  // tab highlights
+  const _vtT = document.getElementById(`vtab-terminal-${mode}`);
+  const _vtA = document.getElementById(`vtab-agentflow-${mode}`);
+  const _vtI = document.getElementById(`vtab-insights-${mode}`);
+  if (_vtT) _vtT.classList.toggle('vt-active', view==='terminal');
+  if (_vtA) _vtA.classList.toggle('vt-active', view==='agentflow');
+  if (_vtI) _vtI.classList.toggle('vt-active', view==='insights');
+  // panel visibility
   const tw = document.getElementById(`terminal-wrap-${mode}`);
   const ap = document.getElementById(`agentflow-panel-${mode}`);
-  if (view === 'terminal') {
-    if (tw) tw.style.display = '';
-    if (ap) ap.classList.remove('af-visible');
-  } else {
-    if (tw) tw.style.display = 'none';
-    if (ap) ap.classList.add('af-visible');
+  const ip = document.getElementById(`insights-panel-${mode}`);
+  if (tw) tw.style.display = (view === 'terminal') ? '' : 'none';
+  if (ap) ap.classList.toggle('af-visible', view === 'agentflow');
+  if (ip) ip.classList.toggle('insights-visible', view === 'insights');
+  if (view === 'agentflow') {
     _refreshAgentFlow(mode);
+  } else if (view === 'insights') {
+    _refreshInsightsPanel(mode);
+  }
+}
+
+// ─── Run Insights view ────────────────────────────────────────
+// v1.1.0: fetch and render the per-run insights ledger for the active
+// session.  The panel reads ``State.activeSession[mode]`` to find the
+// run_id, then hits ``GET /api/run/<run_id>/insights``.
+async function _refreshInsightsPanel(mode) {
+  const sessId = State.activeSession && State.activeSession[mode];
+  const body = document.getElementById(`insights-body-${mode}`);
+  const meta = document.getElementById(`insights-meta-${mode}`);
+  if (!body) return;
+  if (!sessId) {
+    if (meta) meta.textContent = 'no session selected';
+    body.innerHTML = '<div class="af-empty">Start a run, or pick a session from the bar above.</div>';
+    return;
+  }
+  const sess = _getSession(sessId);
+  if (!sess || !sess.run_id) {
+    if (meta) meta.textContent = 'session has no run_id yet';
+    body.innerHTML = '<div class="af-empty">Waiting for the run to register a run_id…</div>';
+    return;
+  }
+  if (meta) meta.textContent = `run_id=${sess.run_id}`;
+  body.innerHTML = '<div class="af-empty">Loading insights…</div>';
+  try {
+    const resp = await fetch(`/api/run/${encodeURIComponent(sess.run_id)}/insights`);
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    body.innerHTML = _renderInsightsForRun(data);
+  } catch (err) {
+    // v1.1.0 fifth-pass (G-23): use the centralised _escapeHtml helper
+    // so quotes and apostrophes are escaped consistently with the
+    // other six error-rendering paths in this file.  The prior
+    // strip-only pass missed `"` and `'`, which would have allowed
+    // attribute-context injection if a future refactor moved this
+    // node into an attribute slot.
+    body.innerHTML = `<div class="af-empty">Failed to load insights: ${_escapeHtml(String(err))}</div>`;
+  }
+}
+
+function _escapeHtml(s) {
+  return String(s == null ? '' : s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
+    .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+}
+
+function _renderInsightsForRun(data) {
+  const total = (data && data.total) || 0;
+  if (!total) {
+    return '<div class="af-empty">No insight events recorded for this run yet. Run insights are written when Stage 0 force-nones, retries exhaust, or the project is saved.</div>';
+  }
+  const streamLabels = {
+    output: 'Output Method',
+    error:  'Error Records',
+    debate: 'Direction Debate Rejections',
+    params: 'Runtime Parameters',
+  };
+  const streamIcons = {
+    output: '✅',
+    error:  '⚠️',
+    debate: '⛔',
+    params: '⚙️',
+  };
+  const parts = [`<div class="insights-summary">Total events: <strong>${total}</strong></div>`];
+  ['debate', 'error', 'output', 'params'].forEach((s) => {
+    const events = (data.streams && data.streams[s]) || [];
+    if (!events.length) return;
+    parts.push(
+      `<div class="insights-stream-block">
+         <div class="insights-stream-header">
+           <span class="insights-stream-icon">${streamIcons[s] || '•'}</span>
+           <span class="insights-stream-title">${streamLabels[s] || s}</span>
+           <span class="insights-stream-count">${events.length}</span>
+         </div>
+         <div class="insights-stream-events">
+           ${events.map(_renderInsightEventRow).join('')}
+         </div>
+       </div>`
+    );
+  });
+  return parts.join('');
+}
+
+function _renderInsightEventRow(ev) {
+  const ts = _escapeHtml(ev.ts || '');
+  const stage = _escapeHtml(ev.stage || '');
+  const kind = _escapeHtml(ev.kind || '');
+  const outcome = (ev.outcome && ev.outcome.status) || '';
+  const signals = Array.isArray(ev.signals) ? ev.signals : [];
+  const sigTags = signals.slice(0, 8).map(s =>
+    `<span class="insight-signal-tag">${_escapeHtml(s)}</span>`
+  ).join('');
+  let detail = '';
+  const p = ev.payload || {};
+  if (kind === 'direction_debate_rejection') {
+    detail = `<div class="insight-detail-line"><strong>reason:</strong> ${_escapeHtml(p.rejection_reason || '')}` +
+             (p.judge_verdict_excerpt ? ` &middot; <span class="insight-detail-excerpt">${_escapeHtml(p.judge_verdict_excerpt)}</span>` : '') + '</div>';
+  } else if (kind === 'error_record') {
+    detail = `<div class="insight-detail-line"><strong>${_escapeHtml(p.exception_class || 'Error')}</strong>` +
+             (p.message_head ? ` &middot; <span class="insight-detail-excerpt">${_escapeHtml(p.message_head)}</span>` : '') +
+             ` &middot; retries=${_escapeHtml(p.retry_count == null ? '-' : p.retry_count)}</div>`;
+  } else if (kind === 'output_method') {
+    const parts = [];
+    if (p.primary_model_id) parts.push(`model=${_escapeHtml(p.primary_model_id)}`);
+    if (p.framework) parts.push(`framework=${_escapeHtml(p.framework)}`);
+    if (p.validation_verdict) parts.push(`validation=${_escapeHtml(p.validation_verdict)}`);
+    detail = `<div class="insight-detail-line">${parts.join(' · ')}</div>`;
+  } else if (kind === 'runtime_params') {
+    const flagsCount = p.cli_flags ? Object.keys(p.cli_flags).length : 0;
+    detail = `<div class="insight-detail-line">mode=${_escapeHtml(p.mode || '')} · provider=${_escapeHtml(p.llm_provider || '')} · ${flagsCount} flag(s)</div>`;
+  }
+  const outcomeClass = outcome === 'success' ? 'insight-outcome-success'
+    : outcome === 'failure' ? 'insight-outcome-failure'
+    : outcome === 'partial' ? 'insight-outcome-partial'
+    : 'insight-outcome-neutral';
+  return `<div class="insight-event-row">
+            <div class="insight-event-meta">
+              <span class="insight-event-ts">${ts}</span>
+              <span class="insight-event-stage">${stage}</span>
+              <span class="insight-event-outcome ${outcomeClass}">${_escapeHtml(outcome)}</span>
+            </div>
+            ${detail}
+            ${sigTags ? `<div class="insight-event-tags">${sigTags}</div>` : ''}
+          </div>`;
+}
+
+// Dashboard widget: total events per stream + recent global feed.
+async function loadInsightsDashboard() {
+  const body = document.getElementById('insights-dashboard-body');
+  if (!body) return;
+  try {
+    const resp = await fetch('/api/insights/summary');
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    const data = await resp.json();
+    if (!data || !data.enabled) {
+      body.innerHTML = '<div class="empty-state"><div class="em-icon">⏸</div>Run Insights subsystem is disabled (CRUCIBLE_RUN_INSIGHTS_ENABLED=0).</div>';
+      return;
+    }
+    const streams = data.streams || {};
+    const cells = ['output', 'error', 'debate', 'params'].map(s => {
+      const info = streams[s] || {};
+      return `<div class="insights-mini-stat">
+                <div class="insights-mini-label">${s}.jsonl</div>
+                <div class="insights-mini-value">${(info.lines||0).toLocaleString()}</div>
+              </div>`;
+    }).join('');
+    const recent = Array.isArray(data.recent) ? data.recent : [];
+    const recentList = recent.length
+      ? `<div class="insights-recent-list">${recent.map(_renderInsightEventRow).join('')}</div>`
+      : '<div class="af-empty">No events yet. The ledger fills up as runs complete.</div>';
+    body.innerHTML = `
+      <div class="insights-dashboard-stats">${cells}</div>
+      <div class="insights-dashboard-recent">
+        <div class="insights-section-title">Recent events</div>
+        ${recentList}
+      </div>
+      <div class="insights-dashboard-footer">
+        <small>Ledger root: <code>${_escapeHtml(data.root || '')}</code> · schema v${data.schema_version || 1}</small>
+      </div>`;
+  } catch (err) {
+    body.innerHTML = `<div class="empty-state"><div class="em-icon">⚠</div>Failed to load: ${_escapeHtml(''+err)}</div>`;
   }
 }
 
@@ -1660,6 +2020,10 @@ async function loadDashboard() {
     console.error('Dashboard error:', err);
   }
   loadBudgetStatus();
+  // v1.1.0: also refresh the run-insights widget so dashboard view is consistent.
+  if (typeof loadInsightsDashboard === 'function') {
+    try { loadInsightsDashboard(); } catch (_) {}
+  }
 }
 
 // Client-side filtering of the runs table by search query
@@ -2394,6 +2758,10 @@ const SETTINGS_SCHEMA = [
           'ENHANCED_LOCKFILE_GEN','PROJECT_MEMORY_PROMPT_CHARS','PIPELINE_PROJECT_PROFILE'] },
   { id:'notify', title:'Notifications', icon:'🔔', open:false,
     keys:['NOTIFY_WEBHOOK_URL','NOTIFY_SLACK_WEBHOOK_URL','NOTIFY_DISCORD_WEBHOOK_URL','NOTIFY_ON_FAIL_ONLY'] },
+  { id:'run_insights', title:'Run Insights Ledger', icon:'📚', open:false,
+    keys:['CRUCIBLE_RUN_INSIGHTS_ENABLED','CRUCIBLE_RUN_INSIGHTS_RECORD_OUTPUT','CRUCIBLE_RUN_INSIGHTS_RECORD_ERRORS',
+          'CRUCIBLE_RUN_INSIGHTS_RECORD_DEBATE','CRUCIBLE_RUN_INSIGHTS_RECORD_PARAMS','CRUCIBLE_RUN_INSIGHTS_REDACT',
+          'CRUCIBLE_RUN_INSIGHTS_BACKEND'] },
   { id:'extdata', title:'External Data Connectors', icon:'📡', open:false,
     keys:['ENHANCED_GITHUB_REPO','ALPHA_VANTAGE_API_KEY','ALPHA_VANTAGE_BASE_URL','FRED_API_KEY','FRED_BASE_URL','COINGECKO_BASE_URL','EXTERNAL_DATA_TIMEOUT','EXTERNAL_DATA_MAX_RETRIES',
           'GITHUB_ANALYZER_TIMEOUT','GITHUB_ANALYZER_MAX_RETRIES','GITHUB_ANALYZER_CACHE_TTL'] },
@@ -2404,7 +2772,11 @@ const SETTINGS_SCHEMA = [
   { id:'abtest', title:'A/B Testing', icon:'⚗️', open:false,
     keys:['AB_TEST_TIMEOUT','AB_TEST_PARALLEL'] },
   { id:'backtest', title:'Backtest & Optimisation', icon:'📈', open:false,
-    keys:['ENHANCED_BACKTEST_RUNNER',
+    keys:['ENHANCED_BACKTEST_RUNNER','BACKTEST_REQUIRE_REAL_DATA',
+          'BACKTEST_MIN_REAL_DATA_ROWS','BACKTEST_DATA_CACHE_TTL_HOURS',
+          'BACKTEST_DATA_CACHE_DIR','BACKTEST_DATA_MAX_STALENESS_DAYS',
+          'BACKTEST_SYNTHETIC_SEED','BACKTEST_PREPARE_DATA_ONLY',
+          'BACKTEST_PARALLEL_FETCH',
           'BACKTEST_PARAM_SEARCH','BACKTEST_BAYESIAN_N_TRIALS',
           'BACKTEST_SYMBOL','BACKTEST_DATA_SOURCE','BACKTEST_PERIOD','BACKTEST_INTERVAL',
           'BACKTEST_DATA_ROWS','BACKTEST_INITIAL_CAPITAL','BACKTEST_MAX_COMBOS',
@@ -2435,187 +2807,202 @@ const SETTINGS_SCHEMA = [
 ];
 
 const KEY_META = {
-  LLM_PROVIDER:          { label:'Provider',                  desc:'Which provider powers all LLM calls in this run.',                                  type:'select', opts:[{v:'openrouter',l:'OpenRouter'},{v:'alibaba_coding_plan',l:'Alibaba Coding Plan'},{v:'ollama',l:'Ollama (Local)'}] },
-  OPENROUTER_API_KEY:               { label:'API Key',                      desc:'OpenRouter API key (openrouter.ai/keys).',                                          type:'password' },
+  LLM_PROVIDER:          { label:'Provider',                  desc:{en:'Which provider powers all LLM calls in this run.', zh:'本次執行所有 LLM 呼叫使用的供應商。'},                                  type:'select', opts:[{v:'openrouter',l:'OpenRouter'},{v:'alibaba_coding_plan',l:'Alibaba Coding Plan'},{v:'ollama',l:'Ollama (Local)'}] },
+  OPENROUTER_API_KEY:               { label:'API Key',                      desc:{en:'OpenRouter API key (openrouter.ai/keys).', zh:'OpenRouter API 金鑰（openrouter.ai/keys）。'},                                          type:'password' },
   OPENROUTER_BASE_URL:              { label:'Base URL',                     desc:{en:'OpenRouter API endpoint — every OpenRouter request uses this URL. Override if you use a proxy.', zh:'OpenRouter API 端點。所有 OpenRouter 請求使用此 URL。如使用代理可修改。'},             type:'text' },
-  OPENROUTER_PRIMARY_MODEL:         { label:'Primary Model',                desc:'Main analysis model for the workflow pipeline.',                                    type:'text' },
-  OPENROUTER_DIRECTION_JUDGE_MODEL: { label:'Direction Judge Model',        desc:'Stage 0 direction debate judge model.',                                             type:'text' },
-  OPENROUTER_LIBRARIAN_MODEL:       { label:'Librarian / Research Model',   desc:'Research and document retrieval model.',                                            type:'text' },
-  OPENROUTER_LLM_TIMEOUT_SECONDS:   { label:'Request Timeout (s)',          desc:'Max seconds per OpenRouter LLM request before timeout.',                           type:'number' },
-  ALIBABA_CODING_PLAN_API_KEY:               { label:'API Key',             desc:'Alibaba DashScope API key for Coding Plan.',                                        type:'password' },
-  ALIBABA_CODING_PLAN_BASE_URL:              { label:'Base URL',            desc:'OpenAI-compatible endpoint. Change only if using a proxy.',                         type:'text' },
-  ALIBABA_CODING_PLAN_PRIMARY_MODEL:         { label:'Primary Model',       desc:'Main analysis model.',                                                              type:'text' },
-  ALIBABA_CODING_PLAN_DIRECTION_JUDGE_MODEL: { label:'Direction Judge',     desc:'Stage 0 direction debate judge model.',                                             type:'text' },
-  ALIBABA_CODING_PLAN_LIBRARIAN_MODEL:       { label:'Librarian Model',     desc:'Research and document retrieval model.',                                            type:'text' },
-  ALIBABA_CODING_PLAN_LLM_TIMEOUT_SECONDS:  { label:'Request Timeout (s)', desc:'Max seconds per Alibaba LLM request before timeout. Default: 180.',                  type:'number' },
-  ALIBABA_CODING_PLAN_INITIAL_RESPONSE_TIMEOUT_SECONDS: { label:'Initial Response Timeout (s)', desc:'Max seconds to wait for the first token from Alibaba. Default: 120.', type:'number' },
-  OLLAMA_BASE_URL:               { label:'Ollama Base URL',             desc:'Ollama server API base URL. Default: http://localhost:11434/v1.',                  type:'text' },
-  OLLAMA_PRIMARY_MODEL:          { label:'Primary Model',               desc:'Main analysis model (must be pulled: ollama pull <model>).',                       type:'text' },
-  OLLAMA_DIRECTION_JUDGE_MODEL:  { label:'Direction Judge Model',       desc:'Stage 0 direction debate judge model.',                                             type:'text' },
-  OLLAMA_LIBRARIAN_MODEL:        { label:'Librarian / Research Model',  desc:'Research and document retrieval model.',                                            type:'text' },
-  STRICT_JSON:         { label:'Strict JSON',              desc:'Force all LLM responses to be valid JSON.',                type:'boolean' },
-  COST_TRACE:          { label:'Cost Trace',               desc:'Log per-call token costs to the output stream.',           type:'boolean' },
-  LOCAL_CACHE:         { label:'Local Cache',              desc:'Cache LLM responses to disk to save cost on reruns.',      type:'boolean' },
-  CRUCIBLE_LOG_LEVEL:  { label:'Log Level',              desc:'Python logging verbosity level.',                          type:'select', opts:[{v:'DEBUG',l:'DEBUG'},{v:'INFO',l:'INFO'},{v:'WARNING',l:'WARNING'},{v:'ERROR',l:'ERROR'}] },
-  CRUCIBLE_JSON_LOGS:  { label:'JSON Logs',              desc:'Emit logs in structured JSON format (for log aggregators).', type:'boolean' },
-  LIBRARIAN_INTER_QUERY_DELAY_SECONDS: { label:'Librarian Search Delay (s)', desc:'Minimum delay in seconds between consecutive web-search requests (min 0.5). Increase to 8–15 if DuckDuckGo returns 429 errors. Default: 4.', type:'number' },
-  LIBRARIAN_MAX_RESULTS_PER_QUERY:     { label:'Max Results per Query',      desc:'Max search results fetched per individual web query. Default: 3.',                type:'number' },
-  LIBRARIAN_MAX_CITATIONS:             { label:'Max Citations',              desc:'Upper bound of raw citation candidates collected. Default: 12.',                   type:'number' },
-  LIBRARIAN_MAX_QUERIES_PER_LANE:      { label:'Max Queries per Lane',       desc:'Max search queries fired per research lane. Default: 4.',                          type:'number' },
-  LIBRARIAN_HTTP_TIMEOUT_SECONDS:      { label:'HTTP Timeout (s)',           desc:'Timeout for each citation-fetch HTTP request. Default: 15.',                       type:'number' },
-  LIBRARIAN_HTTP_MAX_BYTES:            { label:'HTTP Max Bytes',             desc:'Max bytes downloaded per citation URL. Default: 1048576 (1 MB).',                  type:'number' },
-  LIBRARIAN_MAX_VERIFIED_CITATIONS:    { label:'Max Verified Citations',     desc:'Max citations kept after verification pass. Default: 6.',                          type:'number' },
-  CODEX_ENTRYPOINT:          { label:'Runtime Validation Entrypoint', desc:'Optional override for the runtime validation entry point (e.g. api/main.py:app). Leave blank to use auto-detection.', type:'text' },
-  CRUCIBLE_ENV_FILE:  { label:'.env File Path',                desc:'Optional override for the .env file location. Leave blank to use the default (.env in project root).', type:'text' },
-  GATE_CONTROL_ENABLED:              { label:'Gate Controller',             desc:'Master switch for the Gate Controller subsystem. Set to false to skip Gate evaluation entirely on every run (default: on).', type:'boolean' },
-  SELECTIVE_RERUN_ENABLED:           { label:'Selective Rerun',             desc:'Master switch for the Selective Rerun subsystem. Set to false to disable all gate-triggered reruns even when Gate Controller is enabled (default: on).', type:'boolean' },
-  DIRECTION_REFINEMENT_ENABLED:      { label:'Direction Refinement',        desc:'Enable evidence-gap refinement inside Direction Debate.',    type:'boolean' },
-  DIRECTION_REFINEMENT_MAX_ITERATIONS: { label:'Max Iterations',            desc:'Max refinement rounds before accepting current direction.',  type:'number' },
-  GATE_DIRECTION_FEEDBACK_ENABLED:   { label:'Gate Feedback',               desc:'Allow Gate Controller to bounce analysis back for refinement.', type:'boolean' },
-  SELECTIVE_RERUN_MAX_ATTEMPTS:      { label:'Selective Rerun Max',         desc:'Upper bound for Gate-triggered selective reruns.',           type:'number' },
-  BUDGET_SOFT_COST_LIMIT:            { label:'Soft Cost Limit (USD)',       desc:'Cumulative spend warning threshold in USD. Pipeline logs a WARNING when exceeded but continues. Leave blank to disable.', type:'number' },
-  BUDGET_HARD_COST_LIMIT:            { label:'Hard Cost Limit (USD)',       desc:'Cumulative spend hard cutoff in USD. Pipeline stops immediately with BudgetExceededError when exceeded. Leave blank to disable.', type:'number' },
-  BUDGET_MAX_TOTAL_TOKENS:           { label:'Max Total Tokens',            desc:'Maximum total tokens (input + output) allowed per run across all LLM calls. Leave blank to disable.', type:'number' },
-  CONVERGENCE_MAX_ITERATIONS:        { label:'Max Agent Iterations',        desc:'Hard cap on agent tick() calls per run. 0 = disabled. Default: 50.', type:'number' },
-  CONVERGENCE_TIMEOUT_SECONDS:       { label:'Agent Timeout (s)',           desc:'Wall-clock timeout in seconds for the convergence guard. 0 = disabled. Default: 3600 (1 hour).', type:'number' },
-  CONVERGENCE_STALE_THRESHOLD:       { label:'Stale Output Threshold',      desc:'Emit StaleLoopWarning when the same agent output signature repeats this many times consecutively. 0 = disabled. Default: 5.', type:'number' },
-  AGENT_KICKOFF_RETRY_ATTEMPTS:        { label:'Max Retry Attempts',          desc:'Maximum number of retry attempts for agent crew kickoff failures. Default: 20.', type:'number' },
-  AGENT_KICKOFF_RETRY_BACKOFF_SECONDS: { label:'Base Backoff (s)',            desc:'Initial backoff delay in seconds between retries. Doubles each attempt up to max. Default: 2.0.', type:'number' },
-  AGENT_KICKOFF_RETRY_MAX_BACKOFF_SECONDS: { label:'Max Backoff (s)',         desc:'Upper bound for exponential backoff delay. Default: 30.0.',  type:'number' },
-  AGENT_KICKOFF_RETRY_JITTER_RATIO:  { label:'Jitter Ratio',                desc:'Random jitter added to backoff (0.0–1.0). Prevents thundering-herd. Default: 0.15.', type:'number' },
-  API_VERSION_CHECK_ENABLED:         { label:'Enabled',                     desc:'Check for deprecated API calls after code generation.',      type:'boolean' },
-  API_VERSION_CHECK_MAX_LIBRARIES:   { label:'Max Libraries',               desc:'Max libraries to check per run.',                            type:'number' },
-  API_VERSION_CHECK_TIMEOUT_SECONDS: { label:'Timeout (s)',                 desc:'HTTP timeout for version check requests.',                   type:'number' },
-  API_VERSION_CHECK_CACHE_TTL_HOURS: { label:'Cache TTL (h)',               desc:'How long to cache version check results.',                   type:'number' },
-  API_VERSION_CHECK_SEVERITY_THRESHOLD: { label:'Severity Threshold',       desc:'Minimum severity to flag.',                                  type:'select', opts:[{v:'low',l:'Low'},{v:'medium',l:'Medium'},{v:'high',l:'High'}] },
-  ENHANCED_SECURITY_SCAN:            { label:'Security Scan',               desc:'Run static security analysis (bandit) on generated code.',   type:'boolean' },
-  ENHANCED_DEPLOYMENT_ARTIFACTS:     { label:'Deployment Artifacts',        desc:'Generate Dockerfile, docker-compose, CI workflow after run.',type:'boolean' },
-  ENHANCED_PROJECT_MEMORY:           { label:'Project Memory',              desc:'Persist direction decisions and failed experiments across runs.', type:'boolean' },
-  ENHANCED_PROJECT_MEMORY_MAX_ENTRIES: { label:'Memory Max Entries',        desc:'Max entries retained (oldest evicted when exceeded).',       type:'number' },
-  ENHANCED_GENERATE_TESTS:           { label:'Generate Tests',              desc:'Generate pytest suites for each produced Python file.',       type:'boolean' },
-  ENHANCED_GENERATE_TESTS_MAX_FILES: { label:'Max Files',                   desc:'Max source files to generate tests for per run.',            type:'number' },
-  ENHANCED_API_AUTOPATCH:            { label:'API Autopatch',               desc:'Auto-patch deprecated API calls found by version check.',    type:'boolean' },
-  ENHANCED_INDEPENDENT_VALIDATION:   { label:'Independent Validation',      desc:'Run syntax/pytest/smoke in a subprocess after code gen.',    type:'boolean' },
-  ENHANCED_INDEPENDENT_VALIDATION_LLM: { label:'Validation LLM Review',    desc:'Add adversarial LLM code review pass during validation.',    type:'boolean' },
-  ENHANCED_INDEPENDENT_VALIDATION_TIMEOUT: { label:'Validation Timeout (s)',desc:'Subprocess timeout for pytest and smoke check phases.',      type:'number' },
-  ENHANCED_CI_OUTPUT:                { label:'CI Output',                   desc:'Write github_annotations.txt and ci_summary.md after run.',  type:'boolean' },
-  ENHANCED_WATCH_DEBOUNCE_SECONDS:   { label:'Watch Debounce (s)',          desc:'File-change debounce delay for watch subcommand.',           type:'number' },
-  ENHANCED_WATCH_TIMEOUT:            { label:'Watch Run Timeout (s)',       desc:'Per-triggered-run subprocess timeout for watch subcommand. Kills hung run and resumes watching. Default: 3600.', type:'number' },
-  ENHANCED_BATCH_MAX_WORKERS:        { label:'Batch Max Workers',           desc:'Max parallel workers for batch subcommand (1 = sequential).', type:'number' },
-  ENHANCED_AUTO_REMEDIATION:         { label:'Auto Remediation',            desc:'LLM-driven closed-loop fix for HIGH+ security findings.',    type:'boolean' },
-  ENHANCED_AUTO_REMEDIATION_MAX_ROUNDS: { label:'Max Rounds',               desc:'Max fix iterations before giving up.',                       type:'number' },
-  ENHANCED_DEPENDENCY_AUDIT:         { label:'Dependency Audit',            desc:'Run pip-audit on generated requirements.txt for CVEs.',      type:'boolean' },
-  ENHANCED_HTML_REPORT:              { label:'HTML Report',                 desc:'Generate a self-contained HTML run report.',                 type:'boolean' },
-  ENHANCED_CODE_QUALITY:             { label:'Code Quality',                desc:'Run AST-based complexity/LOC/nesting analysis.',             type:'boolean' },
-  ENHANCED_RUN_REGISTRY:             { label:'Run Registry',                desc:'Index completed runs into a SQLite registry.',               type:'boolean' },
-  ENHANCED_INTERACTIVE:              { label:'Interactive Mode',            desc:'Pause before each run for research guidance via stdin.',     type:'boolean' },
-  ENHANCED_DEDUP_CHECK:              { label:'Dedup Check',                 desc:'Detect semantically similar past runs before starting.',     type:'boolean' },
-  DEDUP_SIMILARITY_THRESHOLD:        { label:'Similarity Threshold',        desc:'Cosine similarity threshold [0.0–1.0] to flag as duplicate.', type:'number' },
-  DEDUP_LOOKBACK_DAYS:               { label:'Lookback Days',               desc:'Only compare runs within last N days (0 = no limit).',      type:'number' },
-  DEDUP_MAX_CORPUS_RUNS:             { label:'Max Corpus Runs',             desc:'Max past runs included in the similarity corpus.',           type:'number' },
-  ENHANCED_BATCH_TIMEOUT:            { label:'Batch Timeout (s)',           desc:'Per-project subprocess timeout for the batch subcommand. Default: 3600.',  type:'number' },
-  ENHANCED_POST_CHAT:                { label:'Post-Analysis Chat',          desc:'Start interactive Q&A about the analysis after the run completes. Enable with --post-chat.', type:'boolean' },
-  POST_CHAT_CONTEXT_CHARS:           { label:'Post-Chat Context (chars)',    desc:'Max chars of analysis output injected as context for post-analysis chat. Default: 12000.', type:'number' },
-  ENHANCED_AGENT_METRICS:            { label:'Agent Metrics',               desc:'Compute and display per-agent token, latency, and task metrics after the run. Enable with --agent-metrics.', type:'boolean' },
-  ENHANCED_PROMPT_VERSION_LABEL:     { label:'Prompt Version Label',        desc:'Label recorded alongside the run quality score for prompt A/B comparisons. Enable with --prompt-version-label.', type:'text' },
-  ENHANCED_LOCKFILE_GEN:             { label:'Lock-file Generation',        desc:'Generate pyproject.toml + pinned requirements.txt for generated code. Enable with --lockfile-gen.', type:'boolean' },
-  PROJECT_MEMORY_PROMPT_CHARS:       { label:'Memory Prompt Budget (chars)', desc:'Max characters of project memory injected into the system prompt per run. Default: 16000 (~4 000 tokens).', type:'number' },
-  PIPELINE_PROJECT_PROFILE:          { label:'Project Profile Path',        desc:'Path to a JSON project profile file that overrides pipeline defaults. Leave blank to auto-detect.', type:'text' },
-  ENHANCED_BACKTEST_RUNNER:          { label:'Backtest Runner (default)',    desc:'Run automated backtest pipeline (data prep, execution, param sweep, LLM fix loop) by default. Enable with --backtest-runner.', type:'boolean' },
-  ENHANCED_GITHUB_REPO:              { label:'GitHub Repo URL',             desc:'GitHub repository URL to analyse and inject as research context. Enable with --github-repo.', type:'text' },
-  GITHUB_ANALYZER_TIMEOUT:           { label:'GitHub Analyzer Timeout (s)', desc:'HTTP request timeout in seconds for GitHub API calls during repo analysis. Default: 15.', type:'number' },
-  GITHUB_ANALYZER_MAX_RETRIES:       { label:'GitHub Analyzer Retries',     desc:'Max retry attempts on transient GitHub API errors (429/5xx). Default: 2.', type:'number' },
-  GITHUB_ANALYZER_CACHE_TTL:         { label:'GitHub Analyzer Cache TTL (s)', desc:'Seconds to cache GitHub API responses (0 = disable cache). Default: 3600.', type:'number' },
-  ENHANCED_INGEST_DOCS:              { label:'Document Ingestion (default)', desc:'Inject local documents into the pipeline context by default. Enable with --ingest-docs.', type:'boolean' },
-  ENHANCED_INGEST_DOCS_DIR:          { label:'Ingest Docs Directory',       desc:'Directory of documents to ingest (PDF/MD/TXT/DOCX). Read by --ingest-docs.', type:'text' },
-  DOCUMENT_INGESTION_MAX_CHARS:      { label:'Max Chars per Document',      desc:'Maximum characters read from a single document during ingestion. Default: 8000.', type:'number' },
-  DOCUMENT_INGESTION_TOTAL_CHARS:    { label:'Total Ingestion Budget (chars)', desc:'Maximum total characters across all ingested documents per run. Default: 24000.', type:'number' },
-  ENHANCED_MULTILANG_CODEGEN:        { label:'Multi-Lang Codegen (default)', desc:'Generate TypeScript/Go translations of Stage 4 Python output by default. Enable with --multilang-codegen.', type:'boolean' },
-  ENHANCED_MULTILANG_LANGS:          { label:'Multi-Lang Target Languages', desc:'Comma-separated target languages for multi-language codegen (default: typescript,go).', type:'text' },
-  MULTILANG_MAX_FILES:               { label:'Max Files to Translate',      desc:'Maximum number of Python files sent to LLM for multi-language translation per run. Default: 10.', type:'number' },
-  MULTILANG_MAX_CHARS:               { label:'Max Chars per File',          desc:'Maximum characters of source code sent per file to the LLM translator. Default: 4000.', type:'number' },
-  MULTILANG_ENABLE_RUST:             { label:'Enable Rust Target',          desc:'Allow Rust 2021 edition as a translation target (experimental). Disabled by default.', type:'boolean' },
-  NOTIFY_WEBHOOK_URL:                { label:'Custom Webhook URL',          desc:'Generic webhook called on pipeline completion.',             type:'password' },
-  NOTIFY_SLACK_WEBHOOK_URL:          { label:'Slack Webhook URL',           desc:'Slack incoming webhook URL.',                               type:'password' },
-  NOTIFY_DISCORD_WEBHOOK_URL:        { label:'Discord Webhook URL',         desc:'Discord incoming webhook URL.',                             type:'password' },
-  NOTIFY_ON_FAIL_ONLY:               { label:'Notify on Failure Only',      desc:'Skip notifications for successful runs.',                   type:'boolean' },
-  ALPHA_VANTAGE_API_KEY:             { label:'Alpha Vantage API Key',       desc:'Required for alpha_vantage data source.',                   type:'password' },
-  ALPHA_VANTAGE_BASE_URL:            { label:'Alpha Vantage Base URL',      desc:'Override only if using a proxy.',                           type:'text' },
-  FRED_API_KEY:                      { label:'FRED API Key',                desc:'Federal Reserve Economic Data — optional, increases limits.',type:'password' },
-  FRED_BASE_URL:                     { label:'FRED Base URL',               desc:'Override only if using a proxy.',                           type:'text' },
-  COINGECKO_BASE_URL:                { label:'CoinGecko Base URL',          desc:'Free tier requires no API key.',                            type:'text' },
-  EXTERNAL_DATA_TIMEOUT:             { label:'Request Timeout (s)',         desc:'HTTP fetch timeout shared across all connectors.',          type:'number' },
-  EXTERNAL_DATA_MAX_RETRIES:         { label:'Max Retries',                 desc:'Retry attempts for failed external data fetches.',          type:'number' },
-  AB_TEST_TIMEOUT:                   { label:'Test Timeout (s)',            desc:'Max seconds per pipeline subprocess in an A/B run.',        type:'number' },
-  AB_TEST_PARALLEL:                  { label:'Run in Parallel',             desc:'Run both variants simultaneously (uses more resources).',   type:'boolean' },
-  BACKTEST_PARAM_SEARCH:             { label:'Param Search Strategy',       desc:'Hyperparameter search method: grid, random, or bayesian (requires optuna).', type:'select', opts:[{v:'grid',l:'Grid'},{v:'random',l:'Random'},{v:'bayesian',l:'Bayesian (Optuna)'}] },
-  BACKTEST_BAYESIAN_N_TRIALS:        { label:'Bayesian Trials',             desc:'Number of Optuna TPE trials when using bayesian search.',   type:'number' },
-  BACKTEST_SYMBOL:                   { label:'Ticker Symbol',               desc:'Primary ticker/symbol to download (e.g. SPY, BTC-USD). Default: SPY.', type:'text' },
-  BACKTEST_DATA_SOURCE:              { label:'Data Source',                 desc:'Force a specific data source. "auto" lets the runner decide. Default: auto.', type:'select', opts:[{v:'auto',l:'Auto'},{v:'yfinance',l:'yfinance'},{v:'binance',l:'Binance'},{v:'project',l:'Project Files'}] },
-  BACKTEST_PERIOD:                   { label:'Download Period',             desc:'yfinance download period (e.g. 2y, 5y, max). "auto" derives from the strategy. Default: auto.', type:'text' },
-  BACKTEST_INTERVAL:                 { label:'Candle Interval',             desc:'yfinance candle interval (e.g. 1d, 1h, 5m). "auto" derives from the strategy. Default: auto.', type:'text' },
-  BACKTEST_DATA_ROWS:                { label:'Synthetic Rows',              desc:'Rows of synthetic OHLCV fallback data when live fetch fails. Default: 500.', type:'number' },
-  BACKTEST_INITIAL_CAPITAL:          { label:'Initial Capital',             desc:'Starting capital (USD) for synthetic / paper trading runs. Default: 100000.', type:'number' },
-  BACKTEST_MAX_COMBOS:               { label:'Max Combos',                  desc:'Maximum parameter combinations to evaluate during hyperparameter search. Default: 50.', type:'number' },
-  BACKTEST_TARGET_METRIC:            { label:'Target Metric',               desc:'Metric to optimise for during param search (e.g. sharpe_ratio, calmar_ratio, total_return). Default: sharpe_ratio.', type:'text' },
-  BACKTEST_FIX_MAX_ROUNDS:           { label:'Fix Max Rounds',              desc:'Max LLM auto-fix iterations if the backtest script fails. Default: 3.', type:'number' },
-  BACKTEST_TIMEOUT:                  { label:'Backtest Timeout (s)',        desc:'Max seconds per backtest subprocess before it is killed. Default: 120.', type:'number' },
-  PORTFOLIO_REBALANCE_PERIOD:        { label:'Rebalance Period',            desc:'Portfolio rebalancing frequency for combined equity curve.', type:'select', opts:[{v:'daily',l:'Daily'},{v:'weekly',l:'Weekly'},{v:'monthly',l:'Monthly'},{v:'quarterly',l:'Quarterly'},{v:'annual',l:'Annual'}] },
-  PORTFOLIO_RISK_FREE_RATE:          { label:'Risk-Free Rate',              desc:'Annualised risk-free rate for Sharpe/Sortino calculations (e.g. 0.04 = 4%).', type:'number' },
+  OPENROUTER_PRIMARY_MODEL:         { label:'Primary Model',                desc:{en:'Main analysis model for the workflow pipeline.', zh:'工作流主要分析使用的模型。'},                                    type:'text' },
+  OPENROUTER_DIRECTION_JUDGE_MODEL: { label:'Direction Judge Model',        desc:{en:'Stage 0 direction debate judge model.', zh:'Stage 0 方向辯論的評審模型。'},                                             type:'text' },
+  OPENROUTER_LIBRARIAN_MODEL:       { label:'Librarian / Research Model',   desc:{en:'Research and document retrieval model.', zh:'研究與文件檢索使用的模型。'},                                            type:'text' },
+  OPENROUTER_LLM_TIMEOUT_SECONDS:   { label:'Request Timeout (s)',          desc:{en:'Max seconds per OpenRouter LLM request before timeout.', zh:'單次 OpenRouter LLM 請求逾時前的最大秒數。'},                           type:'number' },
+  ALIBABA_CODING_PLAN_API_KEY:               { label:'API Key',             desc:{en:'Alibaba DashScope API key for Coding Plan.', zh:'Alibaba DashScope Coding Plan 的 API 金鑰。'},                                        type:'password' },
+  ALIBABA_CODING_PLAN_BASE_URL:              { label:'Base URL',            desc:{en:'OpenAI-compatible endpoint. Change only if using a proxy.', zh:'OpenAI 相容端點。僅在使用代理時修改。'},                         type:'text' },
+  ALIBABA_CODING_PLAN_PRIMARY_MODEL:         { label:'Primary Model',       desc:{en:'Main analysis model.', zh:'主要分析使用的模型。'},                                                              type:'text' },
+  ALIBABA_CODING_PLAN_DIRECTION_JUDGE_MODEL: { label:'Direction Judge',     desc:{en:'Stage 0 direction debate judge model.', zh:'Stage 0 方向辯論的評審模型。'},                                             type:'text' },
+  ALIBABA_CODING_PLAN_LIBRARIAN_MODEL:       { label:'Librarian Model',     desc:{en:'Research and document retrieval model.', zh:'研究與文件檢索使用的模型。'},                                            type:'text' },
+  ALIBABA_CODING_PLAN_LLM_TIMEOUT_SECONDS:  { label:'Request Timeout (s)', desc:{en:'Max seconds per Alibaba LLM request before timeout. Default: 180.', zh:'單次 Alibaba LLM 請求逾時前的最大秒數。預設 180。'},                  type:'number' },
+  ALIBABA_CODING_PLAN_INITIAL_RESPONSE_TIMEOUT_SECONDS: { label:'Initial Response Timeout (s)', desc:{en:'Max seconds to wait for the first token from Alibaba. Default: 120.', zh:'等待 Alibaba 回傳第一個 token 的最大秒數。預設 120。'}, type:'number' },
+  OLLAMA_BASE_URL:               { label:'Ollama Base URL',             desc:{en:'Ollama server API base URL. Default: http://localhost:11434/v1.', zh:'Ollama 伺服器 API 基底 URL。預設 http://localhost:11434/v1。'},                  type:'text' },
+  OLLAMA_PRIMARY_MODEL:          { label:'Primary Model',               desc:{en:'Main analysis model (must be pulled: ollama pull <model>).', zh:'主要分析使用的模型（需先用 ollama pull <model> 拉取）。'},                       type:'text' },
+  OLLAMA_DIRECTION_JUDGE_MODEL:  { label:'Direction Judge Model',       desc:{en:'Stage 0 direction debate judge model.', zh:'Stage 0 方向辯論的評審模型。'},                                             type:'text' },
+  OLLAMA_LIBRARIAN_MODEL:        { label:'Librarian / Research Model',  desc:{en:'Research and document retrieval model.', zh:'研究與文件檢索使用的模型。'},                                            type:'text' },
+  STRICT_JSON:         { label:'Strict JSON',              desc:{en:'Force all LLM responses to be valid JSON.', zh:'強制所有 LLM 回應為合法 JSON。'},                type:'boolean' },
+  COST_TRACE:          { label:'Cost Trace',               desc:{en:'Log per-call token costs to the output stream.', zh:'將每次呼叫的 token 成本記錄到輸出串流。'},           type:'boolean' },
+  LOCAL_CACHE:         { label:'Local Cache',              desc:{en:'Cache LLM responses to disk to save cost on reruns.', zh:'將 LLM 回應快取到磁碟，重跑時節省成本。'},      type:'boolean' },
+  CRUCIBLE_LOG_LEVEL:  { label:'Log Level',              desc:{en:'Python logging verbosity level.', zh:'Python logging 詳細程度。'},                          type:'select', opts:[{v:'DEBUG',l:'DEBUG'},{v:'INFO',l:'INFO'},{v:'WARNING',l:'WARNING'},{v:'ERROR',l:'ERROR'}] },
+  CRUCIBLE_JSON_LOGS:  { label:'JSON Logs',              desc:{en:'Emit logs in structured JSON format (for log aggregators).', zh:'以結構化 JSON 格式輸出 log（供 log 聚合工具使用）。'}, type:'boolean' },
+  LIBRARIAN_INTER_QUERY_DELAY_SECONDS: { label:'Librarian Search Delay (s)', desc:{en:'Minimum delay in seconds between consecutive web-search requests (min 0.5). Increase to 8–15 if DuckDuckGo returns 429 errors. Default: 4.', zh:'連續網路搜尋請求之間的最小間隔秒數（最低 0.5）。若 DuckDuckGo 回傳 429，調高到 8–15。預設 4。'}, type:'number' },
+  LIBRARIAN_MAX_RESULTS_PER_QUERY:     { label:'Max Results per Query',      desc:{en:'Max search results fetched per individual web query. Default: 3.', zh:'單次網路查詢抓取的搜尋結果上限。預設 3。'},                type:'number' },
+  LIBRARIAN_MAX_CITATIONS:             { label:'Max Citations',              desc:{en:'Upper bound of raw citation candidates collected. Default: 12.', zh:'蒐集的原始引用候選數量上限。預設 12。'},                   type:'number' },
+  LIBRARIAN_MAX_QUERIES_PER_LANE:      { label:'Max Queries per Lane',       desc:{en:'Max search queries fired per research lane. Default: 4.', zh:'每條研究 lane 發出的搜尋查詢上限。預設 4。'},                          type:'number' },
+  LIBRARIAN_HTTP_TIMEOUT_SECONDS:      { label:'HTTP Timeout (s)',           desc:{en:'Timeout for each citation-fetch HTTP request. Default: 15.', zh:'每筆引用 HTTP 抓取請求的逾時秒數。預設 15。'},                       type:'number' },
+  LIBRARIAN_HTTP_MAX_BYTES:            { label:'HTTP Max Bytes',             desc:{en:'Max bytes downloaded per citation URL. Default: 1048576 (1 MB).', zh:'每個引用 URL 的最大下載 bytes。預設 1048576（1 MB）。'},                  type:'number' },
+  LIBRARIAN_MAX_VERIFIED_CITATIONS:    { label:'Max Verified Citations',     desc:{en:'Max citations kept after verification pass. Default: 6.', zh:'通過驗證後保留的引用上限。預設 6。'},                          type:'number' },
+  CODEX_ENTRYPOINT:          { label:'Runtime Validation Entrypoint', desc:{en:'Optional override for the runtime validation entry point (e.g. api/main.py:app). Leave blank to use auto-detection.', zh:'執行時驗證 entry point 的可選覆寫（例如 api/main.py:app）。留空使用自動偵測。'}, type:'text' },
+  CRUCIBLE_ENV_FILE:  { label:'.env File Path',                desc:{en:'Optional override for the .env file location. Leave blank to use the default (.env in project root).', zh:'.env 檔案路徑的可選覆寫。留空使用預設（專案根目錄下的 .env）。'}, type:'text' },
+  GATE_CONTROL_ENABLED:              { label:'Gate Controller',             desc:{en:'Master switch for the Gate Controller subsystem. Set to false to skip Gate evaluation entirely on every run (default: on).', zh:'Gate Controller 子系統主開關。設為 false 後所有執行皆跳過 Gate 評估（預設開啟）。'}, type:'boolean' },
+  SELECTIVE_RERUN_ENABLED:           { label:'Selective Rerun',             desc:{en:'Master switch for the Selective Rerun subsystem. Set to false to disable all gate-triggered reruns even when Gate Controller is enabled (default: on).', zh:'Selective Rerun 子系統主開關。即使 Gate Controller 開啟，設為 false 也會停用所有 gate 觸發的重跑（預設開啟）。'}, type:'boolean' },
+  DIRECTION_REFINEMENT_ENABLED:      { label:'Direction Refinement',        desc:{en:'Enable evidence-gap refinement inside Direction Debate.', zh:'在方向辯論內啟用證據缺口修補。'},    type:'boolean' },
+  DIRECTION_REFINEMENT_MAX_ITERATIONS: { label:'Max Iterations',            desc:{en:'Max refinement rounds before accepting current direction.', zh:'接受當前方向前的最大修補輪數。'},  type:'number' },
+  GATE_DIRECTION_FEEDBACK_ENABLED:   { label:'Gate Feedback',               desc:{en:'Allow Gate Controller to bounce analysis back for refinement.', zh:'允許 Gate Controller 將分析退回重新修補。'}, type:'boolean' },
+  SELECTIVE_RERUN_MAX_ATTEMPTS:      { label:'Selective Rerun Max',         desc:{en:'Upper bound for Gate-triggered selective reruns.', zh:'Gate 觸發的 selective rerun 次數上限。'},           type:'number' },
+  BUDGET_SOFT_COST_LIMIT:            { label:'Soft Cost Limit (USD)',       desc:{en:'Cumulative spend warning threshold in USD. Pipeline logs a WARNING when exceeded but continues. Leave blank to disable.', zh:'累計花費警告閾值（USD）。超過時管線會 log WARNING 但繼續執行。留空停用。'}, type:'number' },
+  BUDGET_HARD_COST_LIMIT:            { label:'Hard Cost Limit (USD)',       desc:{en:'Cumulative spend hard cutoff in USD. Pipeline stops immediately with BudgetExceededError when exceeded. Leave blank to disable.', zh:'累計花費硬性上限（USD）。超過時管線立即拋出 BudgetExceededError 中止。留空停用。'}, type:'number' },
+  BUDGET_MAX_TOTAL_TOKENS:           { label:'Max Total Tokens',            desc:{en:'Maximum total tokens (input + output) allowed per run across all LLM calls. Leave blank to disable.', zh:'單次執行所有 LLM 呼叫的 token 上限（input + output 總和）。留空停用。'}, type:'number' },
+  CONVERGENCE_MAX_ITERATIONS:        { label:'Max Agent Iterations',        desc:{en:'Hard cap on agent tick() calls per run. 0 = disabled. Default: 50.', zh:'單次執行內 agent tick() 呼叫的硬性上限。0 = 停用。預設 50。'}, type:'number' },
+  CONVERGENCE_TIMEOUT_SECONDS:       { label:'Agent Timeout (s)',           desc:{en:'Wall-clock timeout in seconds for the convergence guard. 0 = disabled. Default: 3600 (1 hour).', zh:'收斂守護的 wall-clock 逾時秒數。0 = 停用。預設 3600（1 小時）。'}, type:'number' },
+  CONVERGENCE_STALE_THRESHOLD:       { label:'Stale Output Threshold',      desc:{en:'Emit StaleLoopWarning when the same agent output signature repeats this many times consecutively. 0 = disabled. Default: 5.', zh:'相同 agent 輸出 signature 連續重複此次數時發出 StaleLoopWarning。0 = 停用。預設 5。'}, type:'number' },
+  AGENT_KICKOFF_RETRY_ATTEMPTS:        { label:'Max Retry Attempts',          desc:{en:'Maximum number of retry attempts for agent crew kickoff failures. Default: 20.', zh:'agent crew kickoff 失敗時的最大重試次數。預設 20。'}, type:'number' },
+  AGENT_KICKOFF_RETRY_BACKOFF_SECONDS: { label:'Base Backoff (s)',            desc:{en:'Initial backoff delay in seconds between retries. Doubles each attempt up to max. Default: 2.0.', zh:'重試間的初始 backoff 秒數，每次嘗試後翻倍至最大值。預設 2.0。'}, type:'number' },
+  AGENT_KICKOFF_RETRY_MAX_BACKOFF_SECONDS: { label:'Max Backoff (s)',         desc:{en:'Upper bound for exponential backoff delay. Default: 30.0.', zh:'指數 backoff 延遲的上限。預設 30.0。'},  type:'number' },
+  AGENT_KICKOFF_RETRY_JITTER_RATIO:  { label:'Jitter Ratio',                desc:{en:'Random jitter added to backoff (0.0–1.0). Prevents thundering-herd. Default: 0.15.', zh:'加在 backoff 上的隨機抖動比例（0.0–1.0），避免 thundering herd。預設 0.15。'}, type:'number' },
+  API_VERSION_CHECK_ENABLED:         { label:'Enabled',                     desc:{en:'Check for deprecated API calls after code generation.', zh:'程式碼生成後檢查是否使用已棄用的 API。'},      type:'boolean' },
+  API_VERSION_CHECK_MAX_LIBRARIES:   { label:'Max Libraries',               desc:{en:'Max libraries to check per run.', zh:'單次執行檢查的套件數上限。'},                            type:'number' },
+  API_VERSION_CHECK_TIMEOUT_SECONDS: { label:'Timeout (s)',                 desc:{en:'HTTP timeout for version check requests.', zh:'版本檢查 HTTP 請求的逾時秒數。'},                   type:'number' },
+  API_VERSION_CHECK_CACHE_TTL_HOURS: { label:'Cache TTL (h)',               desc:{en:'How long to cache version check results.', zh:'版本檢查結果的快取存活時間（小時）。'},                   type:'number' },
+  API_VERSION_CHECK_SEVERITY_THRESHOLD: { label:'Severity Threshold',       desc:{en:'Minimum severity to flag.', zh:'標記問題的最低嚴重程度。'},                                  type:'select', opts:[{v:'low',l:'Low'},{v:'medium',l:'Medium'},{v:'high',l:'High'}] },
+  ENHANCED_SECURITY_SCAN:            { label:'Security Scan',               desc:{en:'Run static security analysis (bandit) on generated code.', zh:'對產出程式碼執行靜態安全分析（bandit）。'},   type:'boolean' },
+  ENHANCED_DEPLOYMENT_ARTIFACTS:     { label:'Deployment Artifacts',        desc:{en:'Generate Dockerfile, docker-compose, CI workflow after run.', zh:'執行結束後產生 Dockerfile、docker-compose、CI workflow。'},type:'boolean' },
+  ENHANCED_PROJECT_MEMORY:           { label:'Project Memory',              desc:{en:'Persist direction decisions and failed experiments across runs.', zh:'跨執行保存方向決策與失敗實驗。'}, type:'boolean' },
+  ENHANCED_PROJECT_MEMORY_MAX_ENTRIES: { label:'Memory Max Entries',        desc:{en:'Max entries retained (oldest evicted when exceeded).', zh:'保留的最大記錄數（超過時淘汰最舊的）。'},       type:'number' },
+  ENHANCED_GENERATE_TESTS:           { label:'Generate Tests',              desc:{en:'Generate pytest suites for each produced Python file.', zh:'為每個產出的 Python 檔產生 pytest 測試套件。'},       type:'boolean' },
+  ENHANCED_GENERATE_TESTS_MAX_FILES: { label:'Max Files',                   desc:{en:'Max source files to generate tests for per run.', zh:'單次執行最多為幾個原始碼檔案產生測試。'},            type:'number' },
+  ENHANCED_API_AUTOPATCH:            { label:'API Autopatch',               desc:{en:'Auto-patch deprecated API calls found by version check.', zh:'自動修補版本檢查找到的已棄用 API 呼叫。'},    type:'boolean' },
+  ENHANCED_INDEPENDENT_VALIDATION:   { label:'Independent Validation',      desc:{en:'Run syntax/pytest/smoke in a subprocess after code gen.', zh:'程式碼生成後在 subprocess 內執行語法 / pytest / smoke 檢查。'},    type:'boolean' },
+  ENHANCED_INDEPENDENT_VALIDATION_LLM: { label:'Validation LLM Review',    desc:{en:'Add adversarial LLM code review pass during validation.', zh:'驗證階段加入對抗式 LLM code review。'},    type:'boolean' },
+  ENHANCED_INDEPENDENT_VALIDATION_TIMEOUT: { label:'Validation Timeout (s)',desc:{en:'Subprocess timeout for pytest and smoke check phases.', zh:'pytest 與 smoke 檢查階段的 subprocess 逾時秒數。'},      type:'number' },
+  ENHANCED_CI_OUTPUT:                { label:'CI Output',                   desc:{en:'Write github_annotations.txt and ci_summary.md after run.', zh:'執行結束後寫出 github_annotations.txt 與 ci_summary.md。'},  type:'boolean' },
+  ENHANCED_WATCH_DEBOUNCE_SECONDS:   { label:'Watch Debounce (s)',          desc:{en:'File-change debounce delay for watch subcommand.', zh:'watch 子指令的檔案變更 debounce 延遲秒數。'},           type:'number' },
+  ENHANCED_WATCH_TIMEOUT:            { label:'Watch Run Timeout (s)',       desc:{en:'Per-triggered-run subprocess timeout for watch subcommand. Kills hung run and resumes watching. Default: 3600.', zh:'watch 子指令每次觸發 run 的 subprocess 逾時秒數。卡住的 run 會被終止並繼續監看。預設 3600。'}, type:'number' },
+  ENHANCED_BATCH_MAX_WORKERS:        { label:'Batch Max Workers',           desc:{en:'Max parallel workers for batch subcommand (1 = sequential).', zh:'batch 子指令的最大平行 worker 數（1 = 序列執行）。'}, type:'number' },
+  ENHANCED_AUTO_REMEDIATION:         { label:'Auto Remediation',            desc:{en:'LLM-driven closed-loop fix for HIGH+ security findings.', zh:'對 HIGH 以上嚴重程度的安全發現進行 LLM 驅動的閉環修復。'},    type:'boolean' },
+  ENHANCED_AUTO_REMEDIATION_MAX_ROUNDS: { label:'Max Rounds',               desc:{en:'Max fix iterations before giving up.', zh:'放棄前的最大修復輪數。'},                       type:'number' },
+  ENHANCED_DEPENDENCY_AUDIT:         { label:'Dependency Audit',            desc:{en:'Run pip-audit on generated requirements.txt for CVEs.', zh:'對產出的 requirements.txt 執行 pip-audit 檢查 CVE。'},      type:'boolean' },
+  ENHANCED_HTML_REPORT:              { label:'HTML Report',                 desc:{en:'Generate a self-contained HTML run report.', zh:'產生獨立的 HTML 執行報告。'},                 type:'boolean' },
+  ENHANCED_CODE_QUALITY:             { label:'Code Quality',                desc:{en:'Run AST-based complexity/LOC/nesting analysis.', zh:'執行 AST 為基礎的複雜度 / 行數 / 巢狀深度分析。'},             type:'boolean' },
+  ENHANCED_RUN_REGISTRY:             { label:'Run Registry',                desc:{en:'Index completed runs into a SQLite registry.', zh:'將完成的 run 索引到 SQLite registry。'},               type:'boolean' },
+  ENHANCED_INTERACTIVE:              { label:'Interactive Mode',            desc:{en:'Pause before each run for research guidance via stdin.', zh:'每次執行前透過 stdin 暫停，等待研究指引輸入。'},     type:'boolean' },
+  ENHANCED_DEDUP_CHECK:              { label:'Dedup Check',                 desc:{en:'Detect semantically similar past runs before starting.', zh:'執行前偵測語意上相似的歷史 run。'},     type:'boolean' },
+  DEDUP_SIMILARITY_THRESHOLD:        { label:'Similarity Threshold',        desc:{en:'Cosine similarity threshold [0.0–1.0] to flag as duplicate.', zh:'標記為重複的 cosine 相似度閾值（0.0–1.0）。'}, type:'number' },
+  DEDUP_LOOKBACK_DAYS:               { label:'Lookback Days',               desc:{en:'Only compare runs within last N days (0 = no limit).', zh:'僅比對最近 N 天內的 run（0 = 不限制）。'},      type:'number' },
+  DEDUP_MAX_CORPUS_RUNS:             { label:'Max Corpus Runs',             desc:{en:'Max past runs included in the similarity corpus.', zh:'納入相似度比對 corpus 的歷史 run 數量上限。'},           type:'number' },
+  ENHANCED_BATCH_TIMEOUT:            { label:'Batch Timeout (s)',           desc:{en:'Per-project subprocess timeout for the batch subcommand. Default: 3600.', zh:'batch 子指令每個專案的 subprocess 逾時秒數。預設 3600。'},  type:'number' },
+  ENHANCED_POST_CHAT:                { label:'Post-Analysis Chat',          desc:{en:'Start interactive Q&A about the analysis after the run completes. Enable with --post-chat.', zh:'執行結束後啟動與分析結果互動 Q&A 的介面。需搭配 --post-chat 開啟。'}, type:'boolean' },
+  POST_CHAT_CONTEXT_CHARS:           { label:'Post-Chat Context (chars)',    desc:{en:'Max chars of analysis output injected as context for post-analysis chat. Default: 12000.', zh:'注入分析後對話作為 context 的分析輸出字元數上限。預設 12000。'}, type:'number' },
+  ENHANCED_AGENT_METRICS:            { label:'Agent Metrics',               desc:{en:'Compute and display per-agent token, latency, and task metrics after the run. Enable with --agent-metrics.', zh:'執行結束後計算並顯示每個 agent 的 token、延遲、任務指標。需搭配 --agent-metrics 開啟。'}, type:'boolean' },
+  ENHANCED_PROMPT_VERSION_LABEL:     { label:'Prompt Version Label',        desc:{en:'Label recorded alongside the run quality score for prompt A/B comparisons. Enable with --prompt-version-label.', zh:'與 run 品質分數一起記錄的標籤，用於 prompt A/B 比較。需搭配 --prompt-version-label 開啟。'}, type:'text' },
+  ENHANCED_LOCKFILE_GEN:             { label:'Lock-file Generation',        desc:{en:'Generate pyproject.toml + pinned requirements.txt for generated code. Enable with --lockfile-gen.', zh:'為產出程式碼產生 pyproject.toml 與 pinned requirements.txt。需搭配 --lockfile-gen 開啟。'}, type:'boolean' },
+  PROJECT_MEMORY_PROMPT_CHARS:       { label:'Memory Prompt Budget (chars)', desc:{en:'Max characters of project memory injected into the system prompt per run. Default: 16000 (~4 000 tokens).', zh:'單次執行注入 system prompt 的 project memory 字元數上限。預設 16000（約 4000 tokens）。'}, type:'number' },
+  PIPELINE_PROJECT_PROFILE:          { label:'Project Profile Path',        desc:{en:'Path to a JSON project profile file that overrides pipeline defaults. Leave blank to auto-detect.', zh:'用來覆寫管線預設值的 JSON project profile 檔案路徑。留空使用自動偵測。'}, type:'text' },
+  ENHANCED_BACKTEST_RUNNER:          { label:'Backtest Runner (default)',    desc:{en:'Run automated backtest pipeline (data prep, execution, param sweep, LLM fix loop) by default. Enable with --backtest-runner.', zh:'預設執行自動化回測管線（資料準備、執行、參數掃描、LLM 修復迴圈）。需搭配 --backtest-runner 開啟。'}, type:'boolean' },
+  BACKTEST_REQUIRE_REAL_DATA:        { label:'Require Real Market Data',     desc:{en:'Refuse the synthetic-GBM fallback when no real data provider succeeds. With this on (default), the pipeline raises BacktestDataIntegrityError instead of silently producing meaningless Sharpe / drawdown numbers from random walks. Turn off only for offline CI smoke tests.', zh:'真實資料提供者都失敗時，拒絕回退到 synthetic-GBM 假資料。預設開啟：管線會丟出 BacktestDataIntegrityError，避免從隨機漫步產出毫無意義的 Sharpe / 回撤數字。只有離線 CI 煙霧測試時才關閉。'}, type:'boolean' },
+  BACKTEST_MIN_REAL_DATA_ROWS:       { label:'Min Real-Data Rows',          desc:{en:'Minimum OHLCV rows a fetched dataset must contain before the runner accepts it. Defends against yfinance partial responses (1-2 stale rows from delisted tickers). Effective threshold is max(this value, 30% of the timeframe profile synthetic_rows). Default: 30.', zh:'抓回的 OHLCV 至少要有幾列才算可用，防止 yfinance 對下市標的回傳 1-2 列殘缺資料。實際門檻為 max(此值, 30% × 該週期 profile 的 synthetic_rows)。預設 30。'}, type:'number' },
+  BACKTEST_DATA_CACHE_TTL_HOURS:     { label:'Data Cache TTL (hours)',      desc:{en:'How long to keep cached OHLCV CSV files on disk. Subsequent runs the same day reuse the cache, avoiding repeated API calls and rate-limit risk. 0 disables caching. Default: 24.', zh:'OHLCV CSV 快取的保存時間（小時）。同日後續執行會重用快取，避免重複呼叫 API 撞 rate limit。0 = 關閉快取。預設 24。'}, type:'number' },
+  BACKTEST_DATA_CACHE_DIR:           { label:'Data Cache Directory',        desc:{en:'Directory for cached OHLCV CSV files. Leave blank to use ~/.crucible/data_cache. Supports ~ expansion.', zh:'OHLCV CSV 快取目錄。留空使用 ~/.crucible/data_cache。支援 ~ 展開。'}, type:'text' },
+  BACKTEST_DATA_MAX_STALENESS_DAYS:  { label:'Max Data Staleness (days)',   desc:{en:'When the most recent data row is older than this many days, the report appends a warning that metrics may not reflect the current regime. 0 disables the check. Default: 7.', zh:'最後一根 K 線距今超過幾天時，回測報告會多一條警告：目前 Sharpe / 回撤可能不反映當前市場狀態。0 = 關閉檢查。預設 7。'}, type:'number' },
+  BACKTEST_SYNTHETIC_SEED:           { label:'Synthetic Seed',              desc:{en:'Seed for the GBM synthetic-data fallback (only used when BACKTEST_REQUIRE_REAL_DATA=0). An integer means reproducible; "random" picks a fresh seed each run. Default: 42 (preserves v1.0.x behaviour).', zh:'合成 GBM 資料的種子（僅在 BACKTEST_REQUIRE_REAL_DATA=0 時生效）。整數表示可重現；"random" 表示每次重新抽。預設 42（保留 v1.0.x 行為）。'}, type:'text' },
+  BACKTEST_PREPARE_DATA_ONLY:        { label:'Prepare-Data Only (Dry Run)', desc:{en:'When on, the backtest pipeline exits immediately after preparing data — no strategy execution, no parameter sweep. Useful for confirming the data-fetch path is wired up. Default: off.', zh:'開啟時回測管線在準備資料完成後立即結束，不執行策略也不做參數掃描。用來確認資料路徑是否接通。預設關閉。'}, type:'boolean' },
+  BACKTEST_PARALLEL_FETCH:           { label:'Parallel Real-Data Fetch',    desc:{en:'When on, the auto cascade fires yfinance and Binance concurrently and uses whichever returns valid data first. Off by default — sequential cascade is friendlier to provider rate limits and easier to debug.', zh:'開啟時 auto cascade 同時打 yfinance + Binance，誰先回傳有效資料就用誰。預設關閉，sequential cascade 對 provider rate limit 更友善、也較易除錯。'}, type:'boolean' },
+  ENHANCED_GITHUB_REPO:              { label:'GitHub Repo URL',             desc:{en:'GitHub repository URL to analyse and inject as research context. Enable with --github-repo.', zh:'要分析並注入研究 context 的 GitHub repository URL。需搭配 --github-repo 開啟。'}, type:'text' },
+  GITHUB_ANALYZER_TIMEOUT:           { label:'GitHub Analyzer Timeout (s)', desc:{en:'HTTP request timeout in seconds for GitHub API calls during repo analysis. Default: 15.', zh:'repo 分析期間 GitHub API 呼叫的 HTTP 請求逾時秒數。預設 15。'}, type:'number' },
+  GITHUB_ANALYZER_MAX_RETRIES:       { label:'GitHub Analyzer Retries',     desc:{en:'Max retry attempts on transient GitHub API errors (429/5xx). Default: 2.', zh:'GitHub API 暫時性錯誤（429/5xx）的最大重試次數。預設 2。'}, type:'number' },
+  GITHUB_ANALYZER_CACHE_TTL:         { label:'GitHub Analyzer Cache TTL (s)', desc:{en:'Seconds to cache GitHub API responses (0 = disable cache). Default: 3600.', zh:'GitHub API 回應的快取秒數（0 = 停用快取）。預設 3600。'}, type:'number' },
+  ENHANCED_INGEST_DOCS:              { label:'Document Ingestion (default)', desc:{en:'Inject local documents into the pipeline context by default. Enable with --ingest-docs.', zh:'預設將本機文件注入管線 context。需搭配 --ingest-docs 開啟。'}, type:'boolean' },
+  ENHANCED_INGEST_DOCS_DIR:          { label:'Ingest Docs Directory',       desc:{en:'Directory of documents to ingest (PDF/MD/TXT/DOCX). Read by --ingest-docs.', zh:'要 ingest 的文件目錄（PDF/MD/TXT/DOCX）。由 --ingest-docs 讀取。'}, type:'text' },
+  DOCUMENT_INGESTION_MAX_CHARS:      { label:'Max Chars per Document',      desc:{en:'Maximum characters read from a single document during ingestion. Default: 8000.', zh:'ingest 時單一文件讀取的最大字元數。預設 8000。'}, type:'number' },
+  DOCUMENT_INGESTION_TOTAL_CHARS:    { label:'Total Ingestion Budget (chars)', desc:{en:'Maximum total characters across all ingested documents per run. Default: 24000.', zh:'單次執行所有 ingest 文件的總字元數上限。預設 24000。'}, type:'number' },
+  ENHANCED_MULTILANG_CODEGEN:        { label:'Multi-Lang Codegen (default)', desc:{en:'Generate TypeScript/Go translations of Stage 4 Python output by default. Enable with --multilang-codegen.', zh:'預設為 Stage 4 Python 輸出產生 TypeScript / Go 翻譯。需搭配 --multilang-codegen 開啟。'}, type:'boolean' },
+  ENHANCED_MULTILANG_LANGS:          { label:'Multi-Lang Target Languages', desc:{en:'Comma-separated target languages for multi-language codegen (default: typescript,go).', zh:'多語言 codegen 的目標語言，以逗號分隔（預設：typescript,go）。'}, type:'text' },
+  MULTILANG_MAX_FILES:               { label:'Max Files to Translate',      desc:{en:'Maximum number of Python files sent to LLM for multi-language translation per run. Default: 10.', zh:'單次執行送 LLM 翻譯的 Python 檔數上限。預設 10。'}, type:'number' },
+  MULTILANG_MAX_CHARS:               { label:'Max Chars per File',          desc:{en:'Maximum characters of source code sent per file to the LLM translator. Default: 4000.', zh:'每個檔案送 LLM 翻譯的原始碼字元數上限。預設 4000。'}, type:'number' },
+  MULTILANG_ENABLE_RUST:             { label:'Enable Rust Target',          desc:{en:'Allow Rust 2021 edition as a translation target (experimental). Disabled by default.', zh:'允許 Rust 2021 edition 作為翻譯目標（實驗性功能）。預設停用。'}, type:'boolean' },
+  NOTIFY_WEBHOOK_URL:                { label:'Custom Webhook URL',          desc:{en:'Generic webhook called on pipeline completion.', zh:'管線完成時呼叫的通用 webhook。'},             type:'password' },
+  NOTIFY_SLACK_WEBHOOK_URL:          { label:'Slack Webhook URL',           desc:{en:'Slack incoming webhook URL.', zh:'Slack incoming webhook URL。'},                               type:'password' },
+  NOTIFY_DISCORD_WEBHOOK_URL:        { label:'Discord Webhook URL',         desc:{en:'Discord incoming webhook URL.', zh:'Discord incoming webhook URL。'},                             type:'password' },
+  NOTIFY_ON_FAIL_ONLY:               { label:'Notify on Failure Only',      desc:{en:'Skip notifications for successful runs.', zh:'成功的 run 略過通知。'},                   type:'boolean' },
+  ALPHA_VANTAGE_API_KEY:             { label:'Alpha Vantage API Key',       desc:{en:'Required for alpha_vantage data source.', zh:'使用 alpha_vantage 資料來源時必填。'},                   type:'password' },
+  ALPHA_VANTAGE_BASE_URL:            { label:'Alpha Vantage Base URL',      desc:{en:'Override only if using a proxy.', zh:'僅在使用代理時修改。'},                           type:'text' },
+  FRED_API_KEY:                      { label:'FRED API Key',                desc:{en:'Federal Reserve Economic Data — optional, increases limits.', zh:'美國聯準會經濟資料 — 可選，提供後可提高請求上限。'},type:'password' },
+  FRED_BASE_URL:                     { label:'FRED Base URL',               desc:{en:'Override only if using a proxy.', zh:'僅在使用代理時修改。'},                           type:'text' },
+  COINGECKO_BASE_URL:                { label:'CoinGecko Base URL',          desc:{en:'Free tier requires no API key.', zh:'免費版不需 API key。'},                            type:'text' },
+  EXTERNAL_DATA_TIMEOUT:             { label:'Request Timeout (s)',         desc:{en:'HTTP fetch timeout shared across all connectors.', zh:'所有 connector 共用的 HTTP 抓取逾時秒數。'},          type:'number' },
+  EXTERNAL_DATA_MAX_RETRIES:         { label:'Max Retries',                 desc:{en:'Retry attempts for failed external data fetches.', zh:'外部資料抓取失敗時的重試次數。'},          type:'number' },
+  AB_TEST_TIMEOUT:                   { label:'Test Timeout (s)',            desc:{en:'Max seconds per pipeline subprocess in an A/B run.', zh:'A/B 執行內每個管線 subprocess 的最大秒數。'},        type:'number' },
+  AB_TEST_PARALLEL:                  { label:'Run in Parallel',             desc:{en:'Run both variants simultaneously (uses more resources).', zh:'兩個變體同時執行（會使用較多資源）。'},   type:'boolean' },
+  BACKTEST_PARAM_SEARCH:             { label:'Param Search Strategy',       desc:{en:'Hyperparameter search method: grid, random, or bayesian (requires optuna).', zh:'超參數搜尋方法：grid（網格）、random（隨機）或 bayesian（貝氏，需安裝 optuna）。'}, type:'select', opts:[{v:'grid',l:'Grid'},{v:'random',l:'Random'},{v:'bayesian',l:'Bayesian (Optuna)'}] },
+  BACKTEST_BAYESIAN_N_TRIALS:        { label:'Bayesian Trials',             desc:{en:'Number of Optuna TPE trials when using bayesian search.', zh:'使用貝氏搜尋時的 Optuna TPE 試驗次數。'},   type:'number' },
+  BACKTEST_SYMBOL:                   { label:'Ticker Symbol',               desc:{en:'Primary ticker/symbol to download (e.g. SPY, BTC-USD). Default: SPY.', zh:'要下載的主要標的代碼（例如 SPY、BTC-USD）。預設 SPY。'}, type:'text' },
+  BACKTEST_DATA_SOURCE:              { label:'Data Source',                 desc:{en:'Force a specific data source. "auto" lets the runner decide. Default: auto.', zh:'強制指定資料來源。"auto" 讓 runner 自行決定。預設 auto。'}, type:'select', opts:[{v:'auto',l:'Auto'},{v:'yfinance',l:'yfinance'},{v:'binance',l:'Binance'},{v:'project',l:'Project Files'}] },
+  BACKTEST_PERIOD:                   { label:'Download Period',             desc:{en:'yfinance download period (e.g. 2y, 5y, max). "auto" derives from the strategy. Default: auto.', zh:'yfinance 下載期間（例如 2y、5y、max）。"auto" 會從策略自動推導。預設 auto。'}, type:'text' },
+  BACKTEST_INTERVAL:                 { label:'Candle Interval',             desc:{en:'yfinance candle interval (e.g. 1d, 1h, 5m). "auto" derives from the strategy. Default: auto.', zh:'yfinance K 線間隔（例如 1d、1h、5m）。"auto" 會從策略自動推導。預設 auto。'}, type:'text' },
+  BACKTEST_DATA_ROWS:                { label:'Synthetic Rows',              desc:{en:'Rows of synthetic OHLCV fallback data when live fetch fails. Default: 500.', zh:'即時下載失敗時，合成 OHLCV 備援資料的列數。預設 500。'}, type:'number' },
+  BACKTEST_INITIAL_CAPITAL:          { label:'Initial Capital',             desc:{en:'Starting capital (USD) for synthetic / paper trading runs. Default: 100000.', zh:'合成 / 模擬交易執行的起始資金（USD）。預設 100000。'}, type:'number' },
+  BACKTEST_MAX_COMBOS:               { label:'Max Combos',                  desc:{en:'Maximum parameter combinations to evaluate during hyperparameter search. Default: 50.', zh:'超參數搜尋時要評估的參數組合上限。預設 50。'}, type:'number' },
+  BACKTEST_TARGET_METRIC:            { label:'Target Metric',               desc:{en:'Metric to optimise for during param search (e.g. sharpe_ratio, calmar_ratio, total_return). Default: sharpe_ratio.', zh:'參數搜尋時要最佳化的指標（例如 sharpe_ratio、calmar_ratio、total_return）。預設 sharpe_ratio。'}, type:'text' },
+  BACKTEST_FIX_MAX_ROUNDS:           { label:'Fix Max Rounds',              desc:{en:'Max LLM auto-fix iterations if the backtest script fails. Default: 3.', zh:'回測腳本失敗時，LLM 自動修復的最大輪數。預設 3。'}, type:'number' },
+  BACKTEST_TIMEOUT:                  { label:'Backtest Timeout (s)',        desc:{en:'Max seconds per backtest subprocess before it is killed. Default: 120.', zh:'單次回測 subprocess 被強制結束前的最大秒數。預設 120。'}, type:'number' },
+  PORTFOLIO_REBALANCE_PERIOD:        { label:'Rebalance Period',            desc:{en:'Portfolio rebalancing frequency for combined equity curve.', zh:'合併淨值曲線的投組再平衡頻率。'}, type:'select', opts:[{v:'daily',l:'Daily'},{v:'weekly',l:'Weekly'},{v:'monthly',l:'Monthly'},{v:'quarterly',l:'Quarterly'},{v:'annual',l:'Annual'}] },
+  PORTFOLIO_RISK_FREE_RATE:          { label:'Risk-Free Rate',              desc:{en:'Annualised risk-free rate for Sharpe/Sortino calculations (e.g. 0.04 = 4%).', zh:'用於 Sharpe / Sortino 計算的年化無風險利率（例如 0.04 = 4%）。'}, type:'number' },
   // Quant Analytics Suite — feature enable flags
-  ENHANCED_QUANT_ANALYTICS:      { label:'Quant Analytics (default)',  desc:'Run Walk-Forward + Significance Testing after a Quant mode backtest by default. Enable with --quant-analytics.', type:'boolean' },
-  ENHANCED_WALK_FORWARD:         { label:'Walk-Forward (default)',      desc:'Enable walk-forward validation within --quant-analytics (default: on when analytics enabled).', type:'boolean' },
-  ENHANCED_SIGNIFICANCE_TEST:    { label:'Significance Test (default)', desc:'Enable permutation/bootstrap significance test within --quant-analytics (default: on).', type:'boolean' },
-  ENHANCED_REGIME_DETECTION:     { label:'Regime Detection (default)',  desc:'Detect market regimes (bull/bear/sideways) from backtest price data by default. Enable with --regime-detection.', type:'boolean' },
-  ENHANCED_FACTOR_ANALYSIS:      { label:'Factor Analysis (default)',   desc:'Run CAPM/Fama-French factor exposure regression by default. Enable with --factor-analysis.', type:'boolean' },
-  ENHANCED_TRANSACTION_COST:     { label:'Transaction Cost (default)',  desc:'Run transaction cost sensitivity analysis by default. Enable with --transaction-cost.', type:'boolean' },
-  ENHANCED_MONTE_CARLO:          { label:'Monte Carlo (default)',       desc:'Run Monte Carlo simulation and stress tests by default. Enable with --monte-carlo.', type:'boolean' },
-  ENHANCED_TEARSHEET:            { label:'Tearsheet (default)',         desc:'Generate rich Markdown strategy tearsheet by default. Enable with --tearsheet.', type:'boolean' },
-  ENHANCED_SIGNAL_ANALYSIS:      { label:'Signal Analysis (default)',   desc:'Run signal decay analysis to measure edge half-life by default. Enable with --signal-analysis.', type:'boolean' },
-  ENHANCED_COINTEGRATION:        { label:'Cointegration (default)',     desc:'Run cointegration + pairs trading analysis on multi-asset data by default. Enable with --cointegration.', type:'boolean' },
-  ENHANCED_DYNAMIC_CORRELATION:  { label:'Dynamic Correlation (default)', desc:'Compute rolling correlation matrix and PCA decomposition by default. Enable with --dynamic-correlation.', type:'boolean' },
+  ENHANCED_QUANT_ANALYTICS:      { label:'Quant Analytics (default)',  desc:{en:'Run Walk-Forward + Significance Testing after a Quant mode backtest by default. Enable with --quant-analytics.', zh:'預設在 Quant 模式回測後執行 Walk-Forward 與顯著性檢定。需搭配 --quant-analytics 開啟。'}, type:'boolean' },
+  ENHANCED_WALK_FORWARD:         { label:'Walk-Forward (default)',      desc:{en:'Enable walk-forward validation within --quant-analytics (default: on when analytics enabled).', zh:'在 --quant-analytics 內啟用 walk-forward 驗證（analytics 開啟時預設為 on）。'}, type:'boolean' },
+  ENHANCED_SIGNIFICANCE_TEST:    { label:'Significance Test (default)', desc:{en:'Enable permutation/bootstrap significance test within --quant-analytics (default: on).', zh:'在 --quant-analytics 內啟用 permutation / bootstrap 顯著性檢定（預設 on）。'}, type:'boolean' },
+  ENHANCED_REGIME_DETECTION:     { label:'Regime Detection (default)',  desc:{en:'Detect market regimes (bull/bear/sideways) from backtest price data by default. Enable with --regime-detection.', zh:'預設從回測價格資料偵測市場狀態（多頭 / 空頭 / 盤整）。需搭配 --regime-detection 開啟。'}, type:'boolean' },
+  ENHANCED_FACTOR_ANALYSIS:      { label:'Factor Analysis (default)',   desc:{en:'Run CAPM/Fama-French factor exposure regression by default. Enable with --factor-analysis.', zh:'預設執行 CAPM / Fama-French 因子曝險迴歸。需搭配 --factor-analysis 開啟。'}, type:'boolean' },
+  ENHANCED_TRANSACTION_COST:     { label:'Transaction Cost (default)',  desc:{en:'Run transaction cost sensitivity analysis by default. Enable with --transaction-cost.', zh:'預設執行交易成本敏感度分析。需搭配 --transaction-cost 開啟。'}, type:'boolean' },
+  ENHANCED_MONTE_CARLO:          { label:'Monte Carlo (default)',       desc:{en:'Run Monte Carlo simulation and stress tests by default. Enable with --monte-carlo.', zh:'預設執行 Monte Carlo 模擬與壓力測試。需搭配 --monte-carlo 開啟。'}, type:'boolean' },
+  ENHANCED_TEARSHEET:            { label:'Tearsheet (default)',         desc:{en:'Generate rich Markdown strategy tearsheet by default. Enable with --tearsheet.', zh:'預設產生完整 Markdown 策略 tearsheet。需搭配 --tearsheet 開啟。'}, type:'boolean' },
+  ENHANCED_SIGNAL_ANALYSIS:      { label:'Signal Analysis (default)',   desc:{en:'Run signal decay analysis to measure edge half-life by default. Enable with --signal-analysis.', zh:'預設執行訊號衰減分析，衡量 edge 半衰期。需搭配 --signal-analysis 開啟。'}, type:'boolean' },
+  ENHANCED_COINTEGRATION:        { label:'Cointegration (default)',     desc:{en:'Run cointegration + pairs trading analysis on multi-asset data by default. Enable with --cointegration.', zh:'預設對多資產資料執行共整合 + 配對交易分析。需搭配 --cointegration 開啟。'}, type:'boolean' },
+  ENHANCED_DYNAMIC_CORRELATION:  { label:'Dynamic Correlation (default)', desc:{en:'Compute rolling correlation matrix and PCA decomposition by default. Enable with --dynamic-correlation.', zh:'預設計算滾動相關係數矩陣與 PCA 分解。需搭配 --dynamic-correlation 開啟。'}, type:'boolean' },
   // Quant Analytics Suite env vars
-  WALK_FORWARD_N_SPLITS:         { label:'WF Splits',               desc:'Number of IS/OOS rolling splits for walk-forward validation. Default: 5.',            type:'number' },
-  WALK_FORWARD_OOS_PCT:          { label:'WF OOS %',                desc:'Fraction of each split used as out-of-sample (0.0–1.0). Default: 0.3.',              type:'number' },
-  WALK_FORWARD_IS_PCT:           { label:'WF Use % Splits',         desc:'Use percentage-based IS/OOS splits (true) vs fixed-bar-count splits (false). Default: true.', type:'boolean' },
-  WALK_FORWARD_MIN_TRAIN_BARS:   { label:'WF Min Train Bars',       desc:'Minimum number of in-sample bars required per fold; folds below this are skipped. Default: 100.', type:'number' },
-  SIG_N_PERMUTATIONS:            { label:'Permutations',            desc:'Number of random permutations for the significance p-value estimate. Default: 1000.',  type:'number' },
-  SIG_N_BOOTSTRAP:               { label:'Signal Bootstrap N',      desc:'Bootstrap resamples for signal confidence-interval construction. Default: 1000.',      type:'number' },
-  SIG_CONFIDENCE_LEVEL:          { label:'Signal CI Level',         desc:'Confidence level for signal bootstrap CIs (e.g. 0.95 = 95% CI). Default: 0.95.',      type:'number' },
-  REGIME_METHOD:                 { label:'Regime Method',           desc:'Default regime detection algorithm: volatility, trend, or hmm. Default: volatility.',  type:'select', opts:[{v:'volatility',l:'Volatility Threshold'},{v:'trend',l:'SMA Trend Band'},{v:'hmm',l:'Baum-Welch HMM'}] },
-  REGIME_N_REGIMES:              { label:'HMM Regimes',             desc:'Number of hidden states in the Baum-Welch HMM model. Default: 3.',                    type:'number' },
-  REGIME_VOL_WINDOW:             { label:'Vol Window (bars)',        desc:'Rolling window for volatility-threshold regime detection. Default: 20.',               type:'number' },
-  REGIME_TREND_WINDOW:           { label:'Trend Window (bars)',      desc:'Rolling window for SMA trend-band regime detection. Default: 50.',                    type:'number' },
-  REGIME_LOOKBACK_BARS:          { label:'Regime Lookback (bars)',   desc:'Limit regime detection to last N bars (0 = use all available data). Default: 0.',     type:'number' },
-  MC_N_SIMULATIONS:              { label:'MC Paths',                desc:'Number of Monte Carlo bootstrap simulation paths. Default: 5000.',                    type:'number' },
-  MC_HORIZON_DAYS:               { label:'MC Horizon (days)',       desc:'Number of trading days to simulate forward in Monte Carlo. Default: 252.',             type:'number' },
-  MC_METHOD:                     { label:'MC Method',               desc:'Monte Carlo simulation method. Default: bootstrap (block-resample from actual returns).', type:'select', opts:[{v:'bootstrap',l:'Bootstrap (block-resample)'}] },
-  MC_SEED:                       { label:'MC Random Seed',          desc:'Random seed for Monte Carlo reproducibility (-1 = random each run). Default: 42.',    type:'number' },
-  FACTOR_RISK_FREE_RATE:         { label:'Factor RF Rate',          desc:'Annualised risk-free rate for CAPM alpha computation (e.g. 0.04). Default: 0.04.',    type:'number' },
-  FACTOR_LOOKBACK_DAYS:          { label:'Factor Lookback (days)',  desc:'Number of trading days used for factor regression. Default: 252.',                    type:'number' },
-  FACTOR_USE_FF_DATA:            { label:'Use Fama-French Data',    desc:'Download Fama-French factor data for 3-factor/5-factor regression (requires internet). Default: false.', type:'boolean' },
-  SIGNAL_HORIZONS:               { label:'Signal Horizons',         desc:'Comma-separated forward-return horizons in days (e.g. 1,2,5,10,20). Default: 1,2,3,5,10,20,40.', type:'text' },
-  SIGNAL_MIN_OBSERVATIONS:       { label:'Signal Min Obs',          desc:'Minimum number of observations required per horizon for t-stat. Default: 30.',        type:'number' },
-  SIGNAL_SIGNIFICANCE_THRESH:    { label:'Signal Sig Threshold',    desc:'p-value threshold for marking a horizon as statistically significant. Default: 0.05.', type:'number' },
-  RISK_METHOD:                   { label:'Risk Method',             desc:'Risk attribution computation method. Default: historical (empirical percentile VaR/CVaR).', type:'select', opts:[{v:'historical',l:'Historical (empirical)'},{v:'parametric',l:'Parametric (normal)'},{v:'ewma',l:'EWMA (exp. weighted)'}] },
-  RISK_CONFIDENCE_LEVEL:         { label:'VaR Confidence',          desc:'Confidence level for VaR/CVaR calculations (e.g. 0.95 = 95%). Default: 0.95.',        type:'number' },
-  RISK_LOOKBACK_WINDOW:          { label:'Risk Lookback (bars)',     desc:'Rolling window in bars for risk calculations. Default: 252 (1 trading year).',         type:'number' },
-  ENHANCED_RISK_ATTRIBUTION:     { label:'Risk Attribution (default)', desc:'Enable --risk-attribution by default on every run without passing the flag explicitly.', type:'boolean' },
-  TC_COMMISSION_PCT:             { label:'Commission (%)',           desc:'Commission per trade as a decimal fraction (e.g. 0.001 = 0.1% = 10 bps). Default: 0.001.', type:'number' },
-  TC_SLIPPAGE_PCT:               { label:'Slippage (%)',             desc:'Slippage per trade as a decimal fraction (e.g. 0.0005 = 0.05% = 5 bps). Default: 0.0005.', type:'number' },
-  TC_SPREAD_BPS:                 { label:'Spread (bps)',             desc:'Bid-ask half-spread in basis points applied to each fill. Default: 2.0.',             type:'number' },
-  TC_USE_KYLE_IMPACT:            { label:'Kyle Market Impact',       desc:'Enable non-linear market impact modelling via the Kyle-lambda formula. Default: false.', type:'boolean' },
-  TC_KYLE_LAMBDA:                { label:'Kyle Lambda',              desc:'Kyle-lambda market impact coefficient (higher = more impact per unit of volume). Default: 0.1.', type:'number' },
-  TC_AVG_DAILY_VOLUME:           { label:'Avg Daily Volume',         desc:'Average daily volume for impact scaling (0 = use strategy default / disable). Default: 0.', type:'number' },
-  TC_N_SCENARIOS:                { label:'TC Scenarios',             desc:'Monte Carlo scenarios for transaction cost sensitivity analysis. Default: 10.',        type:'number' },
-  TEARSHEET_MONTHLY_RETURNS:     { label:'Monthly Returns',          desc:'Include monthly returns heatmap table in the tearsheet output. Default: true.',        type:'boolean' },
-  TEARSHEET_DRAWDOWN_PERIODS:    { label:'Drawdown Periods',         desc:'Include top drawdown periods table in the tearsheet output. Default: true.',           type:'boolean' },
-  TEARSHEET_MAX_DRAWDOWN_PERIODS:{ label:'Max Drawdown Rows',        desc:'Number of worst drawdown periods to list in the table. Default: 5.',                  type:'number' },
-  TEARSHEET_TRADE_ANALYSIS:      { label:'Trade Analysis',           desc:'Include per-trade statistics (win rate, avg win/loss, profit factor) in the tearsheet. Default: true.', type:'boolean' },
-  MLFLOW_TRACKING_URI:               { label:'Tracking URI',                desc:'MLflow server URI. When set, every run is logged as an MLflow experiment.', type:'text' },
-  MLFLOW_EXPERIMENT_NAME:            { label:'Experiment Name',             desc:'MLflow experiment name (default: Crucible).',          type:'text' },
-  MLFLOW_LOG_ARTIFACTS:              { label:'Log Artifacts',               desc:'Upload the HTML report as an MLflow artifact on completion.', type:'boolean' },
-  WEBHOOK_SECRET:                    { label:'HMAC Secret',                 desc:'HMAC-SHA256 secret for POST /webhook/trigger signature validation. Leave blank to disable signature checks.', type:'password' },
+  WALK_FORWARD_N_SPLITS:         { label:'WF Splits',               desc:{en:'Number of IS/OOS rolling splits for walk-forward validation. Default: 5.', zh:'walk-forward 驗證的 IS / OOS 滾動切割數。預設 5。'},            type:'number' },
+  WALK_FORWARD_OOS_PCT:          { label:'WF OOS %',                desc:{en:'Fraction of each split used as out-of-sample (0.0–1.0). Default: 0.3.', zh:'每個切割中作為樣本外的比例（0.0–1.0）。預設 0.3。'},              type:'number' },
+  WALK_FORWARD_IS_PCT:           { label:'WF Use % Splits',         desc:{en:'Use percentage-based IS/OOS splits (true) vs fixed-bar-count splits (false). Default: true.', zh:'使用百分比切割（true）或固定 bar 數切割（false）。預設 true。'}, type:'boolean' },
+  WALK_FORWARD_MIN_TRAIN_BARS:   { label:'WF Min Train Bars',       desc:{en:'Minimum number of in-sample bars required per fold; folds below this are skipped. Default: 100.', zh:'每個 fold 所需的最少樣本內 bar 數，少於此數的 fold 會被跳過。預設 100。'}, type:'number' },
+  SIG_N_PERMUTATIONS:            { label:'Permutations',            desc:{en:'Number of random permutations for the significance p-value estimate. Default: 1000.', zh:'估算顯著性 p-value 的隨機重排次數。預設 1000。'},  type:'number' },
+  SIG_N_BOOTSTRAP:               { label:'Signal Bootstrap N',      desc:{en:'Bootstrap resamples for signal confidence-interval construction. Default: 1000.', zh:'建構訊號信賴區間的 bootstrap 重抽樣次數。預設 1000。'},      type:'number' },
+  SIG_CONFIDENCE_LEVEL:          { label:'Signal CI Level',         desc:{en:'Confidence level for signal bootstrap CIs (e.g. 0.95 = 95% CI). Default: 0.95.', zh:'訊號 bootstrap 信賴區間的信心水準（例如 0.95 = 95% CI）。預設 0.95。'},      type:'number' },
+  REGIME_METHOD:                 { label:'Regime Method',           desc:{en:'Default regime detection algorithm: volatility, trend, or hmm. Default: volatility.', zh:'預設的市場狀態偵測演算法：volatility（波動率）、trend（趨勢）或 hmm。預設 volatility。'},  type:'select', opts:[{v:'volatility',l:'Volatility Threshold'},{v:'trend',l:'SMA Trend Band'},{v:'hmm',l:'Baum-Welch HMM'}] },
+  REGIME_N_REGIMES:              { label:'HMM Regimes',             desc:{en:'Number of hidden states in the Baum-Welch HMM model. Default: 3.', zh:'Baum-Welch HMM 模型的隱狀態數。預設 3。'},                    type:'number' },
+  REGIME_VOL_WINDOW:             { label:'Vol Window (bars)',        desc:{en:'Rolling window for volatility-threshold regime detection. Default: 20.', zh:'波動率閾值法狀態偵測的滾動窗口（bar 數）。預設 20。'},               type:'number' },
+  REGIME_TREND_WINDOW:           { label:'Trend Window (bars)',      desc:{en:'Rolling window for SMA trend-band regime detection. Default: 50.', zh:'SMA 趨勢帶狀態偵測的滾動窗口（bar 數）。預設 50。'},                    type:'number' },
+  REGIME_LOOKBACK_BARS:          { label:'Regime Lookback (bars)',   desc:{en:'Limit regime detection to last N bars (0 = use all available data). Default: 0.', zh:'限制狀態偵測只看最近 N 個 bar（0 = 使用全部可用資料）。預設 0。'},     type:'number' },
+  MC_N_SIMULATIONS:              { label:'MC Paths',                desc:{en:'Number of Monte Carlo bootstrap simulation paths. Default: 5000.', zh:'Monte Carlo bootstrap 模擬路徑數。預設 5000。'},                    type:'number' },
+  MC_HORIZON_DAYS:               { label:'MC Horizon (days)',       desc:{en:'Number of trading days to simulate forward in Monte Carlo. Default: 252.', zh:'Monte Carlo 向前模擬的交易日數。預設 252。'},             type:'number' },
+  MC_METHOD:                     { label:'MC Method',               desc:{en:'Monte Carlo simulation method. Default: bootstrap (block-resample from actual returns).', zh:'Monte Carlo 模擬方法。預設 bootstrap（從實際收益做 block 重抽樣）。'}, type:'select', opts:[{v:'bootstrap',l:'Bootstrap (block-resample)'}] },
+  MC_SEED:                       { label:'MC Random Seed',          desc:{en:'Random seed for Monte Carlo reproducibility (-1 = random each run). Default: 42.', zh:'Monte Carlo 可重現性的隨機種子（-1 = 每次執行隨機）。預設 42。'},    type:'number' },
+  FACTOR_RISK_FREE_RATE:         { label:'Factor RF Rate',          desc:{en:'Annualised risk-free rate for CAPM alpha computation (e.g. 0.04). Default: 0.04.', zh:'計算 CAPM alpha 用的年化無風險利率（例如 0.04）。預設 0.04。'},    type:'number' },
+  FACTOR_LOOKBACK_DAYS:          { label:'Factor Lookback (days)',  desc:{en:'Number of trading days used for factor regression. Default: 252.', zh:'因子迴歸使用的交易日數。預設 252。'},                    type:'number' },
+  FACTOR_USE_FF_DATA:            { label:'Use Fama-French Data',    desc:{en:'Download Fama-French factor data for 3-factor/5-factor regression (requires internet). Default: false.', zh:'下載 Fama-French 因子資料以做 3 因子 / 5 因子迴歸（需要網路）。預設 false。'}, type:'boolean' },
+  SIGNAL_HORIZONS:               { label:'Signal Horizons',         desc:{en:'Comma-separated forward-return horizons in days (e.g. 1,2,5,10,20). Default: 1,2,3,5,10,20,40.', zh:'前向收益的觀察期（天），以逗號分隔（例如 1,2,5,10,20）。預設 1,2,3,5,10,20,40。'}, type:'text' },
+  SIGNAL_MIN_OBSERVATIONS:       { label:'Signal Min Obs',          desc:{en:'Minimum number of observations required per horizon for t-stat. Default: 30.', zh:'每個 horizon 計算 t-stat 所需的最少觀察數。預設 30。'},        type:'number' },
+  SIGNAL_SIGNIFICANCE_THRESH:    { label:'Signal Sig Threshold',    desc:{en:'p-value threshold for marking a horizon as statistically significant. Default: 0.05.', zh:'判定 horizon 是否統計顯著的 p-value 閾值。預設 0.05。'}, type:'number' },
+  RISK_METHOD:                   { label:'Risk Method',             desc:{en:'Risk attribution computation method. Default: historical (empirical percentile VaR/CVaR).', zh:'風險歸因計算方法。預設 historical（經驗百分位 VaR / CVaR）。'}, type:'select', opts:[{v:'historical',l:'Historical (empirical)'},{v:'parametric',l:'Parametric (normal)'},{v:'ewma',l:'EWMA (exp. weighted)'}] },
+  RISK_CONFIDENCE_LEVEL:         { label:'VaR Confidence',          desc:{en:'Confidence level for VaR/CVaR calculations (e.g. 0.95 = 95%). Default: 0.95.', zh:'VaR / CVaR 計算的信心水準（例如 0.95 = 95%）。預設 0.95。'},        type:'number' },
+  RISK_LOOKBACK_WINDOW:          { label:'Risk Lookback (bars)',     desc:{en:'Rolling window in bars for risk calculations. Default: 252 (1 trading year).', zh:'風險計算的滾動窗口（bar 數）。預設 252（一個交易年）。'},         type:'number' },
+  ENHANCED_RISK_ATTRIBUTION:     { label:'Risk Attribution (default)', desc:{en:'Enable --risk-attribution by default on every run without passing the flag explicitly.', zh:'預設啟用 --risk-attribution，不需每次明確帶旗標。'}, type:'boolean' },
+  TC_COMMISSION_PCT:             { label:'Commission (%)',           desc:{en:'Commission per trade as a decimal fraction (e.g. 0.001 = 0.1% = 10 bps). Default: 0.001.', zh:'每筆交易的佣金（小數，例如 0.001 = 0.1% = 10 bps）。預設 0.001。'}, type:'number' },
+  TC_SLIPPAGE_PCT:               { label:'Slippage (%)',             desc:{en:'Slippage per trade as a decimal fraction (e.g. 0.0005 = 0.05% = 5 bps). Default: 0.0005.', zh:'每筆交易的滑價（小數，例如 0.0005 = 0.05% = 5 bps）。預設 0.0005。'}, type:'number' },
+  TC_SPREAD_BPS:                 { label:'Spread (bps)',             desc:{en:'Bid-ask half-spread in basis points applied to each fill. Default: 2.0.', zh:'套用到每筆成交的買賣價差半幅（bps）。預設 2.0。'},             type:'number' },
+  TC_USE_KYLE_IMPACT:            { label:'Kyle Market Impact',       desc:{en:'Enable non-linear market impact modelling via the Kyle-lambda formula. Default: false.', zh:'啟用 Kyle-lambda 公式做非線性市場衝擊建模。預設 false。'}, type:'boolean' },
+  TC_KYLE_LAMBDA:                { label:'Kyle Lambda',              desc:{en:'Kyle-lambda market impact coefficient (higher = more impact per unit of volume). Default: 0.1.', zh:'Kyle-lambda 市場衝擊係數（越高 = 每單位 volume 的衝擊越大）。預設 0.1。'}, type:'number' },
+  TC_AVG_DAILY_VOLUME:           { label:'Avg Daily Volume',         desc:{en:'Average daily volume for impact scaling (0 = use strategy default / disable). Default: 0.', zh:'用於衝擊縮放的日均 volume（0 = 使用策略預設 / 停用）。預設 0。'}, type:'number' },
+  TC_N_SCENARIOS:                { label:'TC Scenarios',             desc:{en:'Monte Carlo scenarios for transaction cost sensitivity analysis. Default: 10.', zh:'交易成本敏感度分析的 Monte Carlo 情境數。預設 10。'},        type:'number' },
+  TEARSHEET_MONTHLY_RETURNS:     { label:'Monthly Returns',          desc:{en:'Include monthly returns heatmap table in the tearsheet output. Default: true.', zh:'tearsheet 輸出包含月度收益熱圖表。預設 true。'},        type:'boolean' },
+  TEARSHEET_DRAWDOWN_PERIODS:    { label:'Drawdown Periods',         desc:{en:'Include top drawdown periods table in the tearsheet output. Default: true.', zh:'tearsheet 輸出包含最大回撤期間表。預設 true。'},           type:'boolean' },
+  TEARSHEET_MAX_DRAWDOWN_PERIODS:{ label:'Max Drawdown Rows',        desc:{en:'Number of worst drawdown periods to list in the table. Default: 5.', zh:'表中列出的最差回撤期間數量。預設 5。'},                  type:'number' },
+  TEARSHEET_TRADE_ANALYSIS:      { label:'Trade Analysis',           desc:{en:'Include per-trade statistics (win rate, avg win/loss, profit factor) in the tearsheet. Default: true.', zh:'tearsheet 包含每筆交易統計（勝率、平均盈虧、profit factor）。預設 true。'}, type:'boolean' },
+  MLFLOW_TRACKING_URI:               { label:'Tracking URI',                desc:{en:'MLflow server URI. When set, every run is logged as an MLflow experiment.', zh:'MLflow 伺服器 URI。設定後每次執行都會記錄為 MLflow 實驗。'}, type:'text' },
+  MLFLOW_EXPERIMENT_NAME:            { label:'Experiment Name',             desc:{en:'MLflow experiment name (default: Crucible).', zh:'MLflow 實驗名稱（預設：Crucible）。'},          type:'text' },
+  MLFLOW_LOG_ARTIFACTS:              { label:'Log Artifacts',               desc:{en:'Upload the HTML report as an MLflow artifact on completion.', zh:'執行結束時將 HTML 報告作為 MLflow artifact 上傳。'}, type:'boolean' },
+  WEBHOOK_SECRET:                    { label:'HMAC Secret',                 desc:{en:'HMAC-SHA256 secret for POST /webhook/trigger signature validation. Leave blank to disable signature checks.', zh:'POST /webhook/trigger 簽章驗證用的 HMAC-SHA256 secret。留空停用簽章檢查。'}, type:'password' },
+  CRUCIBLE_RUN_INSIGHTS_ENABLED:          { label:'Enable Ledger',         desc:{en:'Master switch for the run-insights ledger. Set to false to disable the entire subsystem — recorder becomes a no-op, zero I/O, and the per-run Insights tab + dashboard widget show as disabled.', zh:'Run Insights 帳本主開關。關閉後整個子系統停用:recorder 變 no-op、零 I/O、per-run Insights 分頁與 dashboard 卡片顯示停用。'}, type:'boolean' },
+  CRUCIBLE_RUN_INSIGHTS_RECORD_OUTPUT:    { label:'Record Output Methods', desc:{en:'Record an output_method event each time section 07 successfully saves a project (model id, framework, validation verdict, artefact list, score).', zh:'section 07 成功儲存專案時記錄 output_method 事件(模型 id、framework、驗證結論、artefact 清單、score)。'}, type:'boolean' },
+  CRUCIBLE_RUN_INSIGHTS_RECORD_ERRORS:    { label:'Record Errors',         desc:{en:'Record an error_record event when a retryable operation exhausts all retries in resilience.kickoff_crew_with_retry (exception class, message head, retry count).', zh:'resilience.kickoff_crew_with_retry 重試耗盡時記錄 error_record 事件(例外類別、message head、retry 次數)。'}, type:'boolean' },
+  CRUCIBLE_RUN_INSIGHTS_RECORD_DEBATE:    { label:'Record Debate Rejections', desc:{en:'Record a direction_debate_rejection event when Stage 0 force-nones a candidate direction, or parse-fails after all fallbacks (judge verdict excerpt, rejection reason).', zh:'Stage 0 force-none 候選方向或所有 fallback 後仍 parse 失敗時記錄 direction_debate_rejection 事件(judge 評語節錄、拒絕原因)。'}, type:'boolean' },
+  CRUCIBLE_RUN_INSIGHTS_RECORD_PARAMS:    { label:'Record Runtime Parameters', desc:{en:'auto = record in Quant mode only (matches the Quant-records / non-Quant-skips requirement); 1 = always record; 0 = never record. Typos fall back to auto, never truthy-coerce.', zh:'auto = 僅 Quant 模式記錄(符合「Quant 記錄、非 Quant 不記錄」需求);1 = 永遠記錄;0 = 永遠不記錄。拼錯的值 fallback 回 auto,不會被 truthy-coerce。'}, type:'select', opts:[{v:'auto',l:'auto (Quant only)'},{v:'1',l:'1 (always record)'},{v:'0',l:'0 (never record)'}] },
+  CRUCIBLE_RUN_INSIGHTS_REDACT:           { label:'Redact Sensitive Fields', desc:{en:'Recursively redact sensitive field names (api_key, token, secret, webhook_url, auth, etc.) from payloads before write. Highly recommended; runtime_params payloads can embed operator config dicts with webhook URLs / API tokens.', zh:'寫入前對敏感欄位(api_key、token、secret、webhook_url、auth 等)做遞迴遮蔽。強烈建議開啟;runtime_params payload 可能嵌入含 webhook URL / API token 的設定 dict。'}, type:'boolean' },
+  CRUCIBLE_RUN_INSIGHTS_BACKEND:          { label:'Storage Backend',       desc:{en:'Storage backend selector. local = JSONL streams under .crucible_insights/ (only this is implemented today). cloudflare / dual are protocol stubs that raise NotImplementedError until the cloud backend ships.', zh:'儲存後端選擇器。local = .crucible_insights/ 下的 JSONL streams(目前唯一實作);cloudflare / dual 為 protocol stub,雲端後端上線前會 raise NotImplementedError。'}, type:'select', opts:[{v:'local',l:'local (JSONL on disk)'},{v:'cloudflare',l:'cloudflare (not yet implemented)'},{v:'dual',l:'dual (not yet implemented)'}] },
 };
 
 function _toggleSection(hdr) {
@@ -2635,6 +3022,27 @@ async function loadSettings() {
     showToast('Failed to load settings — check server connection', 'error');
   }
   loadWebhookHistory();
+}
+
+// v1.1.0: snapshot of the env values as they appeared when Settings was
+// last rendered.  ``saveSettings`` only POSTs keys whose current input
+// value differs from this snapshot — protects operator overrides that
+// were set via shell ``export`` and would otherwise be silently nuked by
+// the empty string in a freshly-rendered (commented-out-in-.env.example)
+// input field.
+let _SETTINGS_BASELINE = {};
+
+function _snapshotSettingsBaseline() {
+  _SETTINGS_BASELINE = {};
+  document.querySelectorAll('[data-env-key]').forEach(el => {
+    const key = el.dataset.envKey;
+    if (!key) return;
+    if (el.type === 'checkbox') {
+      _SETTINGS_BASELINE[key] = el.checked ? '1' : '0';
+    } else {
+      _SETTINGS_BASELINE[key] = (el.value == null) ? '' : String(el.value);
+    }
+  });
 }
 
 function renderSettings(env) {
@@ -2702,6 +3110,10 @@ function renderSettings(env) {
   if (providerEl) {
     providerEl.addEventListener('change', () => _updateProviderHighlight(providerEl.value));
   }
+
+  // Capture the rendered state as the baseline for dirty-tracking so
+  // saveSettings can detect which inputs the operator actually changed.
+  _snapshotSettingsBaseline();
 }
 
 function _updateProviderHighlight(activeProvider) {
@@ -2731,7 +3143,16 @@ function _updateProviderHighlight(activeProvider) {
 
 function _renderKeyItem(key, val, meta) {
   const id       = `env-${key}`;
-  const isSecret = meta.type === 'password' || /api.?key|secret|token/i.test(key);
+  // v1.1.0 fifth-pass (G-24): broadened secret detection.  The
+  // previous regex (/api.?key|secret|token/i) missed common patterns
+  // that the v1.1.0 fifth-pass audit found in operator .env files —
+  // notably webhook URLs (Slack/Discord/Teams), routing keys
+  // (PagerDuty), client_id/dsn (Sentry), private keys, and bearer
+  // tokens.  These keys land in the "Other" group when they fall
+  // outside SETTINGS_SCHEMA; without the mask flag, real webhook
+  // URLs containing authentication path tokens display as plain
+  // text on screen — a real shoulder-surf / screen-share leak.
+  const isSecret = meta.type === 'password' || /api.?key|secret|token|password|passwd|webhook.?url|routing.?key|bot.?(id|token)|credentials|bearer|signing.?key|private.?key|dsn|auth/i.test(key);
   const badge    = isSecret ? '<span class="settings-secret-badge">secret</span>' : '';
   const descHtml = meta.desc ? `<div class="settings-desc">${escHtml(getDesc(meta.desc))}</div>` : '';
   const hdr      = `<div class="settings-item-hdr">
@@ -2791,25 +3212,63 @@ function _renderKeyItem(key, val, meta) {
 }
 
 async function saveSettings() {
+  // v1.1.0: only POST keys whose current input value differs from the
+  // baseline snapshot captured when the page was rendered.  Previously
+  // every ``[data-env-key]`` element was serialised on Save, which meant
+  // a freshly-rendered empty input (e.g. for a key that was commented-out
+  // in .env.example) would persist ``KEY=""`` into .env even though the
+  // operator never touched it — silently nuking any shell-export override.
+  // Skipping unchanged keys is a no-op on the happy path and prevents the
+  // data-loss class of bugs without changing the legitimate save flow.
   const inputs = document.querySelectorAll('[data-env-key]');
   const data = {};
+  let dirtyCount = 0;
   inputs.forEach(el => {
     const key = el.dataset.envKey;
+    if (!key) return;
+    let current;
     if (el.type === 'checkbox') {
-      data[key] = el.checked ? '1' : '0';
+      current = el.checked ? '1' : '0';
     } else {
-      data[key] = el.value;
+      current = (el.value == null) ? '' : String(el.value);
+    }
+    const baseline = (_SETTINGS_BASELINE && (key in _SETTINGS_BASELINE))
+      ? _SETTINGS_BASELINE[key]
+      : null;
+    // null baseline → no snapshot recorded (e.g. snapshot helper hasn't
+    // run yet); fall through to legacy "send everything" behaviour for
+    // safety.  In the normal flow the baseline is populated immediately
+    // after the page renders, so this branch only triggers on a stale
+    // DOM that never went through renderSettings().
+    if (baseline === null || current !== baseline) {
+      data[key] = current;
+      dirtyCount += 1;
     }
   });
+
+  if (dirtyCount === 0) {
+    showToast('No changes to save', 'info');
+    return;
+  }
+
   // Prevent double-submit while request is in-flight
   const saveBtn = document.querySelector('#page-settings .btn-primary');
   if (saveBtn) saveBtn.disabled = true;
   try {
-    const resp = await fetch('/api/env', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(data) });
+    const resp = await fetch('/api/env', {
+      method: 'POST',
+      headers: {'Content-Type':'application/json', 'X-Requested-With': 'XMLHttpRequest'},
+      body: JSON.stringify(data),
+    });
     if (!resp.ok) throw new Error(`Server error ${resp.status}`);
     const result = await resp.json();
     if (result.success) {
-      showToast('Settings saved to .env ✓', 'success');
+      showToast(`Settings saved to .env (${dirtyCount} key${dirtyCount === 1 ? '' : 's'}) ✓`, 'success');
+      // Settings just wrote new values to .env — invalidate the per-run flag
+      // panel cache so env-backed flags (Run Insights ledger toggles) on the
+      // Idea / Path pages re-sync from the freshly written state.  Fire and
+      // forget; the panels stay usable even if this re-render fails.
+      try { _refreshEnvCacheAndRerender(); } catch (e) { /* non-fatal */ }
     } else {
       showToast('Save failed: ' + (result.error || 'unknown error'), 'error');
     }
@@ -3502,6 +3961,12 @@ async function testWebhook() {
 
   renderFlagGroups('project', 1);
   renderFlagGroups('idea', 1);
+
+  // After the synchronous first render with FLAG_META.isDefault values, fetch
+  // the live /api/env state and re-render so env-backed flags (Run Insights
+  // ledger toggles) reflect what the recorder will actually do.  Non-blocking;
+  // if the fetch fails the panels keep the hardcoded defaults.
+  _refreshEnvCacheAndRerender();
 
   // v1.0.3: ``window.WEBUI_URL`` is set by an inline script in
   // ``index.html`` from the ``webui_url`` Jinja variable — this file is

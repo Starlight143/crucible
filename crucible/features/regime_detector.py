@@ -24,7 +24,7 @@ import math
 import os
 import random
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -144,14 +144,28 @@ class RegimeDetectionResult:
 # ── Statistical helpers ────────────────────────────────────────────────────────
 
 def _rolling_std(values: List[float], window: int) -> List[Optional[float]]:
-    """Compute rolling standard deviation (sample std, ddof=1) of the window."""
+    """Compute rolling standard deviation (sample std, ddof=1) of the window.
+
+    v1.1.0 fifth-pass (G-9): NaN-sentinel-aware.  ``_equity_to_returns``
+    emits ``float('nan')`` for invalid bars; we drop them inside each
+    window before computing.  If fewer than 2 finite samples remain in
+    a window, that window's std is reported as ``None`` instead of
+    contaminating downstream classification with a zero std (which
+    would over-classify bars as low-volatility "bull").
+    """
     if window <= 0:
         return [None] * len(values)
     result: List[Optional[float]] = [None] * len(values)
     for i in range(window - 1, len(values)):
-        window_vals = values[i - window + 1: i + 1]
-        mean = sum(window_vals) / window
-        var = sum((v - mean) ** 2 for v in window_vals) / (window - 1) if window > 1 else 0.0
+        window_vals = [v for v in values[i - window + 1: i + 1] if math.isfinite(v)]
+        n = len(window_vals)
+        if n < 2:
+            # Too few finite samples — emit None so the volatility-regime
+            # logic treats this bar as "unknown" (mapped to "sideways"
+            # in _detect_volatility), not as zero-volatility "bull".
+            continue
+        mean = sum(window_vals) / n
+        var = sum((v - mean) ** 2 for v in window_vals) / (n - 1)
         result[i] = math.sqrt(var)
     return result
 
@@ -260,6 +274,20 @@ def _gaussian_pdf(x: float, mu: float, sigma: float) -> float:
     return max(val, 1e-300)
 
 
+class HMMInsufficientDataError(ValueError):
+    """Raised by ``_run_hmm_em`` when the observation series is too short
+    to fit a ``K``-state model.  Caller (``_detect_hmm`` /
+    ``detect_regimes``) catches this and surfaces an explicit warning
+    instead of silently labelling every bar as state 0.
+
+    v1.1.0 fifth-pass (G-10): previously the function returned
+    ``([0]*T, [0]*K, [1]*K)`` — a "valid-looking" result that mapped
+    every bar to whichever label ``state_order[0]`` happened to align
+    to, with no warning to the operator.  Fail loud per CLAUDE.md
+    "high-risk system" rules.
+    """
+
+
 def _run_hmm_em(
     observations: List[float],
     n_states: int,
@@ -272,11 +300,18 @@ def _run_hmm_em(
 
     Returns (state_sequence, means, stds).
     State sequence has the same length as observations.
+
+    v1.1.0 fifth-pass (G-10): raises ``HMMInsufficientDataError`` when
+    T < K*2 rather than silently returning a degenerate all-zero path.
     """
     T = len(observations)
     K = n_states
     if T < K * 2:
-        return [0] * T, [0.0] * K, [1.0] * K
+        raise HMMInsufficientDataError(
+            f"HMM requires at least {K * 2} observations to fit "
+            f"{K} states; got {T}.  Fall back to a non-HMM method "
+            "(volatility / trend) for very short series."
+        )
 
     rng = random.Random(seed)
 
@@ -290,7 +325,17 @@ def _run_hmm_em(
     global_std = math.sqrt(
         sum((v - _obs_mean) ** 2 for v in observations) / T
     ) if T > 1 else 1.0
-    stds: List[float] = [max(global_std, 1e-8)] * K
+    # v1.1.0 third-pass: scale-aware std floor.  A flat 1e-14 was
+    # mathematically clean but operationally too aggressive — a single
+    # outlier in the observation series could pull a regime's std to
+    # ~1e-14, after which every off-state emission's log-likelihood
+    # term ``(x-µ)²/σ²`` ballooned to ~1e+28 and dominated the
+    # transition log-probs, smearing the Viterbi regime boundaries.
+    # Floor at the larger of ``global_std × 1e-6`` (a physically
+    # meaningful 6-order-of-magnitude buffer below the dataset's
+    # natural scale) and the absolute 1e-14 backstop.
+    _STD_FLOOR = max(global_std * 1e-6, 1e-14) if global_std > 0 else 1e-14
+    stds: List[float] = [max(global_std, _STD_FLOOR)] * K
 
     # Uniform transition matrix and initial distribution
     pi: List[float] = [1.0 / K] * K
@@ -383,11 +428,16 @@ def _run_hmm_em(
                 sum(gamma[t][k] * (observations[t] - means[k]) ** 2 for t in range(T))
                 / gamma_sum
             )
-            stds[k] = max(math.sqrt(var_k), 1e-8)
+            stds[k] = max(math.sqrt(var_k), _STD_FLOOR)
 
         # Log-likelihood
         log_lik = sum(math.log(s) for s in scale if s > 0)
-        if abs(log_lik - prev_log_lik) < tol:
+        # v1.1.0 fifth-pass (G-11): relative-tolerance EM convergence.
+        # Absolute ``|Δ| < tol`` (tol=1e-4) for long sequences (T=10k)
+        # is roughly 1e-8 relative precision — typically never met,
+        # so EM ran all 100 iterations every time.  Relative tolerance
+        # is the same fix pattern as ``_power_iteration`` (M9).
+        if abs(log_lik - prev_log_lik) < tol * max(abs(log_lik), 1.0):
             break
         prev_log_lik = log_lik
 
@@ -427,9 +477,31 @@ def _detect_hmm(
     """
     Assign regime labels using HMM. Higher-mean state → "bull", lower → "bear".
     With 3 states: highest → "bull", lowest → "bear", middle → "sideways".
+
+    v1.1.0 fifth-pass (G-9, G-10): filter NaN sentinels before fitting,
+    and catch ``HMMInsufficientDataError`` so the volatility-fallback
+    in ``detect_regimes`` runs instead of returning meaningless labels.
     """
     K = max(2, min(config.n_regimes, 3))
-    path, means, _ = _run_hmm_em(returns, n_states=K)
+    finite_rets = _finite_only(returns)
+    if len(finite_rets) < K * 2:
+        raise HMMInsufficientDataError(
+            f"HMM requires {K * 2} finite returns; got {len(finite_rets)} "
+            f"(of {len(returns)}).  Falling back to volatility method."
+        )
+    path_finite, means, _ = _run_hmm_em(finite_rets, n_states=K)
+    # Re-align the path back onto the original return series (NaN bars
+    # inherit the previous bar's regime, or "sideways" if leading).
+    path: List[int] = []
+    finite_iter = iter(path_finite)
+    last_state = 0
+    for r in returns:
+        if math.isfinite(r):
+            try:
+                last_state = next(finite_iter)
+            except StopIteration:
+                pass
+        path.append(last_state)
 
     # Sort states by mean return
     state_order = sorted(range(K), key=lambda k: means[k])
@@ -504,7 +576,14 @@ def detect_regimes(
         elif method == "trend":
             labels = _detect_trend(prices, timestamps, config)
         elif method == "hmm":
-            labels = _detect_hmm(returns, config)
+            # v1.1.0 fifth-pass (G-10): catch insufficient-data so we
+            # fall back to volatility method instead of silently
+            # returning meaningless labels.
+            try:
+                labels = _detect_hmm(returns, config)
+            except HMMInsufficientDataError as exc:
+                result.warnings.append(str(exc))
+                labels = _detect_volatility(returns, timestamps, config)
         else:
             result.warnings.append(
                 f"Unknown method '{method}', falling back to 'volatility'"
@@ -672,19 +751,43 @@ def _load_equity_curve(run_dir: str) -> Tuple[List[float], List[str]]:
 
 
 def _equity_to_returns(equity: List[float]) -> List[float]:
+    """Convert equity curve to period returns with NaN sentinel for bad bars.
+
+    v1.1.0 fifth-pass (G-9): substitutes ``float('nan')`` (not ``0.0``)
+    when prev≤0 / non-finite / curr non-finite.  Matches the contract
+    established by ``quant_analytics._equity_to_returns`` (v1.1.0 M6).
+    Downstream callers (``_rolling_std``, ``_detect_volatility``,
+    ``_detect_trend``, ``_detect_hmm``, ``_regime_stats``) are
+    responsible for filtering NaN before aggregation; treating bad
+    bars as synthetic flat-bar zero returns biased low-volatility
+    "bull" regime classifications.
+    """
     if len(equity) < 2:
         return []
-    returns = []
+    returns: List[float] = []
     for i in range(1, len(equity)):
         prev = equity[i - 1]
-        # Guard against NaN/Inf and non-positive equity: `nan != 0` evaluates
-        # to True in Python, and equity ≤ 0 is semantically invalid for a
-        # portfolio value.  Use `> 0` which subsumes the != 0 check.
-        if prev > 0 and math.isfinite(prev) and math.isfinite(equity[i]):
-            returns.append((equity[i] - prev) / prev)
+        curr = equity[i]
+        if (
+            prev > 1e-14
+            and math.isfinite(prev)
+            and math.isfinite(curr)
+        ):
+            r = (curr - prev) / prev
+            returns.append(r if math.isfinite(r) else float("nan"))
         else:
-            returns.append(0.0)
+            returns.append(float("nan"))
     return returns
+
+
+def _finite_only(values: Iterable[float]) -> List[float]:
+    """Helper used by regime aggregators to drop NaN sentinels.
+
+    v1.1.0 fifth-pass (G-9): centralises the NaN filter so every consumer
+    of ``_equity_to_returns`` strips sentinel bars before computing
+    statistics.  Returns a new list; never mutates the input.
+    """
+    return [v for v in values if math.isfinite(v)]
 
 
 # ── Public runner ──────────────────────────────────────────────────────────────

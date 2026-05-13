@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import random
 import re
 import threading
@@ -547,6 +548,26 @@ def execute_with_retry(
                 )
             return result
     if last_error is not None:
+        # v1.1.0 run_insights: emit error_record when retries are exhausted.
+        # Best-effort; failure here must not mask the original error.
+        try:
+            if __package__ == "crucible":
+                from .features.run_insights import get_recorder as _ri_get_recorder
+                from .run_correlation import get_run_id as _ri_get_run_id
+            else:  # pragma: no cover
+                from features.run_insights import get_recorder as _ri_get_recorder  # type: ignore[no-redef]
+                from run_correlation import get_run_id as _ri_get_run_id  # type: ignore[no-redef]
+            _ri_get_recorder().record_error(
+                run_id=_ri_get_run_id() or os.environ.get("CRUCIBLE_RUN_ID", "").strip(),
+                project_name=str((log_fields or {}).get("project_name") or "stage_pending"),
+                mode=str((log_fields or {}).get("mode") or ""),
+                stage=str((log_fields or {}).get("stage") or operation_name),
+                exception_class=type(last_error).__name__,
+                message=str(last_error)[:300],
+                retry_count=int(attempts),
+            )
+        except Exception:
+            pass
         raise last_error
     raise RuntimeError(f"{operation_name} exhausted retry attempts without result.")
 

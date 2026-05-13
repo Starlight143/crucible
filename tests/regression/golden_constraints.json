@@ -1,16 +1,16 @@
 {
   "_comment": "Golden constraints for cross-run regression testing.",
-  "_description": "Each entry defines expected value ranges / invariants for a completed pipeline run. Add entries here to build your regression baseline. See test_regression_runner.py for the constraint schema.",
+  "_description": "Each entry under `examples` defines expected value ranges / invariants for a completed pipeline run. SyntheticGoldenRun is a fixture shipped under tests/regression/fixtures/ so the regression test always has at least one constraint to validate; production runs (under saved_projects/) can add their own entries to build a per-operator baseline.",
   "examples": [
     {
-      "run_id": "EXAMPLE_RUN_ID",
-      "project_name": "ExampleProject",
+      "run_id": "SyntheticGoldenRun",
+      "project_name": "SyntheticGoldenRun",
       "constraints": {
-        "score_min": 50,
-        "score_max": 100,
-        "risk_level_allowed": ["low", "medium", "high"],
+        "score_min": 70,
+        "score_max": 90,
+        "risk_level_allowed": ["low", "medium"],
         "gate_decision_must_not_be": ["kill"],
-        "blocking_risks_max": 5,
+        "blocking_risks_max": 3,
         "experiments_min": 1,
         "has_consensus": true,
         "has_direction": true

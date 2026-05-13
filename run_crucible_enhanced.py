@@ -2470,6 +2470,22 @@ def _build_parser() -> argparse.ArgumentParser:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
+    # v1.1.0: bind the run-correlation contextvar at the very start so every
+    # downstream emit (telemetry, structured logs, run_insights ledger)
+    # carries a consistent run_id.  When the WebUI spawned this process, the
+    # WebUI's own run_id was passed via CRUCIBLE_RUN_ID so its `sess.run_id`
+    # matches the ledger entries and the per-run Insights tab populates.
+    # Direct CLI invocations fall back to a fresh UUID4.
+    try:
+        try:
+            from crucible.run_correlation import set_run_id as _set_run_id
+        except ImportError:
+            from run_correlation import set_run_id as _set_run_id  # type: ignore[no-redef]
+        _set_run_id(os.environ.get("CRUCIBLE_RUN_ID") or None)
+    except Exception:
+        # Correlation-id binding must never break the pipeline boot.
+        pass
+
     parser = _build_parser()
 
     # Use parse_known_args so that core CLI flags (--provider, --dry-run, etc.)

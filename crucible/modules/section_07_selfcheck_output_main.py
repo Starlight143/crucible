@@ -33,6 +33,9 @@ if __package__ == "crucible.modules":
         log_exception,
         update_log_context,
     )
+    from ..run_correlation import get_run_id as _get_run_id, set_run_id as _set_run_id
+    from ..features.run_insights import get_recorder as _get_insights_recorder
+    from ..features.run_insights.schema import OutcomeStatus as _InsightOutcome
 else:  # pragma: no cover - direct script fallback
     from resilience import kickoff_crew_with_retry, reset_circuit_breakers
     from runtime_logging import (
@@ -43,6 +46,12 @@ else:  # pragma: no cover - direct script fallback
         log_exception,
         update_log_context,
     )
+    from run_correlation import (  # type: ignore[no-redef]
+        get_run_id as _get_run_id,
+        set_run_id as _set_run_id,
+    )
+    from features.run_insights import get_recorder as _get_insights_recorder  # type: ignore[no-redef]
+    from features.run_insights.schema import OutcomeStatus as _InsightOutcome  # type: ignore[no-redef]
 
 
 LOGGER = get_logger(__name__)
@@ -892,6 +901,19 @@ def run_self_check() -> bool:
 
 
 def main() -> None:
+    # v1.1.0: bind the run-correlation contextvar before any pipeline work
+    # happens so every emit (telemetry, structured logs, run_insights ledger)
+    # carries a consistent run_id.  When the WebUI spawned us, CRUCIBLE_RUN_ID
+    # was already set; otherwise set_run_id() falls back to a fresh UUID4.
+    # Idempotent: re-binding to the same env value is a no-op.  Without this
+    # fallback, direct invocations of section_07's main() (`crucible.cli`
+    # binds it as `main`) would leave _RUN_ID="" and ledger rows ungroupable.
+    try:
+        _set_run_id(os.environ.get("CRUCIBLE_RUN_ID") or None)
+    except Exception:
+        # Correlation-id binding must never break the pipeline boot.
+        pass
+
     entry_defaults = _resolve_runtime_entry_defaults()
     parser = argparse.ArgumentParser(
         prog="run_crucible.py",
@@ -2520,6 +2542,155 @@ def save_project_output(
 
     print_labels = _get_print_labels(use_cjk)
     print(f"\n{print_labels['project_saved_to']} {project_dir}")
+
+    # v1.1.0 run_insights: record output_method + (Quant only) runtime_params.
+    # This is the single source-of-truth point — every saved run flows
+    # through here, so the insights ledger always sees what the WebUI sees.
+    # Best-effort, never raises.
+    try:
+        _insights_recorder = _get_insights_recorder()
+        _saved_mode = run_meta_payload.get("mode") or authoritative_mode or ""
+        _user_problem_text = ""
+        try:
+            if result is not None:
+                _user_problem_text = str(getattr(result, "user_problem", "") or "")
+        except Exception:
+            _user_problem_text = ""
+        if not _user_problem_text:
+            _user_problem_text = str(run_meta_payload.get("user_problem") or "")
+        _validation_verdict = None
+        try:
+            if review is not None:
+                _validation_verdict = "passed" if bool(review.passes) else "failed"
+        except Exception:
+            _validation_verdict = None
+        _entrypoint = run_meta_payload.get("entrypoint_override") or None
+        _artefact_names: List[str] = []
+        try:
+            for _entry in os.listdir(project_dir):
+                if not _entry.startswith("."):
+                    _artefact_names.append(_entry)
+            _artefact_names.sort()
+        except OSError:
+            _artefact_names = []
+        _outcome_status = _InsightOutcome.SUCCESS
+        _outcome_score: Optional[float] = None
+        try:
+            if review is not None and not bool(review.passes):
+                _outcome_status = _InsightOutcome.PARTIAL
+            _score_raw = run_meta_payload.get("score")
+            if _score_raw is None and result is not None:
+                _score_raw = getattr(result, "overall_score", None)
+            if _score_raw is not None:
+                _outcome_score = float(_score_raw) / 100.0
+        except (TypeError, ValueError):
+            _outcome_score = None
+
+        # v1.1.0 fifth-pass (G-20): best-effort read of backtest_report.json
+        # to enrich the ledger emit with data provenance.  Failure to
+        # read is silent — non-Quant modes don't write this file.
+        _bt_data_source: Optional[str] = (
+            run_meta_payload.get("backtest_data_source") or None
+        )
+        _bt_actual_symbol: Optional[str] = (
+            run_meta_payload.get("backtest_actual_symbol") or None
+        )
+        if _bt_data_source is None:
+            try:
+                _bt_report_path = os.path.join(project_dir, "backtest_report.json")
+                if os.path.isfile(_bt_report_path):
+                    with open(_bt_report_path, "r", encoding="utf-8") as _bt_fh:
+                        _bt_report = json.load(_bt_fh)
+                    if isinstance(_bt_report, dict):
+                        _ds_raw = _bt_report.get("data_source")
+                        if isinstance(_ds_raw, str) and _ds_raw.strip():
+                            _bt_data_source = _ds_raw.strip()
+                        _sym_raw = (
+                            _bt_report.get("data_actual_symbol")
+                            or _bt_report.get("actual_symbol")
+                            or _bt_report.get("symbol_used")
+                        )
+                        if isinstance(_sym_raw, str) and _sym_raw.strip():
+                            _bt_actual_symbol = _sym_raw.strip()
+            except (OSError, json.JSONDecodeError, ValueError):
+                _bt_data_source = _bt_data_source  # keep prior value
+                _bt_actual_symbol = _bt_actual_symbol
+
+        _insights_recorder.record_output_method(
+            run_id=(
+                _get_run_id()
+                or os.environ.get("CRUCIBLE_RUN_ID", "").strip()
+                or str(run_meta_payload.get("run_id") or "")
+            ),
+            project_name=proj_name,
+            mode=_saved_mode,
+            user_problem=_user_problem_text,
+            run_meta=run_meta_payload,
+            validation_verdict=_validation_verdict,
+            entrypoint=_entrypoint,
+            artefact_names=_artefact_names,
+            outcome_score=_outcome_score,
+            outcome_status=_outcome_status,
+            # v1.1.0 fifth-pass (G-20): forward backtest data provenance
+            # to the ledger so v1.2.0 retrieval can filter synthetic
+            # runs without re-opening backtest_report.json per row.
+            # Quant-mode payload carries these; non-Quant modes pass
+            # None which is dropped from the persisted event.
+            data_source=_bt_data_source,
+            data_actual_symbol=_bt_actual_symbol,
+        )
+
+        # runtime_params is Quant-only by default (CRUCIBLE_RUN_INSIGHTS_RECORD_PARAMS=auto).
+        # Recorder's mode-aware gate suppresses the call for non-Quant.
+        _gate_cfg: Dict[str, Any] = {}
+        try:
+            _gate_cfg = {
+                "gate_control_enabled": run_meta_payload.get("gate_control_enabled"),
+                "selective_rerun_enabled": run_meta_payload.get("selective_rerun_enabled"),
+                "quality_round_limit": run_meta_payload.get("quality_round_limit"),
+                "quality_runtime_validation_scope": run_meta_payload.get(
+                    "quality_runtime_validation_scope"
+                ),
+            }
+        except Exception:
+            _gate_cfg = {}
+        _budget_cfg: Dict[str, Any] = {}
+        try:
+            _bp = run_meta_payload.get("budget_policy")
+            if isinstance(_bp, dict):
+                _budget_cfg = dict(_bp)
+        except Exception:
+            _budget_cfg = {}
+        _cli_flags: Dict[str, Any] = {}
+        try:
+            for _k in (
+                "input_mode", "scan_mode", "runtime_profile",
+                "entrypoint_override",
+            ):
+                _v = run_meta_payload.get(_k)
+                if _v is not None:
+                    _cli_flags[_k] = _v
+        except Exception:
+            _cli_flags = {}
+
+        _insights_recorder.record_runtime_params(
+            run_id=(
+                _get_run_id()
+                or os.environ.get("CRUCIBLE_RUN_ID", "").strip()
+                or str(run_meta_payload.get("run_id") or "")
+            ),
+            project_name=proj_name,
+            mode=_saved_mode,
+            cli_flags=_cli_flags,
+            gate_config=_gate_cfg,
+            budget_policy=_budget_cfg,
+            user_problem=_user_problem_text,
+            run_meta=run_meta_payload,
+        )
+    except Exception:
+        # Insights must never break the main save path.  Swallow.
+        pass
+
     return project_dir
 
 

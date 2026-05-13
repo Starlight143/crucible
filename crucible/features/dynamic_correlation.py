@@ -103,13 +103,26 @@ def _std(series: List[float], ddof: int = 1) -> float:
         return 0.0
     mu = _mean(series)
     v = sum((x - mu) ** 2 for x in series) / (n - ddof)
-    return math.sqrt(v) if v > 0.0 else 0.0
+    # v1.1.0 fourth-pass: tighten subnormal guard per CLAUDE.md rule
+    # (``not (x > 1e-14)``).  Previously ``v > 0.0`` admitted IEEE 754
+    # subnormals which then divided into surrounding code paths.
+    return math.sqrt(v) if v > 1e-14 else 0.0
 
 def _pearson_r(x: List[float], y: List[float]) -> float:
-    n = min(len(x), len(y))
+    # v1.1.0 fifth-pass (G-9): pair-wise NaN drop before Pearson.
+    # ``_compute_returns`` now emits NaN sentinels for invalid bars;
+    # without this filter NaN propagates through mean / num and the
+    # later ``math.isfinite(raw)`` short-circuit silently maps to 0.0,
+    # losing the genuine correlation signal on the surviving bars.
+    n0 = min(len(x), len(y))
+    if n0 < 2:
+        return 0.0
+    paired = [(x[i], y[i]) for i in range(n0) if math.isfinite(x[i]) and math.isfinite(y[i])]
+    n = len(paired)
     if n < 2:
         return 0.0
-    x, y = x[:n], y[:n]
+    x = [p[0] for p in paired]
+    y = [p[1] for p in paired]
     mx, my = _mean(x), _mean(y)
     num = sum((x[i] - mx) * (y[i] - my) for i in range(n))
     sx = math.sqrt(sum((v - mx) ** 2 for v in x))
@@ -266,6 +279,14 @@ def _power_iteration(
 
     Returns (eigenvalue, eigenvector).
     Raises ValueError if the matrix is degenerate.
+
+    v1.1.0: the convergence test is now **relative** instead of absolute.
+    Previously ``abs(new - old) < tol`` (with tol=1e-6) accepted any change
+    smaller than 1e-6 — too loose for tiny eigenvalues (1e-3: 0.1 %
+    relative) and too tight for large eigenvalues (1e+6: never converges
+    within max_iter).  The relative form ``abs(new - old) < tol *
+    max(abs(new), 1.0)`` scales with the eigenvalue magnitude so both
+    extremes converge consistently.
     """
     n = len(matrix)
     if n == 0:
@@ -286,7 +307,11 @@ def _power_iteration(
         mv = _mat_mul_vec(matrix, v_new_norm)
         eigenvalue_new = _dot(v_new_norm, mv)
 
-        if abs(eigenvalue_new - eigenvalue) < tol:
+        # Relative convergence: scale tolerance by the current eigenvalue
+        # magnitude (floored at 1.0 so the test is at least as strict as
+        # the original absolute version when the eigenvalue is small).
+        scale = max(abs(eigenvalue_new), 1.0)
+        if abs(eigenvalue_new - eigenvalue) < tol * scale:
             return eigenvalue_new, v_new_norm
         eigenvalue = eigenvalue_new
         v = v_new_norm
@@ -408,20 +433,27 @@ def _attach_labels_to_pca(
 # ── Return series computation ─────────────────────────────────────────────────
 
 def _compute_returns(equity_curve: List[float]) -> List[float]:
-    """Convert equity curve to period (arithmetic) returns."""
+    """Convert equity curve to period (arithmetic) returns.
+
+    v1.1.0 fifth-pass (G-9): NaN sentinel for invalid bars instead of
+    0.0.  Substituting 0.0 made rolling correlation see a string of
+    correlated zeros across all assets → spurious high cross-asset
+    correlation and an artificially low ``diversification_score``.
+    Subnormal positive prev (5e-324) also slipped through the prior
+    ``> 0.0`` floor and produced 1e+300 returns; tightened to 1e-14
+    per CLAUDE.md § 9.3.
+    """
     if len(equity_curve) < 2:
         return []
     returns: List[float] = []
     for i in range(1, len(equity_curve)):
         prev = equity_curve[i - 1]
         curr = equity_curve[i]
-        # Guard against negative equity, Inf prev (not caught by isnan), and
-        # NaN in either value.  Positive-only guard also subsumes the == 0 check.
-        if prev > 0.0 and math.isfinite(prev) and math.isfinite(curr):
+        if prev > 1e-14 and math.isfinite(prev) and math.isfinite(curr):
             r = (curr - prev) / prev
-            returns.append(r if math.isfinite(r) else 0.0)
+            returns.append(r if math.isfinite(r) else float("nan"))
         else:
-            returns.append(0.0)
+            returns.append(float("nan"))
     return returns
 
 

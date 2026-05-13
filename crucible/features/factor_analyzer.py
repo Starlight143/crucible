@@ -223,6 +223,16 @@ class FactorAnalysisResult:
     regression_result: Optional[FactorRegressionResult] = None
     market_beta: Optional[float] = None
     market_correlation: Optional[float] = None
+    # v1.1.0: explicit field for the CAPM-fallback "beta proxy" so downstream
+    # consumers (regime detection / retrieval ranking) can tell a real CAPM
+    # market_beta apart from a self-lag autocorrelation coefficient.  When
+    # ``ff_data`` is available, ``market_beta`` is the legitimate Mkt-RF
+    # loading and ``autocorrelation_beta`` is None.  When ``ff_data`` is
+    # missing, ``market_beta`` stays None and ``autocorrelation_beta``
+    # carries the AR(1) lag coefficient — not a true beta, not comparable
+    # against an external benchmark.  The summary text is loud about which
+    # mode is active.
+    autocorrelation_beta: Optional[float] = None
     factor_summary_text: str = ""
     report_path: Optional[str] = None
     errors: List[str] = field(default_factory=list)
@@ -233,6 +243,7 @@ class FactorAnalysisResult:
             "regression_result": self.regression_result.to_dict() if self.regression_result else None,
             "market_beta": _sanitise_float(self.market_beta),
             "market_correlation": _sanitise_float(self.market_correlation),
+            "autocorrelation_beta": _sanitise_float(self.autocorrelation_beta),
             "factor_summary_text": self.factor_summary_text,
             "report_path": self.report_path,
             "errors": self.errors,
@@ -342,17 +353,56 @@ def _ols_regression(
     ss_res = sum(r ** 2 for r in residuals)
     mean_y = sum(Y) / n
     ss_tot = sum((y - mean_y) ** 2 for y in Y)
-    r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else 0.0
-    adj_r2 = 1.0 - (1.0 - r2) * (n - 1) / (n - k) if (n > k and ss_tot > 0) else None
+    # v1.1.0: tighten the ss_tot guard from > 0 to > 1e-14 — IEEE 754
+    # subnormals (values like 5e-324) slip through ``> 0`` and produce
+    # explosive r² values when used as a divisor.
+    r2 = 1.0 - ss_res / ss_tot if ss_tot > 1e-14 else 0.0
+    adj_r2 = 1.0 - (1.0 - r2) * (n - 1) / (n - k) if (n > k and ss_tot > 1e-14) else None
 
-    # Standard errors: s² * (X'X)^{-1} diagonal
+    # Standard errors: s² * (X'X)^{-1} diagonal.
+    # v1.1.0: also surface ``near-singular X'X`` explicitly when any
+    # diagonal entry of (X'X)^{-1} is negative (FP rounding artefact
+    # from accumulated error in a near-singular inversion).  The previous
+    # ``max(d, 0.0)`` silently clamped these to zero, producing
+    # std_error=0 → t-stat=inf → p≈0 → alpha_is_significant=True falsely.
+    # Now the regression is rejected via a sentinel return and the caller
+    # surfaces the warning instead.
     s2 = ss_res / (n - k) if n > k else 0.0
-    # Invert XtX for std errors — use Gaussian on augmented identity
     XtX_inv_diag = _xtx_inv_diagonal(XtX)
-    if XtX_inv_diag is not None:
-        std_errors = [math.sqrt(max(s2 * d, 0.0)) for d in XtX_inv_diag]
-    else:
+    near_singular = False
+    if XtX_inv_diag is None:
         std_errors = [None] * k
+    elif any(d < -1e-12 for d in XtX_inv_diag):
+        near_singular = True
+        std_errors = [None] * k
+    else:
+        # v1.1.0 fourth-pass (F-4): the third-pass guard checked the
+        # diagonal magnitude in isolation, but on decimal-scaled
+        # inputs (daily returns ≈ 1e-4) the typical s² is ≈ 1e-6 and
+        # XtX_inv diagonals around 1e-10.  ``min_diag = 1e-10 >
+        # 1e-15`` so the guard passed, yet ``se = sqrt(s² × 1e-10) =
+        # 1e-8`` produced t-stats around 1e+6 and false-positive
+        # significance.  The correct test is on the implied
+        # standard-error squared (``s² × diag``) — if that falls
+        # below 1e-20 (i.e. ``se < 1e-10``), the regression is
+        # numerically meaningless regardless of how the magnitude is
+        # split between s² and diag.
+        abs_diags = [abs(d) for d in XtX_inv_diag]
+        min_diag = min(abs_diags)
+        max_diag = max(abs_diags)
+        cond_proxy = (max_diag / min_diag) if min_diag > 0 else float("inf")
+        # Scale-aware floor: catches both unit-scaled and decimal-scaled
+        # regressions.  ``s2 × min_diag < 1e-20`` ↔ implied se < 1e-10.
+        scale_aware_se_sq = s2 * min_diag if s2 > 0 else 0.0
+        if k > 1 and (
+            min_diag < 1e-15
+            or cond_proxy > 1e10
+            or (s2 > 0 and scale_aware_se_sq < 1e-20)
+        ):
+            near_singular = True
+            std_errors = [None] * k
+        else:
+            std_errors = [math.sqrt(max(s2 * d, 0.0)) for d in XtX_inv_diag]
 
     df = n - k
     t_stats: List[Optional[float]] = []
@@ -379,6 +429,7 @@ def _ols_regression(
         "p_values": p_values,
         "n": n,
         "k": k,
+        "near_singular": near_singular,
     }
 
 
@@ -420,13 +471,54 @@ def _download_ff3_daily() -> Optional[Dict[str, List[float]]]:
 
     Returns dict with keys "Mkt-RF", "SMB", "HML", "RF" (each a List[float]),
     or None if download fails.
+
+    v1.1.0 fourth-pass (F-5): the third-pass approach reached into
+    ``resp.fp.raw._sock`` to tighten the live socket's read timeout —
+    but that private attribute chain is unreliable on HTTPS (the
+    ``raw`` attribute may be a ``LengthReadBufferedReader`` rather
+    than a ``SocketIO``, in which case ``.raw._sock`` is
+    AttributeError and the per-chunk timeout silently doesn't apply).
+    We now wrap each ``resp.read(_CHUNK)`` call in
+    ``concurrent.futures.ThreadPoolExecutor`` with a hard
+    ``future.result(timeout=10.0)`` cap.  This works uniformly across
+    HTTP / HTTPS / future asyncio transports because it's pure
+    Python-level timing.  The 60 s total-wall-clock cap remains as
+    defence-in-depth.
     """
+    import time as _time
+    import concurrent.futures as _cf
     try:
         _MAX_FF_BYTES = 10 * 1024 * 1024  # 10 MB safety cap
+        _CHUNK = 65536
+        _PER_CHUNK_TIMEOUT = 10.0  # seconds per read()
+        _TOTAL_TIMEOUT = 60.0      # seconds for the entire fetch
         with urlopen(_FF3_URL, timeout=30) as resp:
-            raw = resp.read(_MAX_FF_BYTES + 1)
-            if len(raw) > _MAX_FF_BYTES:
-                return None
+            buf = bytearray()
+            started = _time.monotonic()
+            # Single-worker executor — we serialise reads inside the
+            # loop, the executor exists purely to expose a hard
+            # per-read timeout.  ``with`` shuts it down at function exit.
+            with _cf.ThreadPoolExecutor(max_workers=1) as _pool:
+                while True:
+                    if _time.monotonic() - started > _TOTAL_TIMEOUT:
+                        return None
+                    try:
+                        future = _pool.submit(resp.read, _CHUNK)
+                        chunk = future.result(timeout=_PER_CHUNK_TIMEOUT)
+                    except _cf.TimeoutError:
+                        # The worker thread will be left holding the
+                        # socket read; the surrounding ``with urlopen``
+                        # block closes the socket which forces the
+                        # worker's read() to error out and the worker
+                        # exits.  Acceptable leak (the pool itself
+                        # closes at function exit).
+                        return None
+                    if not chunk:
+                        break
+                    buf.extend(chunk)
+                    if len(buf) > _MAX_FF_BYTES:
+                        return None
+            raw = bytes(buf)
         with zipfile.ZipFile(io.BytesIO(raw)) as zf:
             names = zf.namelist()
             csv_name = next((n for n in names if n.lower().endswith(".csv")), None)
@@ -551,10 +643,46 @@ def run_factor_regression(
     X_cols = [s[-min_len:] for s in factor_series]
     X = [[X_cols[j][i] for j in range(len(X_cols))] for i in range(min_len)]
 
+    # v1.1.0 fifth-pass (G-9): drop bars where Y or any X column is NaN
+    # (sentinel emitted by ``_load_returns`` for invalid prior equity).
+    # Substituting 0.0 in the loader biased alpha downward; filtering
+    # here preserves alignment between strategy and factors.
+    _mask = [
+        math.isfinite(Y[i]) and all(math.isfinite(row[j]) for j in range(len(row)))
+        for i, row in enumerate(X)
+    ]
+    Y = [Y[i] for i in range(min_len) if _mask[i]]
+    X = [X[i] for i in range(min_len) if _mask[i]]
+    n_dropped = min_len - len(Y)
+    if n_dropped > 0 and n_dropped > min_len * 0.10:
+        result.errors.append(
+            f"Factor regression dropped {n_dropped}/{min_len} bars with "
+            f"non-finite returns (invalid prior equity).  Alpha / loadings "
+            "may be biased; investigate the underlying equity curve."
+        )
+    if len(Y) < 5:
+        result.errors.append(
+            f"Factor regression: only {len(Y)} finite bars remain after NaN filter "
+            "— need >= 5."
+        )
+        return result
+
     ols = _ols_regression(Y, X)
     if ols is None:
         result.errors.append("OLS regression failed (singular matrix or insufficient data)")
         return result
+
+    # v1.1.0 fourth-pass: surface the near-singular diagnostic.  The
+    # OLS path returns all None t-stats / p-values when this fires;
+    # without an explicit warning the caller sees "alpha not
+    # significant" and may conclude "weak signal" rather than
+    # "regression numerically unreliable, do not interpret".
+    if ols.get("near_singular"):
+        result.errors.append(
+            "Factor regression matrix near-singular — t-stats and p-values "
+            "suppressed.  This usually means collinear factors or a degenerate "
+            "return series; results are not interpretable."
+        )
 
     coeffs = ols["coefficients"]  # [alpha, beta_1, ..., beta_k]
     result.alpha = coeffs[0]
@@ -633,12 +761,17 @@ def _load_returns(run_dir: str, lookback_days: int) -> List[float]:
                     # alignment in the CAPM lag path (returns[:-1] vs returns[1:]).
                     # NaN passes `!= 0` in Python, producing NaN returns — use
                     # `> 0 and isfinite` instead.
+                    # v1.1.0 fifth-pass (G-9): NaN sentinel (not 0.0)
+                    # for invalid bars.  ``run_factor_regression``
+                    # filters NaN before fitting; substituting 0.0
+                    # biased alpha downward (treating bad bars as
+                    # zero-return days) and inflated R² spuriously.
                     returns = [
                         (values[i] - values[i - 1]) / values[i - 1]
-                        if values[i - 1] > 0
+                        if values[i - 1] > 1e-14
                         and math.isfinite(values[i - 1])
                         and math.isfinite(values[i])
-                        else 0.0
+                        else float("nan")
                         for i in range(1, len(values))
                     ]
                     return returns[-lookback_days:]
@@ -665,12 +798,17 @@ def _load_returns(run_dir: str, lookback_days: int) -> List[float]:
                 if len(values) >= 2:
                     # Preserve series length: substitute 0.0 for bars where the
                     # previous equity is zero/negative/NaN/Inf instead of skipping.
+                    # v1.1.0 fifth-pass (G-9): NaN sentinel (not 0.0)
+                    # for invalid bars.  ``run_factor_regression``
+                    # filters NaN before fitting; substituting 0.0
+                    # biased alpha downward (treating bad bars as
+                    # zero-return days) and inflated R² spuriously.
                     returns = [
                         (values[i] - values[i - 1]) / values[i - 1]
-                        if values[i - 1] > 0
+                        if values[i - 1] > 1e-14
                         and math.isfinite(values[i - 1])
                         and math.isfinite(values[i])
-                        else 0.0
+                        else float("nan")
                         for i in range(1, len(values))
                     ]
                     return returns[-lookback_days:]
@@ -773,37 +911,66 @@ def run_factor_analysis(
                 else f"  {exp.factor_name}: N/A"
             )
     else:
-        # CAPM (single factor: market proxy = strategy itself or uniform market)
-        # When we don't have real market data, use the strategy return as the
-        # sole factor (gives beta=1 by construction; useful mainly for alpha / t-stats).
+        # No real market data available.  v1.1.0: this branch regresses the
+        # strategy returns on their OWN lag (AR(1) autocorrelation model),
+        # which is NOT a CAPM market beta.  Previous versions populated
+        # ``fa_result.market_beta`` with the AR(1) coefficient, and downstream
+        # consumers (regime detection, retrieval ranking) treated it as a
+        # legitimate beta — a silent correctness bug.  We now:
+        #
+        #   1. Leave ``market_beta`` as ``None`` (correct: no market data).
+        #   2. Populate the explicit ``autocorrelation_beta`` field instead.
+        #   3. Make the summary text loud about what was actually regressed
+        #      and direct the operator to ``use_ff_data=True`` for a real
+        #      CAPM beta.
+        #   4. Surface a result.warning so any orchestration layer that
+        #      ingests the artefact knows to treat ``market_beta`` as
+        #      unavailable rather than substituting the AR(1) coefficient.
         n = len(excess_returns)
-        # Use lagged returns as a proxy for market exposure (autocorrelation model)
         if n > 2:
-            market_proxy = excess_returns[:-1]
+            lagged_proxy = excess_returns[:-1]
             strat_aligned = excess_returns[1:]
         else:
-            market_proxy = excess_returns
+            lagged_proxy = excess_returns
             strat_aligned = excess_returns
 
-        factor_map = {"market": market_proxy}
+        factor_map = {"lag1": lagged_proxy}
         reg = run_factor_regression(strat_aligned, factor_map, config, n_factors_used=1)
         fa_result.regression_result = reg
 
-        fa_result.market_beta = next(
-            (e.loading for e in reg.factor_exposures if e.factor_name == "market"),
+        # Pull the AR(1) loading into the explicitly named field.  Leave
+        # ``market_beta`` as None so consumers cannot accidentally treat it
+        # as a CAPM value.
+        fa_result.autocorrelation_beta = next(
+            (e.loading for e in reg.factor_exposures if e.factor_name == "lag1"),
             None,
         )
-        fa_result.market_correlation = _pearson_correlation(strat_aligned, market_proxy)
+        fa_result.market_beta = None
+        # ``market_correlation`` against a self-lag is autocorrelation by
+        # construction, not a true cross-asset correlation — keep it
+        # computed for diagnostic purposes but rename intent in the summary.
+        fa_result.market_correlation = _pearson_correlation(strat_aligned, lagged_proxy)
+        fa_result.warnings.append(
+            "Real market data unavailable (use_ff_data=False or FF download "
+            "failed). Reporting autocorrelation_beta (AR(1) self-lag) "
+            "instead of a CAPM market_beta; downstream consumers MUST NOT "
+            "treat this value as a comparable market beta."
+        )
 
-        summary_lines.append("=== Factor Analysis (CAPM / Market Model) ===")
+        summary_lines.append("=== Factor Analysis (AR(1) self-lag fallback) ===")
         summary_lines.append(
-            "NOTE: Multi-factor analysis requires use_ff_data=True to download FF data."
+            "NOTE: Real CAPM / multi-factor analysis requires use_ff_data=True. "
+            "This fallback regresses strategy returns on their own lag and "
+            "produces an autocorrelation coefficient, NOT a market beta."
         )
         if reg.alpha is not None:
             ann_alpha = reg.alpha * 252 * 100
             summary_lines.append(f"Daily Alpha: {reg.alpha:.6f} ({ann_alpha:.2f}% annualised)")
-        if fa_result.market_beta is not None:
-            summary_lines.append(f"Market Beta: {fa_result.market_beta:.4f}")
+        if fa_result.autocorrelation_beta is not None:
+            summary_lines.append(
+                f"Autocorrelation β (lag-1): {fa_result.autocorrelation_beta:.4f}"
+                "  ← NOT a market beta"
+            )
         if reg.r_squared is not None:
             summary_lines.append(f"R²: {reg.r_squared:.4f}")
         if reg.alpha_is_significant:

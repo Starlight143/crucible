@@ -329,6 +329,9 @@ Flags with default-on values (memory, security-scan, deployment-artifacts) are p
 | GET | `/api/budget/status` | Today / month-to-date / cumulative cost stats |
 | GET | `/api/webhook/history` | Last 50 webhook delivery attempts |
 | POST | `/api/notify/test` | Test a webhook URL (with retry reporting) |
+| GET | `/api/insights/summary` | Run Insights ledger summary: per-stream event counts + recent global feed |
+| GET | `/api/insights/events` | Paginated event feed; supports `?stream=output\|error\|debate\|params&run_id=&kind=&limit=&since=` |
+| GET | `/api/run/<id>/insights` | All ledger events for a single run, grouped by stream |
 
 ### Production Deployment (Gunicorn)
 
@@ -449,6 +452,24 @@ Copy [.env.example](/.env.example) to `.env` first, then fill in the required va
 | `CRUCIBLE_ENV_FILE=.env` | Custom env file path |
 | `CODEX_ENTRYPOINT=api/main.py:app` | Runtime validation entrypoint override |
 | `API_VERSION_CHECK_ENABLED=1` | Enable API version checking |
+
+### Run Insights Ledger
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CRUCIBLE_RUN_INSIGHTS_ENABLED` | `1` | Master switch. Set `0` to disable the entire subsystem (recorder returns a `_NullRecorder`, all emit points become no-ops, WebUI shows "subsystem is disabled"). |
+| `CRUCIBLE_RUN_INSIGHTS_RECORD_OUTPUT` | `1` | Record `output_method` events when section 07 successfully saves a project. |
+| `CRUCIBLE_RUN_INSIGHTS_RECORD_ERRORS` | `1` | Record `error_record` events when `resilience.kickoff_crew_with_retry` exhausts retries. |
+| `CRUCIBLE_RUN_INSIGHTS_RECORD_DEBATE` | `1` | Record `direction_debate_rejection` events when Stage 0 force-nones or parse-fails after all fallbacks. |
+| `CRUCIBLE_RUN_INSIGHTS_RECORD_PARAMS` | `auto` | `auto` = record in Quant mode only (matches the "Quant records runtime parameters, non-Quant does not" requirement); set `1` to force-on / `0` to force-off. Typos fall back to `auto` (never truthy-coerce). |
+| `CRUCIBLE_RUN_INSIGHTS_REDACT` | `1` | Redact sensitive fields (`api_key`, `token`, `secret`, `webhook_url`, `auth`, etc.) recursively before write. Set `0` for raw payloads. |
+| `CRUCIBLE_RUN_INSIGHTS_BACKEND` | `local` | Storage backend: `local` (JSONL streams under `.crucible_insights/`). `cloudflare` / `dual` are reserved names — the protocol seam is in place but the implementations raise `NotImplementedError`. |
+| `CRUCIBLE_RUN_INSIGHTS_DIR` | `.crucible_insights` | Ledger root directory (relative paths anchor to `PROJECT_ROOT`). |
+| `CRUCIBLE_RUN_INSIGHTS_INLINE_MAX_BYTES` | `4096` | Payloads larger than this are spilled to `blobs/<content_id>.json` and referenced by `payload_blob` hash. |
+| `CRUCIBLE_RUN_INSIGHTS_MAX_ENTRIES_PER_STREAM` | `2000` | FIFO cap per stream — older entries pruned via atomic temp-file swap once the limit is reached. |
+| `CRUCIBLE_RUN_ID` | — | Auto-injected by the WebUI when spawning a pipeline subprocess; binds `run_correlation.set_run_id()` so all telemetry, logs, and ledger entries share the same correlation id. Direct CLI invocations auto-generate a UUID4. |
+
+Additional reserved keys for the planned retrieval + LLM skill distillation layer appear in `.env.example` but are not yet honoured: `CRUCIBLE_RUN_INSIGHTS_API_URL`, `CRUCIBLE_RUN_INSIGHTS_API_TOKEN`, `CRUCIBLE_RUN_INSIGHTS_RETRIEVAL_*`, `CRUCIBLE_RUN_INSIGHTS_INJECT_*`, `CRUCIBLE_RUN_INSIGHTS_DISTILLATION_*`.
 
 ### Direction Debate / Gate
 
@@ -1213,6 +1234,30 @@ Equity curve and drawdown charts rendered directly in the WebUI using Chart.js. 
 
 ### Run Detail View (WebUI)
 Full run inspection modal: `analysis_result.json`, `review_report.json`, `security_report.json`, `backtest_report.json`, generated code file listing — all accessible without leaving the browser. Supports search and mode filtering in the runs list.
+
+### Run Insights Ledger
+A four-stream JSONL ledger that captures **what worked, what failed, and why** across every pipeline run — designed so that a future retrieval layer can read these records to avoid repeating mistakes and reuse successful patterns. Recording is mode-aware: Quant mode records output methods, errors, direction-debate rejections, **and** runtime parameters; non-Quant modes record everything except runtime parameters (`CRUCIBLE_RUN_INSIGHTS_RECORD_PARAMS=auto`).
+
+**Four event streams** under `.crucible_insights/`:
+
+| Stream | File | Source | Recorded when |
+|--------|------|--------|---------------|
+| Output Method | `output.jsonl` | `section_07_selfcheck_output_main.py` | Project successfully saved (model id, framework, validation verdict, artefact list, score) |
+| Errors | `error.jsonl` | `resilience.py` | A retryable operation exhausts all retries (exception class, message head, retry count) |
+| Direction Debate Rejections | `debate.jsonl` | `section_02_research_and_llm.py` | Stage 0 force-nones a candidate direction, or parse-fails after all fallbacks (judge verdict excerpt, rejection reason) |
+| Runtime Parameters | `params.jsonl` | `section_07_selfcheck_output_main.py` | Project saved **and** mode is Quant (cli flags, gate config, budget policy) |
+
+Each event carries a content-addressable `content_id = "sha256:" + sha256(canonical_json(event \ content_id))`, a tagged `signals[]` array (`mode:quant`, `asset:gold`, `venue:ftmo`, …) for future Jaccard-indexable retrieval, an `env_fingerprint` block (python version, platform, arch, model id, provider), and an `outcome` block (`status` ∈ {success/failure/partial/skipped}, `score`, `note`). Payloads larger than `CRUCIBLE_RUN_INSIGHTS_INLINE_MAX_BYTES` (4 KB default) spill to `blobs/<content_id>.json` and the event references them by hash. Sensitive fields are redacted recursively before write.
+
+**WebUI surface:**
+- Per-run **📚 Insights** tab in both Project and Idea modes — fetches `GET /api/run/<run_id>/insights` and renders all four streams for the active session, with outcome badges and signal tags.
+- Dashboard **Run Insights Ledger** card — fetches `GET /api/insights/summary` and shows global event counts plus the most recent 10 events across all streams. Refreshes on every dashboard load.
+
+**Export & disable:**
+- Export the whole ledger with `python -m crucible.features.run_insights.export ./insights.tar.gz` — produces a tarball with `manifest.json`, per-stream sha256 hashes, and all blobs.
+- Set `CRUCIBLE_RUN_INSIGHTS_ENABLED=0` to fully disable; recorder returns `_NullRecorder` and every emit point becomes a no-op.
+
+**Future capability:** The storage layer is a `StorageBackend` protocol with the Cloudflare Workers + D1 + R2 contract frozen in `backends.py` docstrings (D1 schema with `content_id` as PRIMARY KEY, R2 path layout `insights/<run_id>/<content_id>.json`, identical canonical-JSON algorithm in JavaScript). Switching `CRUCIBLE_RUN_INSIGHTS_BACKEND=cloudflare` (or `dual` for safe migration) will route writes to the Worker without any local code changes once the cloud backend ships.
 
 ---
 

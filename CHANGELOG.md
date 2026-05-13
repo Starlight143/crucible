@@ -5,6 +5,613 @@ Versioning follows [Semantic Versioning](https://semver.org/). The first public 
 
 ---
 
+## [v1.1.0] — 2026-05-14
+
+Major release: **Run Insights ledger** (cross-run telemetry with content-
+addressable events, evomap.ai-aligned schema, Cloudflare/D1/R2 seam frozen
+for v1.2.0), **15-point backtest hardening** (real-data integrity guard
+default-on), and **five consecutive four-agent audits** that landed ~110
+fixes across security, numerics, ledger atomicity, and WebUI. Final test
+baseline: **2 451 passed, 1 skipped** (from 2 229 at v1.1.0 inception).
+
+### Added
+
+- **Run Insights ledger** (`crucible/features/run_insights/`): cross-run
+  telemetry on four JSONL streams (output / error / debate / params) under
+  `.crucible_insights/`. Every event carries
+  `content_id = "sha256:" + sha256(canonical_json(event \ content_id))`,
+  a tag-style `signals[]` index, an `env_fingerprint`
+  (python/platform/arch/model_id/llm_provider), and an `outcome` block.
+  Five emit points wired (Stage 0 force-none + parse-fail debates,
+  `save_project_output` output_method + Quant runtime_params,
+  retry-exhausted error in `resilience.py`); all best-effort and
+  exception-swallowing so the ledger can never break the pipeline.
+  Asset-category classifier (Quant-only) auto-tags `signals[]` with
+  `asset:gold|silver|oil|crypto|forex|futures|options|equity|bonds|
+  uncategorized` via deterministic dictionary lookup — zero LLM cost,
+  feeds v1.2.0 retrieval scoping.
+- **Cloudflare Workers + D1 + R2 backend seam**
+  (`run_insights/backends.py`): `StorageBackend` Protocol with
+  `LocalJSONLBackend` shipped + `CloudflareBackend` / `DualWriteBackend`
+  stubs that fail fast at construction time. Module docstring freezes
+  the v1.2.0+ cloud contract: D1 `insight_events` schema, R2 object key
+  layout, `POST /v1/insights/events|batch` + `GET /v1/insights/events`
+  Workers HTTP surface, and the JavaScript canonical-JSON algorithm so
+  the Worker computes byte-identical `content_id` values. Setting
+  `CRUCIBLE_RUN_INSIGHTS_BACKEND=cloudflare` without API URL/token
+  fails fast — operators expecting uploads cannot accidentally land in
+  disk-only mode.
+- **Sovereign-portability archive CLI**
+  (`run_insights/export.py`): `python -m
+  crucible.features.run_insights.export <out.tar.gz>` bundles the
+  ledger into a gzipped tar with per-stream sha256 + line counts.
+  Archive layout matches the future R2 hierarchy so `crucible insights
+  upload` becomes a tar-walk + PUT.
+- **Run Insights view tab + dashboard widget** (`webui/`): each session
+  panel gains a 📚 Insights tab alongside ⬛ Terminal and ⬡ Agent Flow,
+  rendering per-run insights grouped by stream with content-id, env
+  fingerprint, outcome badge, and signal tags. Dashboard gains a "Run
+  Insights Ledger" card. Three new read-only endpoints back it:
+  `GET /api/insights/summary`,
+  `GET /api/insights/events?stream=&run_id=&project_name=&since=&kind=&limit=`,
+  `GET /api/run/<run_id>/insights`.
+- **21 new env vars** under "Run Insights ledger" in `.env.example` —
+  14 active (toggles + per-stream record flags + backend + ledger dir +
+  inline-blob threshold + max entries per stream + redact toggle + 5
+  Cloudflare API keys) plus 7 v1.2.0 retrieval/distillation
+  placeholders shipped listed-but-ignored. `RECORD_PARAMS=auto`
+  (default) records `runtime_params` only on Quant; typos return
+  `auto` (not truthy-coerced) per the env-bool whitelist rule.
+- **Backtest synthetic-data integrity guard**: new
+  `BACKTEST_REQUIRE_REAL_DATA=1` (default ON) + new
+  `BacktestDataIntegrityError`. Both synthetic exit paths in
+  `prepare_data()` (explicit `BACKTEST_DATA_SOURCE=synthetic` AND the
+  auto-cascade fallback after yfinance / ccxt / Binance / project
+  `data_provider.py` all return empty) raise with a multi-line message
+  listing attempted providers, install commands, and the explicit
+  opt-out path. With the guard off, `report.warnings` carries a loud
+  persistent annotation. Three new tests cover the guard; five
+  pre-existing synthetic tests updated to opt out via
+  `patch.dict(os.environ, {"BACKTEST_REQUIRE_REAL_DATA": "0"})`.
+- **Backtest 15-point hardening** (`crucible/features/backtest_runner.py`):
+  (HIGH-1) non-crypto symbols no longer fall back to BTCUSDT under any
+  cascade — Sharpe / drawdown / win-rate stay attached to the
+  requested asset; (HIGH-2) forced-source failure respects the
+  integrity guard; (HIGH-3) `_has_data_file` validates OHLCV columns +
+  row count; (HIGH-4) partial fetched data rejected with profile-aware
+  row-count threshold; (HIGH-5) `_run_project_data_provider` sandboxed
+  (1 MB stdout cap, realpath-inside-`code_dir` enforcement, non-zero
+  rc → failure, cross-drive paths rejected on Windows); (MED-6)
+  disk-level data cache with TTL (`~/.crucible/data_cache/`);
+  (MED-7) `fallback_rows` sentinel fixed (now `Optional[int]`);
+  (MED-8) symbol + timeframe detection share a single file walk;
+  (MED-9) `FetchOutcome(csv_text, error_kind, detail)` classified
+  diagnostics — operator sees `yfinance: rate_limit — HTTP 429`
+  instead of `no data returned`; (MED-10) `data_start_date` /
+  `data_end_date` / `data_staleness_days` surfaced + staleness
+  warning when last bar > `BACKTEST_DATA_MAX_STALENESS_DAYS` (default
+  7); (LOW-11) optional parallel-fetch cascade
+  (`BACKTEST_PARALLEL_FETCH=1`); (LOW-12) stricter `_is_crypto_symbol`
+  — `BRK-B` / bare `BTC` now classified non-crypto; (LOW-13)
+  configurable `BACKTEST_SYNTHETIC_SEED` (`42` / `"random"` / typo
+  → 42 + actual seed recorded in `result.profile`); (LOW-14)
+  `BACKTEST_PREPARE_DATA_ONLY` dry-run mode; (LOW-15) provider-profile
+  limit regression tests. `PrepareDataResult` NamedTuple replaces the
+  prior 3-tuple return (breaking for direct API consumers).
+  `BacktestReport.data_actual_symbol` records the exact symbol form
+  passed to the succeeding provider.
+- **WebUI Settings + flag panels env-sync machinery**
+  (`webui/static/js/app.js` + `webui/app.py`): `_ENV_CACHE` populated
+  on init by one `GET /api/env`; `ENV_BACKED_FLAGS` maps ~40 frontend
+  flag keys to backend env var names (`cache`→`LOCAL_CACHE`,
+  `strict_json`→`STRICT_JSON`, `gate_control`→`GATE_CONTROL_ENABLED`,
+  14 `ENHANCED_*` post-processing flags, 13 `ENHANCED_*` Quant
+  Analytics flags, etc.); `_resolveFlagInitialChecked()` reads live
+  `.env` so Idea / Path panels no longer ignore Settings-page state.
+  `_resolve_run_insights_env_overrides(flags)` + `_run_worker(...,
+  env_overrides=...)` plumb per-run checkbox toggles into
+  `_child_env` while whitelisting `CRUCIBLE_RUN_ID` from override.
+  All four call sites (`api_start_run`, `webhook_trigger`, two A/B
+  variants) pass the resolved dict through.
+- **WebUI Settings — full bilingual sweep of `KEY_META`**: all 187
+  entries are now `desc:{en,zh}` so the top-right language toggle
+  flips every group together (was only 9 entries previously). New
+  entries must use `{en, zh}` going forward (CLAUDE.md § 10
+  documents the enforcement).
+- **WebUI static-asset cache busting**:
+  `_static_asset_hash()` computes `sha1(file_bytes)[:10]` for
+  `js/app.js` and `css/app.css`, embedded as `?v=<hash>` in
+  template `<script>` / `<link>` tags. Editing JS/CSS + restarting
+  Flask now forces browsers to fetch the new bundle on next page
+  load without operator Ctrl+F5.
+- **Run-correlation ID bridge**: WebUI `run_id` and pipeline
+  `run_correlation` ContextVar wired together at three points —
+  (1) `_run_worker` injects `CRUCIBLE_RUN_ID` into child env,
+  (2) `run_crucible_enhanced.main()` + `crucible/__main__.py`
+  call `set_run_id(os.environ.get("CRUCIBLE_RUN_ID") or None)` at
+  entry, (3) all five emit points chain through `_get_run_id()` →
+  `os.environ.get("CRUCIBLE_RUN_ID")` → local-meta fallback so a
+  missing ContextVar still resolves the WebUI session ID.
+- **Synthetic golden-run regression fixture**
+  (`tests/regression/fixtures/SyntheticGoldenRun/`): adds the
+  first real constraint so the regression harness runs (not just
+  skips) on every CI invocation.
+
+### Fixed
+
+A five-pass cross-cutting audit (initial 15-point backtest pass +
+2nd / 3rd / 4th / 5th four-agent runs) landed ~110 fixes. Findings
+are grouped by area below; tagged with the round (B = backtest,
+H/M = 2nd-pass HIGH/MEDIUM, T = 3rd-pass, F = 4th-pass, G = 5th-pass)
+so future audits can cross-reference.
+
+#### Security (WebUI + ledger redaction)
+
+- **SSRF guard fully closed across all known IPv4/IPv6 embeddings.**
+  Earlier rounds caught IPv4-mapped IPv6 (`::ffff:10.0.0.1`,
+  T16). Fourth-pass F-2 added recursive `_ipv6_embedded_v4()` that
+  rejects (a) `::w.x.y.z` deprecated compat, (b) `2002:wxyz:abcd::`
+  6to4, (c) `64:ff9b::w.x.y.z` NAT64 — all three previously had
+  `is_global=True` despite embedding RFC1918 v4. Fifth-pass G-2
+  closed the remaining hole: Python's `is_global` returns True for
+  **multicast (224.0.0.0/4)**, broadcast, and several reserved
+  ranges; `_addr_is_safe` now also rejects `is_multicast` /
+  `is_reserved` / `is_unspecified` / `is_loopback` /
+  `is_link_local`. Affects `/api/notify/test` and pipeline
+  notification retries.
+- **Redirect-based SSRF blocked (G-3).** `_do_request` and
+  `_send_notification_with_retry` previously used the default
+  `urllib.request` opener which auto-follows 30x — an
+  attacker-controlled HTTPS endpoint passing `_is_safe_url` could
+  respond `302 Location: http://169.254.169.254/...` (AWS IMDS) or
+  `http://127.0.0.1:5000/api/env` and the request would auto-follow,
+  sending the operator's Authorization header to the internal host.
+  New `_NoRedirectHandler` suppresses auto-follow; new
+  `_safe_urlopen` helper re-validates every URL through
+  `_is_safe_url` per hop (DNS-rebinding tight), clears the request
+  body on 301/302/303 per RFC 7231 §6.4, and caps redirects at 3.
+- **DNS rebinding mid-retry closed (T17).** `_send_notification_with_retry`
+  now calls `_is_safe_url()` on **every** attempt inside the retry
+  loop, shrinking the rebinding window from ~7 s (full retry budget)
+  to milliseconds.
+- **`_is_safe_url` rejects userinfo + IPv6 scope-id (T16).**
+  `http://victim@evil.com/` previously slipped through because
+  `urlparse` returned `hostname="evil.com"` while userinfo travelled
+  in Authorization headers downstream. Link-local IPv6 with
+  scope-id (`fe80::1%eth0`) also rejected.
+- **CSRF gate handles `Origin: null` + reverse proxies (T15 + F-3/10).**
+  Sandboxed iframes / `data:` / Safari send literal `Origin: null` —
+  now untrusted. Absent `Origin` falls back to `Referer.netloc` vs
+  `request.host`. Reverse-proxy false-positive (where `request.host`
+  is the internal `127.0.0.1:5000` but `Referer` carries the public
+  host) eliminated by also consulting `X-Forwarded-Host` AND a new
+  opt-in `CRUCIBLE_TRUST_FORWARDED=1` env that wires Werkzeug's
+  `ProxyFix` for end-to-end forwarded-header trust.
+- **`MAX_CONTENT_LENGTH` 1 MB cap (H6) → env-configurable (4th pass).**
+  Operators pasting long idea briefs can raise via
+  `CRUCIBLE_MAX_CONTENT_LENGTH_MB` (clamped to [1, 64]).
+- **`X-Requested-With` enforced for cross-origin state changes (H7).**
+  Global `before_request` rejects POST/PUT/PATCH/DELETE to `/api/*`
+  from cross-origin browsers that omit the header. Drive-by attacks
+  from a malicious tab are blocked at the routing layer; server-to-
+  server callers (curl, schedulers — no `Origin`) pass through.
+  Frontend `fetch` shim auto-attaches the header but is pathname-
+  strict and same-origin: `new URL(...).origin === location.origin
+  && pathname.startsWith('/api/')` (T18 + F4) — privacy leak via
+  third-party URLs containing `/api/` closed. Malformed URLs now
+  fail closed (4th pass).
+- **Chart.js CDN pinned with SRI (M5).** `<script>` carries
+  `integrity="sha384-..."` + `crossorigin="anonymous"` +
+  `referrerpolicy="no-referrer"`. A jsDelivr compromise can no
+  longer inject JS into the WebUI origin.
+- **`Content-Type` reverted to bare `application/json`** (4th pass).
+  The `; charset=utf-8` parameter (T17) caused strict
+  Slack/Discord-style receivers to 400; body bytes are still UTF-8.
+- **PII redaction now value-aware, not just field-name (H4).**
+  `_VALUE_SECRET_PATTERNS` covers Anthropic Claude
+  (`sk-ant-(?:api|sid|admin|oat)\d+-...` — `oat\d+` added in G-4
+  for Claude Code OAuth tokens), OpenAI legacy + project +
+  service-account (`sk-svcacct-` added in G-5), OpenRouter
+  (`sk-or-v1-`), Google Gemini (`AIza`), xAI (`xai-`), Slack
+  (`xox[bparseu]-`), GitHub PAT/App, JWTs (including
+  URL-percent-encoded `%2E` variants per T20), Bearer/Basic auth,
+  Stripe (`(sk|rk|pk)_(test|live)_`), AWS keys (`AKIA/ASIA`), and
+  generic `password=` / `api_key=` URL fragments (upper bound
+  raised from 200 → 2000 so long session JWTs are fully redacted).
+  All vendor patterns carry left-AND-right word boundaries
+  (T7 + F1) and explicit upper bounds to prevent catastrophic
+  backtracking. Single-pass short-circuit via
+  `_ANY_SECRET_PREFIX.search()` first — strings with no
+  recognised prefix skip the 14-pattern loop entirely (4th pass).
+- **Redact walks tuples / sets / frozensets / bytes / bytearray +
+  cycles (G-6/G-7/G-8).** Previously only `Mapping` and `list`;
+  tuples leaked secrets, bytes crashed `json.dumps` inside `_emit`
+  silently dropping the event, self-referential containers
+  triggered swallowed `RecursionError`. Sets sorted by
+  canonical-JSON repr for deterministic content-id; bytes decoded
+  via `utf-8 errors='replace'`; cycles become the sentinel
+  `"<cycle>"`.
+- **Settings secret-detection regex broadened (G-24).** Previous
+  `/api.?key|secret|token/i` missed webhook URLs (Slack / Discord
+  / Teams), routing keys (PagerDuty), DSNs (Sentry), bot tokens,
+  bearer credentials, private keys — real operator webhook URLs
+  with auth tokens displayed cleartext in the "Other" group.
+  Regex now covers all of the above plus `password`/`passwd`/`auth`.
+
+#### Numerics & quant correctness
+
+- **NaN sentinel contract extended uniformly (M6 + G-9).** v1.0.x
+  `_equity_to_returns` substituted `0.0` for invalid bars,
+  contaminating Sharpe / max-dd / win-rate with synthetic flat
+  days. Now `float('nan')`. Extended in fifth-pass to three
+  other modules:
+  - `regime_detector._equity_to_returns` + `_rolling_std`
+    (HMM no longer sees synthetic zeros biasing Viterbi toward
+    low-vol "bull");
+  - `factor_analyzer._load_returns` (both JSON + CSV paths —
+    FF3 / AR(1) no longer treats bad bars as zero-return days
+    suppressing alpha and inflating R²);
+  - `dynamic_correlation._compute_returns` + `_pearson_r` (rolling
+    correlation no longer sees correlated zeros across all assets
+    producing spurious cross-asset correlation and a deflated
+    `diversification_score`).
+  Consumers filter NaN via `_finite_returns()` /
+  `_finite_only()` helpers before aggregation; `_pearson_r` does
+  pairwise-finite filtering; `run_factor_regression` builds a
+  finite-only mask and aborts if <5 finite bars survive.
+  Divisor floors tightened from `> 0` to `> 1e-14` per CLAUDE.md
+  § 9.3 so IEEE 754 subnormals (5e-324) can't poison results
+  (M17 / G-16).
+- **Monte Carlo bootstrap pool guards (M7 + G-12).** Filter only
+  non-finite (legitimate zero returns preserved for cash-heavy
+  strategies); empty pool fails loud (M7); single-unique-value
+  pool refused with explicit error (G-12) — previously every
+  simulated path was identical → `std=0`, `var_5pct=0`,
+  `cvar_5pct=0`, `prob_loss=0` falsely advertising perfect
+  strategies.
+- **HMM hardening (M18 / T14 / G-10 / G-11).** Std floor aligned
+  to `1e-14` and made scale-aware (`max(global_std × 1e-6,
+  1e-14)`) so a single outlier can't pull a regime's std to
+  the global floor and smear boundaries. Insufficient data
+  (T < K×2) now raises `HMMInsufficientDataError` which
+  `detect_regimes` catches and falls back to volatility with an
+  explicit warning surfaced in `result.warnings`. EM convergence
+  switched to relative tolerance (`tol × max(|log_lik|, 1.0)`)
+  matching the M9 power-iteration fix — previously absolute
+  `1e-4` against `log_lik ≈ -10000` meant EM never converged
+  inside `max_iter=100`.
+- **Power-iteration relative tolerance (M9).**
+  `dynamic_correlation._power_iteration` uses
+  `abs(new - old) < tol * max(abs(new), 1.0)` so 1e+6
+  eigenvalues converge in `max_iter` and 1e-3 eigenvalues
+  don't accept loose 0.1 %-relative changes.
+- **Significance testing (H9 / T2 / T3 + 4th-pass tail expose).**
+  Permutation p-value uses Phipson-Smyth +1 correction
+  `(count_ge + 1) / (n_perm + 1)` (H9 — previously could report
+  exact 0 → `is_significant=True`). Default now **two-sided**
+  (T3) so short-bias strategies are evaluated against
+  `|SR| ≥ |obs|`; both `p_value_one_sided` /
+  `p_value_two_sided` exposed plus `p_value_greater` /
+  `p_value_less` (4th pass) for pre-registered directional
+  tests. DSR `denom_sq` floor raised to `1e-8` (T2 — matches
+  practical `sr_hat × sqrt(T)` scale) and `dsr_z` clipped to
+  `±6` (4th pass — `Φ(6) ≈ 1 - 9.9e-10` stays
+  finite-distinguishable, `Φ(10)` round-trips through
+  `json.dumps` as exact `1.0`). Both clips annotated in
+  `result.errors` when fired. Independent RNGs (seed 42
+  permutation, 43 bootstrap) so reordering can't silently
+  change the bootstrap CI.
+- **Factor-analyzer near-singular detection (M17 + T12 + F4).**
+  `_xtx_inv_diagonal` negative entries no longer silently
+  clamped (M17 — was producing `t-stat=inf` →
+  `p≈0` → false-positive alpha). Tightened to also reject
+  smallest absolute diag < 1e-15 OR max/min ratio > 1e10
+  (T12). Fourth-pass added the scale-aware
+  `s² × min_diag < 1e-20` check (decimal-scaled inputs
+  evaded the existing guards while still producing
+  `se ≈ 1e-8` → `t ≈ 1e+6` false-positive). `near_singular`
+  surfaced via explicit `result.errors` entry — operator no
+  longer sees all-None t-stats with no explanation.
+- **AR(1) CAPM-fallback no longer mislabels self-lag as market
+  beta (H11).** New `autocorrelation_beta` field;
+  `market_beta` stays `None` when FF3 unavailable; loud
+  warning + summary text annotation.
+- **`_inv_normal` continuous at p=0.5 (H10).** Beasley-Springer-
+  Moro evaluated to ≈±1.5e-5 at p=0.5±; now special-cased to
+  exact 0.0 within 1e-12. Mattered for DSR at `n_trials=2`.
+- **Subnormal-poisoning floors raised to `1e-14`** across
+  `dynamic_correlation._std`, `cointegration_analyzer._std`,
+  `quant_analytics._sharpe_from_returns`, factor-analyzer
+  `ss_tot` (M17), and the walk-forward Sharpe-decay-ratio
+  denominator (G-15 — was `1e-10`, admitted
+  `oos_sharpe / is_sharpe` → ~1e+8 explosion).
+- **DSR z-score clip annotation (4th pass).** When clamp fires,
+  `result.errors` carries `"dsr_z clipped to ±6 (raw |z| = ...)"`
+  so consumers can distinguish "huge real signal" from "denom
+  near floor".
+- **Backtest `_PARAM_RNG` deterministic (G-13).** Was
+  `random.Random()` (OS-time seed at import). Optuna path used
+  `seed=42` but the random-search fallback + `strategy="random"`
+  searches produced different `best_params` every run — broke
+  retrospective analysis and v1.2.0 rank-stability. Now reads
+  `BACKTEST_PARAM_SEED` (default `4242`); `"random"` / `"none"`
+  / empty restore legacy non-deterministic behaviour.
+- **Parallel real-data fetch hard timeout (G-14).** `fut.result()`
+  was called without `timeout=` — yfinance's internal read
+  timeout varies by version, so a slowloris endpoint could
+  hang the pipeline. Now `result(timeout=90)` (env-configurable
+  via `BACKTEST_FETCH_HARD_TIMEOUT_SEC`) with
+  `concurrent.futures.TimeoutError` mapped to a synthetic
+  `FetchOutcome("", "timeout", ...)` so the cascade continues.
+- **FF3 per-chunk timeout via `concurrent.futures` (F5).**
+  Third-pass T13 reached into `resp.fp.raw._sock.settimeout(10)`
+  but on HTTPS the `raw` attribute is a
+  `LengthReadBufferedReader` (not `SocketIO`) → AttributeError
+  swallowed → 10 s per-chunk cap effectively dead. Each
+  `resp.read(_CHUNK)` now wrapped in
+  `ThreadPoolExecutor.submit(...).result(timeout=10.0)` — pure
+  Python timing that works across HTTP / HTTPS / asyncio
+  transports. Also (H12) per-`read` socket-default timeout +
+  60 s wall-clock cap + 64 KB streaming with 10 MB hard
+  payload limit. Tearsheet `duration_days` renamed
+  `duration_bars` (M8 — semantically correct for intraday
+  strategies; legacy properties retained for back-compat).
+- **Backtest data cache key drops `today_utc` (M10).** Previous
+  `sha1(symbol|period|interval|today)` + 24 h TTL fence-post
+  forced cache misses at 00:00 UTC for APAC operators every
+  morning. Now keyed solely by `sha1(symbol|period|interval)`;
+  expiry driven entirely by mtime + TTL.
+- **Backtest staleness probe tz-aware (M4).** End-date parsed
+  from data CSV is now stamped with `tzinfo=_UTC` before
+  `.date()` subtraction.
+
+#### Ledger atomicity & redaction
+
+- **JSONL writes durable on Windows Ctrl-C (H2).**
+  `write_event` / `write_blob` / `prune_stream` follow
+  `fh.flush()` with `os.fsync(fh.fileno())`.
+- **Cross-process JSONL writes safe on Windows (H3).** Module
+  `_file_lock_ctx` no longer falls back to `_NoOpLock` on
+  Windows; uses `msvcrt.locking(LK_LOCK, 1)` on a sentinel
+  byte at offset 0 with bounded retry on transient
+  `EDEADLK`/`EACCES`. `_WindowsLock.__exit__` gives every
+  phase its own `try` so unlock always runs (T6); POSIX
+  counterpart `_PosixLock.__exit__` widened to catch
+  `ValueError` from closed-handle GC interleavings (F7);
+  cross-process test now uses `subprocess.Popen([sys.executable,
+  "-c", script])` instead of `multiprocessing.spawn` (F8 —
+  Python <3.13 spawn-pickle hangs on Windows).
+- **Sidecar lock for prune (T5).** Second-pass H8 added a
+  cross-process file lock around the prune scan, but the lock
+  released BEFORE the temp-file `os.replace` — a concurrent
+  writer could append after the scan and have its append
+  clobbered. Now per-stream sidecar `.<stream>.jsonl.lock`
+  held across the full read → write → replace cycle.
+  `write_event` also takes the sidecar so writers are blocked
+  while prune is rewriting. Sidecar exists because Windows
+  `os.replace` refuses to overwrite a file the same process
+  holds open.
+- **POSIX `_fsync_dir` after atomic renames (T10).** Otherwise
+  a power loss after `replace` could leave file contents on
+  disk while the directory still pointed at the old inode →
+  file vanishes on reboot.
+- **Schema marker is lock-protected, atomic, forward-compatible,
+  and BOM-tolerant.** `_init_layout` creates `.schema_version.lock`,
+  acquires platform exclusive lock, re-checks under the lock,
+  writes via `tempfile.mkstemp` + fsync + `os.replace` (M19).
+  T9 made the write forward-compatible: parses content as
+  `int(content)` and treats `>= expected` as no-write so a
+  v1.2 process won't roll the marker back. G-17 added
+  `utf-8-sig` decode tolerance so a Windows Notepad-saved
+  marker with BOM no longer triggers ValueError → re-write on
+  every startup.
+- **Orphan tempfile cleanup on backend init (G-18).**
+  `tempfile.mkstemp` in three places leaves `.prune_*.jsonl` /
+  `.blob_*.tmp` / `.schema_*.tmp` when the process is SIGKILL'd
+  between mkstemp and `os.replace`. Backend now sweeps files
+  older than 24 h on init (best-effort, swallows all errors).
+- **`_LAST_FETCH_DIAGNOSTICS` thread-local (H5 + T1).** Concurrent
+  `prepare_data()` no longer clobber each other's provider
+  outcomes. T1 fixed the parallel-fetch worker case where
+  worker-thread TLS was invisible to the main-thread call to
+  `_build_cascade_diagnostic_lines` — each worker now snapshots
+  its TLS dict at return time and the main thread merges them
+  back before building the error message.
+- **`_init_layout` failure now substitutes `_NullRecorder` (F6).**
+  Read-only filesystem / parent is a regular file / EACCES
+  previously left the backend instance live with `_root` pointing
+  nowhere — every `write_event` silently returned `""` with no
+  diagnostic. Now sets `_init_failed=True` + `_closed=True`;
+  factory falls back to `_NullRecorder` and logs a loud "ledger
+  DISABLED for this process (events will be lost)" warning.
+- **Recorder safe across POSIX `os.fork()` (M13).**
+  `os.register_at_fork(after_in_child=_reset_recorder_after_fork)`
+  replaces inherited `_RECORDER` / `_RECORDER_LOCK` globals in
+  the child so pytest-xdist forks get a fresh recorder.
+- **Prune is O(1) memory (M12).** Previously `readlines()`
+  loaded the whole stream file. Now two-pass byte-scan in 64 KB
+  chunks — bounded memory at `MAX_ENTRIES=20 000 × ~500 B/line
+  ≈ 10 MB`.
+- **`_writes_since_prune` counter lock-protected; `_lock` →
+  `RLock` (4th pass).** Concurrent emits could lose increments
+  or double-prune; `RLock` cost is identical for uncontended
+  paths and prevents self-recording error-path deadlocks.
+- **`MAX_ENTRIES_PER_STREAM` clamp_max (T4).** Operator typo
+  `2000000000` would have triggered `collections.deque(maxlen=2e9)`
+  attempting a 1 TB allocation during prune. Now clamped to
+  1 000 000.
+- **`_v8_float_repr` ECMA-262-conformant (M3 + T8 + T11 + 4th pass).**
+  `schema.canonical_json` uses a custom `_V8FloatJSONEncoder`
+  matching V8 `Number.prototype.toString` rules (`1.0` → `1`,
+  `1e-7` → `1e-7` not `1e-07`, `-0.0` → `0`). T8 re-implemented
+  the full ECMA-262 §6.1.6.1.13 algorithm after the heuristic
+  diverged from V8 at 1e-6, 1e16, and integer-valued floats —
+  every record containing a float would have produced a
+  divergent `content_id` from the future Cloudflare Worker.
+  T11 added a graceful fallback when `_make_iterencode` rename
+  happens in future CPython. Fourth pass raises `ValueError` on
+  non-finite floats instead of silently emitting `"null"` —
+  NaN payload no longer hash-collides with `None`.
+- **JS↔Python canonical JSON parity test (M3).** 14 edge-case
+  fixtures (integer-valued floats, exponent notation, NaN/Inf,
+  key ordering, unicode, control char escapes, negative zero)
+  pinned against the JS spec frozen in `backends.py` docstring.
+- **`record_output_method` propagates `data_source` +
+  `data_actual_symbol` (G-20).** Without this, v1.2.0 retrieval
+  would have to re-open `backtest_report.json` from disk for
+  every ledger row to filter synthetic-data runs. Recorder
+  signature accepts the optional fields; section_07 reads
+  `backtest_report.json` just-in-time and forwards; also
+  mirrored into `signals[]` as `data_source:{value}` for
+  one-line retrieval filtering.
+- **Backend `LOGGER.warning` rate-limited per `(scope, key)`
+  tuple (G-19).** Eight previously-unrate-limited WARNING sites
+  on a read-only mount / full disk produced hundreds of warnings
+  per minute drowning real diagnostics. New `_warn_once()`
+  records first occurrence; capped at 100 entries to bound its
+  own memory.
+- **Manifest timestamps unified (M20).** `export.py` uses
+  `schema.utc_now_iso()` (ms precision + `Z` suffix) so
+  manifest and event timestamps share format.
+
+#### Per-run flag plumbing — **release blocker fixed in G-1**
+
+- **`_STORE_TRUE_FLAG_TO_ENV` now writes env names the core
+  pipeline reads (G-1).** Fourth-pass F-9 mapped
+  `cache → CRUCIBLE_CACHE`, `strict_json → CRUCIBLE_STRICT_JSON`,
+  `cost_trace → CRUCIBLE_COST_TRACE` — but
+  `section_07_selfcheck_output_main.py:323-325` (and mirrors in
+  sections 02 / 05 / 06) reads the **un-prefixed legacy names**
+  (`LOCAL_CACHE`, `STRICT_JSON`, `COST_TRACE`) via
+  `_env.env_bool()`. So an operator unchecking `strict_json` in
+  the idea/path panel got `CRUCIBLE_STRICT_JSON=0` in the
+  subprocess while the pipeline read `STRICT_JSON` (still `1`
+  from `.env`). Tests passed only because they verified the
+  mapping was internally self-consistent — never that the RHS
+  keys matched what the pipeline actually reads. A textbook
+  "producer is tested, consumer wiring is not" trap. Mapping
+  corrected to bare legacy names + new
+  `test_mapping_rhs_keys_match_actual_pipeline_reads`
+  structurally scans the section_* read sites for
+  `env_bool("NAME", ...)` calls and asserts every mapping RHS
+  appears as one. CLAUDE.md § 9.6 codifies the
+  producer→consumer testing pattern.
+
+#### `.env.example` parser
+
+- **Group-header heuristic tightened (G-21).** Old rule (any
+  1-6 token comment = group header) caused lines like
+  `# Synthetic-data seed used when BACKTEST_REQUIRE_REAL_DATA=0
+  (plumbing` — exactly 6 tokens — to BECOME the group name
+  for adjacent env keys (`BACKTEST_SYNTHETIC_SEED`, etc.).
+  CLAUDE.md § 1 already documented the trap; the audit found
+  three live hijacks. New heuristic accepts 1-3 token
+  comments as headers OR requires explicit divider syntax
+  (`===`, all-caps, ≥4 tokens with surrounding
+  `=`/`─`/`━`/`*`). Two existing description sentences
+  lengthened to ≥7 tokens.
+- **Seven new backtest env keys uncommented (M1).** `BACKTEST_
+  MIN_REAL_DATA_ROWS`, `_CACHE_TTL_HOURS`, `_CACHE_DIR`,
+  `_MAX_STALENESS_DAYS`, `_SYNTHETIC_SEED`, `_PREPARE_DATA_ONLY`,
+  `_PARALLEL_FETCH` — render in Settings with defaults
+  instead of empty fields.
+
+#### WebUI polish
+
+- **`saveSettings()` only POSTs dirty values (M2).**
+  Baseline snapshot via `_snapshotSettingsBaseline()`
+  immediately after `renderSettings()`; Save computes which
+  keys differ. Previously every input was serialised including
+  freshly-rendered empty fields for commented-out keys, silently
+  persisting `KEY=""` and nuking shell-export overrides. Toast
+  reports the dirty-key count; "No changes" short-circuit.
+- **Empty-file sha1 hash never cached (G-22).** Editor
+  truncate-then-write could leave `app.js` 0 bytes momentarily;
+  a Flask request hitting `index()` in that window would
+  permanently cache `sha1(b"")[:10]="da39a3ee5e"`, defeating
+  cache-busting until Flask restart. Zero-byte reads now return
+  ephemeral sentinel `"x"` without caching.
+- **JS error path uses centralised `_escapeHtml` (G-23).**
+  Ad-hoc `replace(/[<>&]/g,'')` missed `"` and `'`; not
+  exploitable in text-node context but drift from policy.
+
+### Changed
+
+- **`SignificanceTestResult` gained 5 new fields**:
+  `p_value_one_sided` + `p_value_two_sided` + `alternative` (T3) +
+  `p_value_greater` + `p_value_less` (4th pass). All populated
+  by `to_dict()`. Downstream consumers using strict-schema
+  `additionalProperties: false` validation need updates;
+  `.get(key)` consumers unaffected.
+- **`DrawdownPeriod.duration_bars` / `recovery_bars`** are now the
+  canonical fields (M8 — `_days` retained as property aliases
+  and in `to_dict()` for v1.0.x consumers).
+- **`PrepareDataResult` NamedTuple** replaces the 3-tuple
+  return of `prepare_data` (breaking for direct API consumers;
+  legacy unpacking documented in `__doc__`).
+- **`BacktestDataIntegrityError` message** now splices
+  per-provider `FetchOutcome` diagnostics into its body —
+  operator sees `yfinance: rate_limit — HTTP 429` rather than
+  the generic `no data returned`.
+- **`.gitignore`** adds `.crucible_insights/`,
+  `.crucible_insights.tar.gz`, `CLAUDE.md`.
+
+### Validation
+
+- pytest: **2 451 passed, 1 skipped** (final, fifth-pass).
+  Baseline evolution: 2 229 (v1.1.0 inception) → 2 269
+  (backtest-runner 15-pt audit) → 2 281 (2nd-pass 34 fixes)
+  → 2 380 (3rd-pass 20 fixes + 99 new tests) → 2 407
+  (4th-pass 30 fixes + 27 new tests) → **2 451** (5th-pass
+  24 fixes + 44 new tests).
+- New test files: `test_run_insights/` (10 files covering
+  canonicalisation, signals extraction, local backend with
+  schema-marker race + clamp_max pin, recorder, redaction
+  field-name + end-to-end + 13-regex-pattern bank,
+  concurrency with cross-process spawn variant, emit-points
+  four-stream swallow coverage, JS canonical parity, V8 float
+  repr with 24 ECMA-262 boundaries); `test_webui_security.py`
+  (MAX_CONTENT_LENGTH / X-Requested-With / SSRF / SRI);
+  `test_backtest_require_real_data_default.py` (env-bool
+  whitelist pin); `test_quant_v1_1_0_regressions.py` (NaN
+  sentinel, power-iter, AR(1), DSR clip, permutation
+  two-sided); `test_store_true_only_per_run_disable.py` (G-1
+  release-blocker pin with the structural
+  producer→consumer wiring test);
+  `test_v1_1_0_fifth_pass_regressions.py` (29 G-N regression
+  pins covering multicast SSRF, redirect SSRF, `sk-ant-oat`
+  redact, HMM insufficient-data, Monte Carlo unique-value,
+  `_PARAM_RNG` seed, ledger orphan cleanup, `.env.example`
+  parser strengthening).
+- `crucible/smoke_test.py`: 5/5 OK;
+  `run_crucible.py --self-check`: OK.
+- Cross-process lock test passes on Windows + Linux,
+  multiprocessing spawn/fork + subprocess.Popen variants.
+- `_safe_urlopen` redirect-rejection verified live against a
+  local stub HTTPS server.
+
+### Compatibility
+
+- Python ≥ 3.10 (unchanged).
+- Drop-in replacement for v1.0.5 — `pip install -U` is safe.
+- Behavioural changes operators should know about:
+  - `BACKTEST_REQUIRE_REAL_DATA=1` is **default on**. Set to
+    `0` to opt back into synthetic-GBM fallback (and accept
+    the loud `report.warnings` annotation).
+  - `_STORE_TRUE_FLAG_TO_ENV` writes `LOCAL_CACHE` /
+    `STRICT_JSON` / `COST_TRACE` (not `CRUCIBLE_*`) — the
+    fourth-pass mapping was wrong and silently no-op'd.
+  - Permutation tests default to **two-sided**; consumers
+    relying on the prior one-sided semantics should read
+    `p_value_one_sided` explicitly.
+  - `PrepareDataResult` NamedTuple breaks direct 3-tuple
+    unpacking of `prepare_data`'s return.
+  - 5 new fields on `SignificanceTestResult` (see Changed).
+  - `DrawdownPeriod.duration_bars` is canonical;
+    `duration_days` is a property alias.
+
+---
+
 ## [v1.0.5] — 2026-05-09
 
 ### Fixed

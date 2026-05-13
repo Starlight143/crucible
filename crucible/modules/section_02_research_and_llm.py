@@ -14,10 +14,14 @@ if __package__ == "crucible.modules":
     from ..resilience import kickoff_crew_with_retry
     from ..runtime_logging import get_logger, log_event, log_exception
     from ..cancellation import OperationCancelledError as _OperationCancelledError
+    from ..run_correlation import get_run_id as _get_run_id
+    from ..features.run_insights import get_recorder as _get_insights_recorder
 else:  # pragma: no cover - direct script fallback
     from resilience import kickoff_crew_with_retry  # type: ignore[no-redef]
     from runtime_logging import get_logger, log_event, log_exception  # type: ignore[no-redef]
     from cancellation import OperationCancelledError as _OperationCancelledError  # type: ignore[no-redef]
+    from run_correlation import get_run_id as _get_run_id  # type: ignore[no-redef]
+    from features.run_insights import get_recorder as _get_insights_recorder  # type: ignore[no-redef]
 
 
 LOGGER = get_logger(__name__)
@@ -1007,6 +1011,29 @@ def _run_single_direction_debate(
                 )
                 if dump_path:
                     print(f"[Info] Direction debate debug dump: {dump_path}")
+                # v1.1.0 run_insights: record direction-debate rejection.
+                # The force-none gate is the most actionable failure surface
+                # for the v1.2.0 retrieval layer — it tells us which signals
+                # consistently produce un-grounded directions so a future
+                # run with the same signals can avoid them.  Best-effort,
+                # never raises.
+                try:
+                    _judge_verdict = ""
+                    if decision is not None:
+                        _judge_verdict = str(getattr(decision, "summary", "") or "")
+                    _get_insights_recorder().record_direction_debate_rejection(
+                        run_id=_get_run_id() or os.environ.get("CRUCIBLE_RUN_ID", "").strip(),
+                        project_name="stage0_pending",
+                        mode=mode,
+                        direction_id=str(getattr(decision, "selected_direction", "") or "unknown"),
+                        rejection_reason="force_none",
+                        judge_verdict=f"force_none:{reason} | {_judge_verdict}",
+                        attempt=attempt + 1,
+                        user_problem=user_problem,
+                        run_meta=None,
+                    )
+                except Exception:
+                    pass
                 return None, comparator_report, audit_report, gap_info
             decision = _apply_deterministic_direction_rerank(
                 decision,
@@ -1062,6 +1089,20 @@ def _run_single_direction_debate(
         )
         if dump_path:
             print(f"[Info] Direction debate debug dump: {dump_path}")
+        # v1.1.0 run_insights: record parse-failed rejection.
+        try:
+            _get_insights_recorder().record_direction_debate_rejection(
+                run_id=_get_run_id() or os.environ.get("CRUCIBLE_RUN_ID", "").strip(),
+                project_name="stage0_pending",
+                mode=mode,
+                direction_id=str(getattr(decision, "selected_direction", "") or "unknown"),
+                rejection_reason="judge_no_winner",
+                judge_verdict="parse_failed_after_fallbacks",
+                attempt=attempt + 1,
+                user_problem=user_problem,
+            )
+        except Exception:
+            pass
         try:
             _record_cost(
                 stage="direction_debate.kickoff",

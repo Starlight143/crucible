@@ -407,22 +407,50 @@ def run_monte_carlo_simulation(
     rng = random.Random(config.seed)
 
     # ── Bootstrap simulation ──────────────────────────────────────────────────
-    # Filter guard-zero sentinels (inserted by _load_returns for invalid bars)
-    # from the resampling pool to prevent artificial volatility suppression.
-    # Defence-in-depth: also drop any non-finite values (NaN / inf) that could
-    # poison the equity-curve product even though _load_returns already filters
-    # them upstream — never rely on a single layer for numerical correctness.
-    bootstrap_pool = [r for r in returns if r != 0.0 and math.isfinite(r)]
+    # v1.1.0: filter ONLY the NaN / Inf sentinels emitted by ``_load_returns``
+    # for invalid bars (prev<=0 or non-finite).  Legitimate zero returns
+    # (cash-only days, holidays, halts) stay in the pool — the previous
+    # implementation dropped EVERY ``0.0`` entry, which over-zealously
+    # treated flat market days as bad data and biased simulated VaR/CVaR
+    # upward.  Equity products of NaN are NaN (catastrophic), so the
+    # sentinel filter is still mandatory.
+    bootstrap_pool = [r for r in returns if math.isfinite(r)]
+    n_dropped = len(returns) - len(bootstrap_pool)
     if not bootstrap_pool:
-        bootstrap_pool = returns
-    else:
-        _n_zeros = len(returns) - len(bootstrap_pool)
-        if _n_zeros > len(returns) * 0.10:
-            result.warnings.append(
-                f"Bootstrap: {_n_zeros}/{len(returns)} ({_n_zeros * 100 // len(returns)}%) "
-                "zero returns removed from sampling pool. If the strategy holds cash "
-                "frequently, simulated VaR/CVaR may be overstated."
-            )
+        # v1.1.0 fourth-pass: previously fell back to the unfiltered
+        # ``returns`` list (still full of NaN) so the simulation
+        # "ran" but produced all-NaN paths — a silent corruption of
+        # every downstream stat.  Failing loud is the correct
+        # production behaviour: zero usable input → no simulation,
+        # explicit error in the report.
+        result.errors.append(
+            f"Monte Carlo aborted: all {len(returns)} returns were "
+            "non-finite (invalid prior equity for every bar).  Check "
+            "the equity curve for divide-by-zero or NaN propagation."
+        )
+        return result
+    # v1.1.0 fifth-pass (G-12): a pool of one unique value (which can
+    # happen with only 1 surviving NaN-filter bar, or a strategy that
+    # produced one tradeable bar followed by NaN sentinels) makes every
+    # simulated path identical.  ``std_final_equity=0``, ``var_5pct=0``,
+    # ``cvar_5pct=0``, ``prob_loss=0`` would falsely advertise a perfect
+    # strategy with zero downside risk.  Refuse to simulate.
+    if len(set(bootstrap_pool)) < 2:
+        result.errors.append(
+            f"Monte Carlo aborted: bootstrap pool has only "
+            f"{len(set(bootstrap_pool))} unique value(s) "
+            f"({len(bootstrap_pool)} usable returns out of {len(returns)}).  "
+            "Simulated paths would be identical → degenerate variance, "
+            "false-zero VaR/CVaR.  Investigate equity curve continuity."
+        )
+        return result
+    if n_dropped > len(returns) * 0.10:
+        result.warnings.append(
+            f"Bootstrap: {n_dropped}/{len(returns)} ({n_dropped * 100 // len(returns)}%) "
+            "non-finite returns removed from sampling pool (invalid prior "
+            "equity).  Simulated VaR/CVaR may be biased; investigate the "
+            "underlying equity curve."
+        )
     try:
         paths = _simulate_bootstrap(
             bootstrap_pool, config.n_simulations, config.horizon_days, rng
@@ -485,7 +513,10 @@ def _load_returns(run_dir: str) -> List[float]:
                         if prev > 0 and math.isfinite(prev) and math.isfinite(curr):
                             returns.append((curr - prev) / prev)
                         else:
-                            returns.append(0.0)
+                            # v1.1.0: NaN sentinel — bootstrap pool filters
+                            # these out without treating legitimate flat-day
+                            # zero returns as bad data.
+                            returns.append(float("nan"))
                     return returns
         except (OSError, json.JSONDecodeError):
             pass
@@ -514,7 +545,10 @@ def _load_returns(run_dir: str) -> List[float]:
                         if prev > 0 and math.isfinite(prev) and math.isfinite(curr):
                             returns.append((curr - prev) / prev)
                         else:
-                            returns.append(0.0)
+                            # v1.1.0: NaN sentinel — bootstrap pool filters
+                            # these out without treating legitimate flat-day
+                            # zero returns as bad data.
+                            returns.append(float("nan"))
                     return returns
             except (OSError, _csv_module.Error):
                 pass

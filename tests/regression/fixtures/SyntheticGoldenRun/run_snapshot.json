@@ -1,0 +1,12 @@
+{
+  "run_id": "SyntheticGoldenRun",
+  "started_at": "2026-05-13T00:00:00.000Z",
+  "ended_at": "2026-05-13T00:00:05.000Z",
+  "mode": "Quant",
+  "llm_provider": "fixture",
+  "direction_decision": {
+    "selected_direction": "momentum-mean-reversion-hybrid",
+    "rationale": "Synthetic direction — fixture-only."
+  },
+  "_fixture_note": "Synthetic regression fixture — never produced by a real run."
+}

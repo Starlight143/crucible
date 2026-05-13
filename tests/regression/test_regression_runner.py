@@ -66,6 +66,13 @@ if str(_REPO_ROOT) not in sys.path:
 _SAVED_PROJECTS_DIR = _REPO_ROOT / "saved_projects"
 _GOLDEN_CONSTRAINTS_PATH = _HERE / "golden_constraints.json"
 
+# v1.1.0: regression-only fixtures shipped with the repo so the test suite
+# always has at least one constraint to validate.  Without this, the entire
+# ``tests/regression/`` directory was dead code in CI (the only golden
+# entry was a placeholder and ``saved_projects/`` doesn't exist on a fresh
+# clone), and the regression harness silently provided zero coverage.
+_FIXTURES_DIR = _HERE / "fixtures"
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _load_json(path: "Path | str") -> Dict[str, Any]:
@@ -92,13 +99,25 @@ def _load_golden_constraints() -> List[Dict[str, Any]]:
 
 
 def _find_run_dirs() -> List[Path]:
-    """Return all valid run directories under saved_projects/."""
-    if not _SAVED_PROJECTS_DIR.is_dir():
-        return []
-    dirs = []
-    for entry in _SAVED_PROJECTS_DIR.iterdir():
-        if entry.is_dir() and (entry / "analysis_result.json").is_file():
-            dirs.append(entry)
+    """Return all valid run directories under saved_projects/ and the
+    repo-shipped regression fixtures directory.
+
+    v1.1.0: ``fixtures/`` is searched first so the synthetic golden run
+    is always discoverable even on a fresh clone with no real saved
+    projects.  Production runs under ``saved_projects/`` are appended
+    after — they take precedence only by virtue of overlap-by-name
+    being impossible (fixture names are namespaced under
+    ``SyntheticGoldenRun*``).
+    """
+    dirs: List[Path] = []
+    if _FIXTURES_DIR.is_dir():
+        for entry in _FIXTURES_DIR.iterdir():
+            if entry.is_dir() and (entry / "analysis_result.json").is_file():
+                dirs.append(entry)
+    if _SAVED_PROJECTS_DIR.is_dir():
+        for entry in _SAVED_PROJECTS_DIR.iterdir():
+            if entry.is_dir() and (entry / "analysis_result.json").is_file():
+                dirs.append(entry)
     return sorted(dirs)
 
 

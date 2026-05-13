@@ -106,19 +106,45 @@ class MonthlyReturn:
 
 @dataclass
 class DrawdownPeriod:
+    """A single drawdown peak-trough-recovery period.
+
+    v1.1.0: the ``duration_bars`` / ``recovery_bars`` fields are bar-count
+    indices, not calendar days.  Daily-frequency strategies see 1 bar = 1
+    day so the previous name (``duration_days``) was accurate; intraday
+    strategies (5-min bars) saw "100 days" meaning 100 × 5-minute slots ≈
+    8.3 hours.  ``to_dict()`` emits BOTH the new ``duration_bars`` /
+    ``recovery_bars`` keys (canonical) AND the legacy ``duration_days`` /
+    ``recovery_days`` keys (back-compat) so existing readers continue to
+    function while new code consumes the unambiguously-named fields.
+    """
+
     start_ts: str
     end_ts: str
     drawdown_pct: float
-    duration_days: int
-    recovery_days: Optional[int] = None
+    duration_bars: int
+    recovery_bars: Optional[int] = None
+
+    # Back-compat property aliases — read-only views over the canonical
+    # fields so legacy callers that access ``.duration_days`` keep working.
+    @property
+    def duration_days(self) -> int:
+        return self.duration_bars
+
+    @property
+    def recovery_days(self) -> Optional[int]:
+        return self.recovery_bars
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "start_ts": self.start_ts,
             "end_ts": self.end_ts,
             "drawdown_pct": _sanitise_float(self.drawdown_pct),
-            "duration_days": self.duration_days,
-            "recovery_days": self.recovery_days,
+            "duration_bars": self.duration_bars,
+            "recovery_bars": self.recovery_bars,
+            # Legacy keys (deprecated, retained for back-compat with v1.0.x
+            # consumers).  Remove in a future major release.
+            "duration_days": self.duration_bars,
+            "recovery_days": self.recovery_bars,
         }
 
 
@@ -305,10 +331,12 @@ def _max_drawdown_and_periods(
                     start_ts=timestamps[dd_start_idx] if timestamps and dd_start_idx < len(timestamps) else str(dd_start_idx),
                     end_ts=timestamps[i] if timestamps and i < len(timestamps) else str(i),
                     drawdown_pct=dd_pct,
-                    # duration_days = peak → trough (industry standard)
-                    duration_days=trough_idx - dd_start_idx,
-                    # recovery_days = trough → recovery-to-prior-peak
-                    recovery_days=i - trough_idx,
+                    # duration_bars = peak → trough (industry standard).  v1.1.0
+                    # renamed from duration_days because intraday strategies
+                    # measure bars, not calendar days.
+                    duration_bars=trough_idx - dd_start_idx,
+                    # recovery_bars = trough → recovery-to-prior-peak.
+                    recovery_bars=i - trough_idx,
                 ))
                 in_dd = False
             peak_val = equity[i]
@@ -325,8 +353,8 @@ def _max_drawdown_and_periods(
             start_ts=timestamps[dd_start_idx] if timestamps and dd_start_idx < len(timestamps) else str(dd_start_idx),
             end_ts=timestamps[-1] if timestamps else str(len(equity) - 1),
             drawdown_pct=dd_pct,
-            duration_days=len(equity) - 1 - dd_start_idx,
-            recovery_days=None,
+            duration_bars=len(equity) - 1 - dd_start_idx,
+            recovery_bars=None,
         ))
 
     all_periods.sort(key=lambda p: p.drawdown_pct, reverse=True)
@@ -757,10 +785,10 @@ def generate_tearsheet(
                 "|---|-------|-----|----------|-----------------|----------------|\n"
             )
             for i, ddp in enumerate(dd_periods, 1):
-                rec = str(ddp.recovery_days) if ddp.recovery_days is not None else "Ongoing"
+                rec = str(ddp.recovery_bars) if ddp.recovery_bars is not None else "Ongoing"
                 md_parts.append(
                     f"| {i} | {ddp.start_ts} | {ddp.end_ts} | "
-                    f"-{ddp.drawdown_pct:.2f}% | {ddp.duration_days} | {rec} |\n"
+                    f"-{ddp.drawdown_pct:.2f}% | {ddp.duration_bars} | {rec} |\n"
                 )
             md_parts.append("\n")
         else:
