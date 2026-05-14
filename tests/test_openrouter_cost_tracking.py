@@ -243,7 +243,25 @@ class TestOpenRouterUsageContext(_ProviderIsolationMixin):
             )
         ) < 1e-12
 
-    def test_does_not_estimate_cost_from_unpriced_model_alias(self):
+    def test_unpriced_model_alias_uses_family_fallback_v1_1_1(self):
+        """v1.1.1 behaviour change.
+
+        Pre-v1.1.1, ``gpt-5.4-pro`` canonicalised to ``openai/gpt-5.4-pro``
+        (no explicit entry in ``OPENROUTER_MODEL_PRICING``) and produced
+        ``cost_source="estimated"`` with zero cost.  That was a defensive
+        assertion against aliases bleeding into wrong prices.
+
+        v1.1.1 layers a family-prefix fallback on top of explicit lookup:
+        ``openai/gpt-5.4-pro`` matches the ``openai/gpt-5`` family entry
+        in ``OPENROUTER_MODEL_FAMILY_PRICING`` and resolves to frontier
+        tier pricing.  This is intentional — without it, any new model
+        variant the operator runs (e.g. a forthcoming pro / turbo flavour)
+        silently emits zero cost and skews the run dashboard.
+
+        The defensive intent of the original test is preserved by
+        ``test_truly_unknown_vendor_still_returns_zero`` below, which
+        uses a vendor outside every family-fallback prefix.
+        """
         rt = get_runtime()
         rt.clear_openrouter_usage()
 
@@ -258,6 +276,40 @@ class TestOpenRouterUsageContext(_ProviderIsolationMixin):
 
         usage = rt.get_last_openrouter_usage()
         assert usage.model_id == "openai/gpt-5.4-pro"
+        # Family fallback fires → cost_source upgrades to the
+        # openrouter-tokens-with-pricing tier (set_openrouter_usage
+        # path; extract_and_set_usage_from_crew path would label it
+        # "crewai_metrics_with_pricing" — both indicate table-based
+        # pricing rather than API-reported real cost).
+        # total_cost_usd computed from tokens × frontier-tier per-million.
+        assert usage.cost_source == "openrouter_tokens_with_pricing"
+        # Frontier-tier prices: $2.50/M input, $15.00/M output.
+        # 1000 input × 2.5e-6 + 500 output × 1.5e-5 = 0.0025 + 0.0075 = 0.0100
+        assert abs(usage.input_cost_usd - 0.0025) < 1e-12
+        assert abs(usage.output_cost_usd - 0.0075) < 1e-12
+        assert abs(usage.total_cost_usd - 0.0100) < 1e-12
+
+    def test_truly_unknown_vendor_still_returns_zero(self):
+        """Preserves the original defensive intent of
+        ``test_does_not_estimate_cost_from_unpriced_model_alias``:
+        a model whose canonical form falls outside every known vendor
+        family (i.e. ``cohere/`` is not in ``OPENROUTER_MODEL_FAMILY_PRICING``)
+        must still emit ``cost_source="estimated"`` with zero cost so
+        the operator gets a clear signal to add the model to the table.
+        """
+        rt = get_runtime()
+        rt.clear_openrouter_usage()
+
+        rt.set_openrouter_usage(
+            {
+                "prompt_tokens": 1_000,
+                "completion_tokens": 500,
+                "total_tokens": 1_500,
+            },
+            model_id="cohere/command-r-plus",
+        )
+
+        usage = rt.get_last_openrouter_usage()
         assert usage.cost_source == "estimated"
         assert usage.input_cost_usd == 0.0
         assert usage.output_cost_usd == 0.0
@@ -1026,7 +1078,18 @@ class TestModelPricingResolution(_ProviderIsolationMixin):
             0.20 / 1_000_000,
             1.17 / 1_000_000,
         )
-        assert rt._get_model_pricing("gpt-5.4-pro") == (0.0, 0.0)
+        # v1.1.1 — ``gpt-5.4-pro`` canonicalises to ``openai/gpt-5.4-pro``
+        # which has no explicit entry but matches the ``openai/gpt-5``
+        # family-prefix fallback.  Returns frontier-tier pricing instead
+        # of (0, 0).  The original protective assertion ("alias doesn't
+        # bleed into wrong price") is preserved by the next assertion:
+        # truly out-of-family vendors still resolve to (0, 0).
+        assert rt._get_model_pricing("gpt-5.4-pro") == (
+            2.50 / 1_000_000,
+            15.00 / 1_000_000,
+        )
+        # Truly unknown vendor (cohere/ is not in family-fallback) → zero.
+        assert rt._get_model_pricing("cohere/command-r-plus") == (0.0, 0.0)
 
 
 class TestResilienceModelResolution(_ProviderIsolationMixin):

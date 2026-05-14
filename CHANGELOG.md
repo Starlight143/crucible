@@ -5,6 +5,132 @@ Versioning follows [Semantic Versioning](https://semver.org/). The first public 
 
 ---
 
+## [v1.1.1] — 2026-05-14
+
+### Fixed
+
+- **Dashboard cost was $0.00 for runs on ``deepseek-v4-flash`` / ``deepseek-v4-pro``
+  despite real OpenRouter spend** (`crucible/modules/section_00_bootstrap_and_utils.py`).
+  Root cause was two-fold:
+  1. ``OPENROUTER_MODEL_PRICING`` had no entries for the v3/v4 DeepSeek
+     IDs the operator is actually using.  ``_get_model_pricing()`` fell
+     through to ``(0.0, 0.0)``, ``extract_and_set_usage_from_crew()`` took
+     the ``pricing_known=False`` branch, and the run snapshot recorded
+     ``total_cost_usd=0.0`` / ``cost_source="estimated"`` for every
+     stage — which the v1.0.5 promotion path correctly copied into
+     ``run_meta.json`` (the promotion wasn't broken; the source data
+     was zero to begin with).
+  2. OpenRouter only populates ``response.usage.cost`` (the actual
+     billed USD amount) when the request body carries
+     ``"usage": {"include": true}``.  Crucible's CrewAI/litellm LLM
+     construction never set this flag, so even when the local pricing
+     table DID resolve, the cost estimate was a multiplication of
+     `tokens × table_price` instead of the real OpenRouter charge.
+- **A — Pricing table extended for v3/v4 DeepSeek IDs + family-prefix
+  fallback.**  Explicit entries added: ``deepseek/deepseek-v3-chat``,
+  ``deepseek-v3-coder``, ``deepseek-v3-reasoner``, ``deepseek-r1``,
+  ``deepseek-v4-flash``, ``deepseek-v4-pro``.  New
+  ``OPENROUTER_MODEL_FAMILY_PRICING`` table keyed by vendor prefix
+  (``deepseek/deepseek-r``, ``deepseek/``, ``openai/gpt-5``,
+  ``openai/gpt-4o``, ``anthropic/``, ``google/``, ``z-ai/``,
+  ``minimax/``, ``meta-llama/``, ``mistralai/``) so a brand-new model
+  variant within a known family (e.g. future ``deepseek-v5-flash``,
+  ``openai/gpt-6.0``) gets a non-zero estimate rather than silently
+  collapsing to ``cost_source="estimated"`` / 0.  Longest matching
+  prefix wins, so ``deepseek/deepseek-r1-distill-future`` resolves to
+  reasoner-tier pricing rather than the generic chat-tier fallback.
+  Family entries are CONSERVATIVE (set to the cheapest in-family
+  variant) so under-reporting is preferred over over-billing surprise.
+- **B — Request body now opts into OpenRouter's usage accounting.**
+  New ``inject_openrouter_usage_extra_body()`` helper merges
+  ``additional_params={"extra_body": {"usage": {"include": True}}}``
+  into the crewai.LLM kwargs.  Forwarded through crewai.LLM →
+  litellm → openai SDK → request body so the response now carries
+  ``usage.cost`` (actual billed USD) and the existing
+  ``set_openrouter_usage()`` path picks it up automatically.  Helper
+  is idempotent, merges with any pre-existing ``extra_body`` /
+  ``usage`` keys, preserves operator-set ``include=False`` overrides,
+  and is defensive against non-dict ``additional_params`` values.
+  Wired into three LLM construction sites:
+  - ``section_02_research_and_llm._create_openrouter_llm`` (main
+    direction-judge / librarian / primary LLM).
+  - ``section_01_extraction_and_reformat._make_formatter_llm`` (schema
+    reformatting LLM).
+  - ``section_05_analysis_and_codegen._make_codegen_llm`` (codegen
+    LLM — the single largest cost sink in a Quant run; without this,
+    cost summaries under-reported by ~70 %).
+  The two sibling helpers detect OpenRouter via the
+  ``_quant_llm_provider`` attribute that ``_create_openrouter_llm``
+  stamps onto the main LLM.
+- **Cost-source labelling correctness preserved.**  When ``usage.cost``
+  arrives from OpenRouter, ``set_openrouter_usage()`` labels the
+  context ``cost_source="openrouter_api"`` (highest priority in
+  ``_USAGE_COST_SOURCE_PRIORITY``).  Falling through to the local
+  pricing table (Tier 1 or Tier 2 fallback) labels it
+  ``"openrouter_tokens_with_pricing"`` / ``"crewai_metrics_with_pricing"``.
+  The label remains ``"estimated"`` only when BOTH the API opt-in
+  failed AND the model is outside every known vendor family — a
+  genuinely-untracked model that the operator should add to the
+  pricing table.
+
+### Test coverage — v1.1.1 (31 new tests)
+
+- New `tests/test_v1_1_1_cost_tracking_regressions.py`:
+  - ``TestGetModelPricingV4Variants`` (4 tests) — v3/v4 explicit
+    entries resolve to the correct tier.
+  - ``TestGetModelPricingFamilyFallback`` (7 tests) — future
+    variants within known families fall back to non-zero pricing;
+    longest-prefix-wins tie-break; unknown vendors still emit
+    ``(0, 0)``; exact entries beat family fallback.
+  - ``TestFamilyPricingTableInvariants`` (2 tests) — every family
+    entry has positive prices; ``deepseek-v4-flash`` / ``v4-pro``
+    are EXPLICIT entries (not fallback-only).
+  - ``TestInjectOpenRouterUsageExtraBody`` (9 tests) — full branch
+    coverage of the merge helper including idempotence, merge into
+    existing structures at all three nesting levels, operator-False
+    override preservation, and three classes of malformed input.
+  - ``TestExtraBodyWiringInCallSites`` (3 tests) — ``inspect.getsource``
+    structural pins that the three LLM construction sites still
+    call the helper (catches a future refactor that drops the
+    injection silently — same anti-pattern documented in CLAUDE.md
+    § 9.6 producer→consumer wiring rule).
+  - ``TestCostZeroRegressionForV4Models`` (6 parametrised cases) —
+    every v3/v4 variant resolves to a ``pricing_known=True`` price,
+    so ``extract_and_set_usage_from_crew`` cannot fall into the
+    ``cost_source="estimated"`` / zero-cost branch for these IDs.
+
+### Validation
+
+- pytest: **2 487 passed, 1 skipped** (up from 2 451).  31 new tests
+  in ``tests/test_v1_1_1_cost_tracking_regressions.py`` covering both
+  the pricing-table fix and the ``extra_body`` injection helper +
+  call-site wiring.  Two pre-existing tests in
+  ``test_openrouter_cost_tracking.py`` updated to reflect the new
+  family-fallback contract (``gpt-5.4-pro`` now resolves to frontier-
+  tier family pricing instead of zero; the defensive-against-bleeding
+  intent is preserved by the new ``test_truly_unknown_vendor_still
+  _returns_zero`` test that uses ``cohere/`` — a vendor outside every
+  family prefix).  Zero regressions.
+- `crucible/smoke_test.py`: 5/5 OK; `run_crucible.py --self-check`: OK.
+
+### Compatibility
+
+- Drop-in for v1.1.0.  No env-var defaults flipped, no public schema
+  changes.
+- Behavioural note: runs using OpenRouter will now produce slightly
+  larger response payloads (the additional ``usage.cost`` /
+  ``usage.cost_details`` fields).  No measurable latency impact —
+  the fields are pre-computed server-side and add ~100 bytes per
+  response.
+- Operators with custom model IDs outside the vendor families
+  enumerated in ``OPENROUTER_MODEL_FAMILY_PRICING`` should add an
+  explicit entry to ``OPENROUTER_MODEL_PRICING``; behaviour
+  otherwise unchanged (still emits ``cost_source="estimated"``
+  with 0 cost, but at least the OpenRouter API opt-in will fill in
+  the real cost when available).
+
+---
+
 ## [v1.1.0] — 2026-05-14
 
 Major release: **Run Insights ledger** (cross-run telemetry with content-

@@ -126,9 +126,53 @@ OPENROUTER_MODEL_PRICING: Dict[str, Tuple[float, float]] = {
     "minimax/minimax-m2.5": (0.20 / 1_000_000, 1.17 / 1_000_000),
     "deepseek/deepseek-chat": (0.14 / 1_000_000, 0.28 / 1_000_000),
     "deepseek/deepseek-coder": (0.14 / 1_000_000, 0.28 / 1_000_000),
+    # v1.1.1 — 2026-era DeepSeek variants the operator is actively using.
+    # The /flash family tracks deepseek-chat pricing; /pro tracks the
+    # reasoner-class tier on OpenRouter.  These keep cost-tracking honest
+    # for any operator on the v4 line without waiting for the OpenRouter
+    # `usage: {include: true}` opt-in path (some legacy CrewAI / litellm
+    # callsites still don't forward the extra_body).
+    "deepseek/deepseek-v3-chat": (0.14 / 1_000_000, 0.28 / 1_000_000),
+    "deepseek/deepseek-v3-coder": (0.14 / 1_000_000, 0.28 / 1_000_000),
+    "deepseek/deepseek-v3-reasoner": (0.55 / 1_000_000, 2.19 / 1_000_000),
+    "deepseek/deepseek-r1": (0.55 / 1_000_000, 2.19 / 1_000_000),
+    "deepseek/deepseek-v4-flash": (0.14 / 1_000_000, 0.28 / 1_000_000),
+    "deepseek/deepseek-v4-pro": (0.55 / 1_000_000, 2.19 / 1_000_000),
     "mistralai/mistral-large": (2.00 / 1_000_000, 6.00 / 1_000_000),
     "mistralai/mistral-medium": (2.70 / 1_000_000, 8.10 / 1_000_000),
     "mistralai/mistral-small": (0.20 / 1_000_000, 0.60 / 1_000_000),
+}
+# v1.1.1 — Family-prefix fallback so a brand-new model variant within a
+# known vendor family (e.g. `deepseek/deepseek-v5-...`) does not silently
+# emit `total_cost_usd=0` / `cost_source="estimated"`.  The fallback
+# pricing is the cheapest entry in each family, which keeps the cost
+# estimate CONSERVATIVE (under-reports rather than over-reports —
+# operators are more tolerant of a $0.10 under-estimate than an $1.00
+# over-charge surprise).  Order matters: longer prefixes win; iteration
+# order is the insertion order below.
+OPENROUTER_MODEL_FAMILY_PRICING: Dict[str, Tuple[float, float]] = {
+    "deepseek/deepseek-r": (0.55 / 1_000_000, 2.19 / 1_000_000),
+    "deepseek/": (0.14 / 1_000_000, 0.28 / 1_000_000),
+    "openai/gpt-5": (2.50 / 1_000_000, 15.00 / 1_000_000),
+    "openai/gpt-4o": (2.50 / 1_000_000, 10.00 / 1_000_000),
+    "openai/gpt-4": (10.00 / 1_000_000, 30.00 / 1_000_000),
+    "openai/gpt-3": (0.50 / 1_000_000, 1.50 / 1_000_000),
+    # Generic OpenAI fallback (future gpt-6+ etc) — same as gpt-5 tier
+    # rather than the ancient gpt-3 floor, since future models are
+    # almost certainly priced at least as high as the current frontier.
+    "openai/": (2.50 / 1_000_000, 15.00 / 1_000_000),
+    "anthropic/claude-3-opus": (15.00 / 1_000_000, 75.00 / 1_000_000),
+    "anthropic/claude-3-haiku": (0.25 / 1_000_000, 1.25 / 1_000_000),
+    "anthropic/": (3.00 / 1_000_000, 15.00 / 1_000_000),
+    "google/gemini-1.5-pro": (3.50 / 1_000_000, 10.50 / 1_000_000),
+    "google/": (0.50 / 1_000_000, 1.50 / 1_000_000),
+    "z-ai/glm-4": (0.10 / 1_000_000, 0.10 / 1_000_000),
+    "z-ai/": (0.72 / 1_000_000, 2.30 / 1_000_000),
+    "minimax/": (0.20 / 1_000_000, 1.17 / 1_000_000),
+    "meta-llama/llama-3-8b": (0.06 / 1_000_000, 0.06 / 1_000_000),
+    "meta-llama/": (0.90 / 1_000_000, 0.90 / 1_000_000),
+    "mistralai/mistral-small": (0.20 / 1_000_000, 0.60 / 1_000_000),
+    "mistralai/": (2.00 / 1_000_000, 6.00 / 1_000_000),
 }
 DEFAULT_MODEL_PRICING = (1.00 / 1_000_000, 3.00 / 1_000_000)
 OPENROUTER_MODEL_ALIASES: Dict[str, str] = {
@@ -1269,14 +1313,49 @@ def clear_openrouter_usage() -> None:
 
 
 def _get_model_pricing(model_id: str) -> Tuple[float, float]:
+    """Resolve per-token input/output USD price for ``model_id``.
+
+    Search order:
+
+    1. Exact / short-name / `endswith(/short)` match against
+       ``OPENROUTER_MODEL_PRICING``.
+    2. Family-prefix fallback against ``OPENROUTER_MODEL_FAMILY_PRICING``
+       (v1.1.1).  Longest matching prefix wins, so
+       ``deepseek/deepseek-r1-distill`` falls under the
+       ``deepseek/deepseek-r`` entry (reasoner-class pricing) rather than
+       the generic ``deepseek/`` chat-class pricing.  Without this fallback,
+       any new model variant within a known family would silently emit
+       ``total_cost_usd=0`` and ``cost_source="estimated"`` — exactly the
+       v1.1.0-fifth-pass cost-zero regression the v1.1.1 round closed.
+    3. Final fallback: ``(0.0, 0.0)`` (caller emits
+       ``cost_source="estimated"`` with zero cost).
+    """
     if not model_id:
         return (0.0, 0.0)
-    for candidate in _iter_model_id_candidates(model_id):
+    candidates = list(_iter_model_id_candidates(model_id))
+    # ── Tier 1: exact / short-name / endswith match ──────────────────────────
+    for candidate in candidates:
         for key, pricing in OPENROUTER_MODEL_PRICING.items():
             key_lower = key.lower()
             key_short = key.split("/")[-1].lower()
             if candidate == key_lower or candidate == key_short or candidate.endswith("/" + key_short):
                 return pricing
+    # ── Tier 2: family-prefix fallback (v1.1.1) ──────────────────────────────
+    # Choose the LONGEST matching prefix so a more-specific family
+    # (e.g. "deepseek/deepseek-r") beats the generic vendor prefix
+    # ("deepseek/").  Without the length sort, dict insertion order would
+    # decide and a generic prefix could shadow the specific one.
+    best_prefix: str = ""
+    best_pricing: Optional[Tuple[float, float]] = None
+    for family_prefix, pricing in OPENROUTER_MODEL_FAMILY_PRICING.items():
+        prefix_lower = family_prefix.lower()
+        for candidate in candidates:
+            if candidate.startswith(prefix_lower) and len(prefix_lower) > len(best_prefix):
+                best_prefix = prefix_lower
+                best_pricing = pricing
+                break
+    if best_pricing is not None:
+        return best_pricing
     return (0.0, 0.0)
 
 
@@ -1398,6 +1477,44 @@ def extract_and_set_usage_from_crew(crew: Any, model_id: str = "") -> None:
             )
         except Exception:
             pass
+
+
+def inject_openrouter_usage_extra_body(llm_kwargs: Dict[str, Any]) -> Dict[str, Any]:
+    """Mutate ``llm_kwargs`` so the OpenRouter request includes ``usage: {"include": true}``.
+
+    OpenRouter only populates ``response.usage.cost`` (the actual billed USD
+    amount) when the request body carries ``"usage": {"include": true}``.
+    Without that opt-in, ``usage.cost`` is omitted from the response and the
+    Crucible cost-tracking pipeline falls back to the local pricing table —
+    which silently returns 0 for any model variant not enumerated there.
+    This was the v1.1.0-era cost-zero bug for ``deepseek-v4-*``.
+
+    The flag is forwarded via crewai.LLM's ``additional_params`` → litellm's
+    ``extra_body`` → openai SDK's request body merger.  All three layers
+    preserve unknown keys verbatim, so this is a pure additive change.
+
+    Idempotent: a second call is a no-op if the flag is already set.
+    Defensive: tolerates ``llm_kwargs["additional_params"]`` being absent,
+    pre-set to a non-dict (returns unchanged), or pre-set with an unrelated
+    ``extra_body`` value (merges instead of clobbering).
+
+    Returns ``llm_kwargs`` for chained-call ergonomics.
+    """
+    if not isinstance(llm_kwargs, dict):
+        return llm_kwargs
+    additional = llm_kwargs.setdefault("additional_params", {})
+    if not isinstance(additional, dict):
+        # Caller passed something we can't merge into — leave it alone to
+        # avoid breaking a deliberate override.
+        return llm_kwargs
+    raw_extra_body = additional.get("extra_body")
+    extra_body = dict(raw_extra_body) if isinstance(raw_extra_body, dict) else {}
+    raw_usage = extra_body.get("usage")
+    usage_block = dict(raw_usage) if isinstance(raw_usage, dict) else {}
+    usage_block.setdefault("include", True)
+    extra_body["usage"] = usage_block
+    additional["extra_body"] = extra_body
+    return llm_kwargs
 
 
 try:

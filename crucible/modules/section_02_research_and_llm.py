@@ -2075,6 +2075,16 @@ def _create_openrouter_llm(
         # by CrewAI (e.g. memory module) also get the x-source: opencode header.
         _install_alibaba_openai_client_header_patch()
 
+    if resolved_provider == LLM_PROVIDER_OPENROUTER:
+        # v1.1.1 — Opt into OpenRouter's usage-accounting so the actual
+        # billed USD amount lands in ``response.usage.cost`` instead of
+        # being silently elided.  Without this, cost tracking falls back
+        # to the local pricing table and emits zero whenever the model
+        # ID is missing or misspelled (e.g. ``deepseek-v4-flash`` before
+        # the v1.1.1 table update).  See ``inject_openrouter_usage_extra_body``
+        # docstring for the three-layer plumbing rationale.
+        inject_openrouter_usage_extra_body(llm_kwargs)
+
     if enable_cost_tracking:
         callback_handler = get_openrouter_callback_handler()
         if callback_handler is not None:

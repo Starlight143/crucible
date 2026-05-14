@@ -100,6 +100,18 @@ def _make_formatter_llm(main_llm: Any, max_tokens: Optional[int] = None) -> Any:
             except (TypeError, ValueError):
                 pass
 
+        # v1.1.1 — Propagate the OpenRouter usage-include opt-in from the
+        # main LLM so the formatter LLM also gets real billed cost in its
+        # responses.  Without this, every formatter call would emit
+        # ``cost_source="estimated"`` and zero out the cost summary even
+        # if the main LLM was correctly configured.
+        try:
+            provider_tag = str(getattr(main_llm, "_quant_llm_provider", "") or "").strip().lower()
+            if provider_tag == LLM_PROVIDER_OPENROUTER:
+                inject_openrouter_usage_extra_body(kwargs)
+        except Exception:
+            pass
+
         formatter_llm = _CrewAI_LLM(**kwargs)
         # Carry over the provider tag so cost tracking / cache keying stays correct.
         try:

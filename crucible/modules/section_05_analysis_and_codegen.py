@@ -179,6 +179,17 @@ def _make_codegen_llm(main_llm: Any) -> Any:
             except (TypeError, ValueError):
                 pass
 
+        # v1.1.1 — Propagate the OpenRouter usage-include opt-in from the
+        # main LLM.  Codegen calls are the single largest cost sink in a
+        # Quant run; without this, every codegen response loses the
+        # billed-cost field and the run summary under-reports by ~70%.
+        try:
+            provider_tag = str(getattr(main_llm, "_quant_llm_provider", "") or "").strip().lower()
+            if provider_tag == LLM_PROVIDER_OPENROUTER:
+                inject_openrouter_usage_extra_body(kwargs)
+        except Exception:
+            pass
+
         codegen_llm = _CrewAI_LLM(**kwargs)
         # Carry over the provider tag so cost tracking / cache keying stays correct.
         try:
