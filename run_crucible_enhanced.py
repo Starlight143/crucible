@@ -2481,7 +2481,10 @@ def main() -> None:
             from crucible.run_correlation import set_run_id as _set_run_id
         except ImportError:
             from run_correlation import set_run_id as _set_run_id  # type: ignore[no-redef]
-        _set_run_id(os.environ.get("CRUCIBLE_RUN_ID") or None)
+        # v1.1.2 (sixth-pass H-3): strip before ``or None`` to reject
+        # whitespace-only ``CRUCIBLE_RUN_ID`` values that would otherwise
+        # bypass set_run_id's own ``.strip()`` defence.
+        _set_run_id((os.environ.get("CRUCIBLE_RUN_ID") or "").strip() or None)
     except Exception:
         # Correlation-id binding must never break the pipeline boot.
         pass

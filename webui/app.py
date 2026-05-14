@@ -44,7 +44,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from flask import Flask, Response, jsonify, render_template, request, stream_with_context
 
@@ -219,7 +219,30 @@ def _enforce_xhr_header_on_state_changes() -> Any:
     # ``request.host`` already reflects the forwarded value and this
     # is a no-op; if ProxyFix is OFF we still try to be lenient on
     # same-origin requests when an explicit forwarded host matches.
-    fwd_host = (request.headers.get("X-Forwarded-Host") or "").strip().lower()
+    #
+    # v1.1.2 (audit fix G5-C-MED-4): gate the X-Forwarded-Host read behind
+    # the same ``CRUCIBLE_TRUST_FORWARDED`` opt-in that controls ProxyFix.
+    # Previously the header was consulted unconditionally — any HTTP client
+    # that controls headers (curl, malicious internal pod) could set
+    # ``Referer: http://attacker.com/`` together with
+    # ``X-Forwarded-Host: attacker.com`` and convince this gate that a
+    # cross-host POST was same-origin.  When the operator has not opted into
+    # trusting forwarded headers, ignore X-Forwarded-Host entirely.
+    #
+    # v1.1.2 (audit fix G5-C-MED-5): split on the first comma.  Multi-hop
+    # proxy chains legitimately emit ``X-Forwarded-Host: real.com, edge.net``
+    # — the un-split string never matches a Referer's host, so legitimate
+    # same-origin POSTs behind multi-hop proxies were 403'd as "missing
+    # X-Requested-With header".  Standard practice (matches Werkzeug
+    # ProxyFix's behaviour) is to take the first hop and discard the rest.
+    _forwarded_trusted = os.environ.get("CRUCIBLE_TRUST_FORWARDED", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    if _forwarded_trusted:
+        _fwd_raw = (request.headers.get("X-Forwarded-Host") or "").strip().lower()
+        fwd_host = _fwd_raw.split(",", 1)[0].strip() if _fwd_raw else ""
+    else:
+        fwd_host = ""
 
     requires_xhr_header = False
     if origin:
@@ -286,6 +309,92 @@ def _handle_500(exc: Any) -> Any:
     return jsonify({"error": "Internal server error"}), 500
 
 
+def _safe_500(exc: BaseException, context: str) -> Any:
+    """Return a generic JSON 500 with a short log-correlation id and log
+    the raw exception via ``LOGGER.exception`` for operator triage.
+
+    v1.1.2 (audit fix G7-C-HIGH-1): five endpoints used to ``jsonify({
+    "error": str(exc) })`` directly, leaking on-disk DB paths (sqlite3
+    errors), absolute filesystem paths (``OSError`` / WindowsError),
+    and internal hostnames (``urllib.error.URLError`` wrapped around
+    ``getaddrinfo``).  We now log the raw exception server-side and
+    return only a generic message + a short ``log_id`` the operator can
+    grep in the WebUI log for the underlying detail.  Endpoint-specific
+    user-input validation errors (400-class) are unaffected — those
+    legitimately reflect malformed requests.
+    """
+    log_id = uuid.uuid4().hex[:8]
+    try:
+        LOGGER.exception("[webui] %s failed (log_id=%s)", context, log_id)
+    except Exception:
+        # Logger itself is broken — at least don't propagate further.
+        pass
+    return jsonify({
+        "error": "internal error",
+        "log_id": log_id,
+        "detail": (
+            "Server-side error; the full traceback is in the WebUI log "
+            f"under log_id={log_id}.  Send the log_id to your operator."
+        ),
+    }), 500
+
+
+# v1.1.2 (sixth-pass H-4): regex patterns used by ``_redact_for_client`` to
+# scrub absolute filesystem paths.  Compiled at module load so the hot path
+# (every webhook history row, every notify_test response) avoids per-call
+# ``re.compile``.  Patterns intentionally only match recognised absolute-
+# path prefixes so URL paths in error messages stay readable.
+_PATH_REDACT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    # Windows ``C:\Users\...\file.ext`` form (and similar drive letters).
+    re.compile(r"[A-Za-z]:\\(?:[^\\/:*?\"<>|\r\n]+\\){1,}([^\\/:*?\"<>|\r\n]+)"),
+    # POSIX absolute path under common home / system roots.
+    re.compile(r"/(?:home|Users|root|tmp|var|opt|etc|usr|mnt|srv)/[^\s\"']+/([^/\s\"']+)"),
+)
+
+
+def _redact_for_client(text: Any, *, max_len: int = 300) -> str:
+    """Scrub a free-form error string before exposing it to the client.
+
+    v1.1.2 (sixth-pass H-4): four endpoints
+    (``api_notify_test``, ``api_webhook_history``, the
+    ``api_v169_metrics`` text/plain branches, ``api_signal``,
+    ``api_list_projects``) used to embed ``str(exc)`` in their response
+    bodies.  Operator-only or not, these paths could carry sk-* tokens
+    (when the URL was misconfigured to include credentials), absolute
+    filesystem paths (``OSError``'s ``strerror`` + ``filename``), and
+    internal hostnames.  This helper:
+
+    1. Routes the string through Run Insights' ``_VALUE_SECRET_PATTERNS``
+       so any of the 14+ vendor-specific secret prefixes are masked.
+    2. Replaces absolute Windows / POSIX paths with ``<path>/<basename>``
+       so the directory tree stays out of the response.
+    3. Caps length at *max_len* to bound clients that aren't expecting
+       multi-KB error bodies.
+
+    Returns the empty string for ``None`` / empty input.
+    """
+    if text is None or text == "":
+        return ""
+    out = str(text)
+    try:
+        try:
+            from crucible.features.run_insights.redact import _redact_string_value as _rs
+        except ImportError:
+            from features.run_insights.redact import _redact_string_value as _rs  # type: ignore[no-redef]
+        out = _rs(out)
+    except Exception:
+        # Defensive: redact module may be unavailable in degraded envs.
+        pass
+    try:
+        for _pat in _PATH_REDACT_PATTERNS:
+            out = _pat.sub(r"<path>/\1", out)
+    except Exception:
+        pass
+    if len(out) > max_len:
+        out = out[: max_len - 1] + "…"
+    return out
+
+
 # ─── In-memory run registry ────────────────────────────────────────────────────
 
 _runs: dict[str, dict[str, Any]] = {}
@@ -303,6 +412,48 @@ _webhook_history_lock = threading.Lock()
 # a further period so status queries still return the final returncode/status.
 _RUNS_OUTPUT_TTL = 300    # 5 min: trim output list after run ends
 _RUNS_ENTRY_TTL  = 3600   # 1 h:  remove the run dict entry entirely
+
+# v1.1.2 (audit fix G5-C-MED-6): cap concurrent worker threads so a scripted
+# attacker or a runaway autorun loop cannot exhaust process / memory budgets
+# by triggering N parallel subprocess.Popen chains through /api/run.
+# Override via ``CRUCIBLE_WEBUI_MAX_CONCURRENT_RUNS`` (whitelist parser
+# semantics — typo falls back to default 4).
+def _parse_max_concurrent_runs() -> int:
+    raw = (os.environ.get("CRUCIBLE_WEBUI_MAX_CONCURRENT_RUNS") or "").strip()
+    if not raw:
+        return 4
+    try:
+        n = int(raw)
+        if n <= 0:
+            return 4
+        return min(n, 64)  # hard ceiling — refuse to allow truly silly values
+    except (ValueError, TypeError):
+        return 4
+
+
+_RUNS_MAX_CONCURRENT = _parse_max_concurrent_runs()
+_runs_semaphore = threading.BoundedSemaphore(value=_RUNS_MAX_CONCURRENT)
+
+# v1.1.2 (audit fix G5-C-MED-9): cap the in-memory output ring per run so a
+# long-running chatty pipeline cannot grow without bound.  Lines beyond the
+# cap are dropped from the head (FIFO) — operators investigating cost / token
+# usage / final verdict need the TAIL; the head is reproducible from
+# saved_projects/ on disk.  Override via
+# ``CRUCIBLE_WEBUI_MAX_OUTPUT_LINES_PER_RUN``.
+def _parse_max_output_lines() -> int:
+    raw = (os.environ.get("CRUCIBLE_WEBUI_MAX_OUTPUT_LINES_PER_RUN") or "").strip()
+    if not raw:
+        return 50_000
+    try:
+        n = int(raw)
+        if n <= 0:
+            return 50_000
+        return min(n, 2_000_000)
+    except (ValueError, TypeError):
+        return 50_000
+
+
+_RUNS_MAX_OUTPUT_LINES = _parse_max_output_lines()
 
 
 def _evict_stale_runs(skip_run_id: str = "") -> None:
@@ -351,6 +502,49 @@ def _cleanup_all_runs() -> None:
                     proc.terminate()
                 except Exception:
                     LOGGER.debug("atexit terminate failed for run", exc_info=True)
+
+
+# v1.1.2 (audit fix G5-C-LOW-14): proactive eviction timer.  Previously
+# ``_evict_stale_runs`` was only called from inside the SSE generator;
+# headless / webhook-only deployments (no dashboard tab open) accumulated
+# completed run records indefinitely until a page load triggered the
+# sweep.  We now run a tiny daemon timer that re-arms itself every
+# ``_EVICTION_TIMER_SECS`` seconds for the lifetime of the process.
+# Daemon=True means the timer shuts down cleanly when Flask exits and
+# never blocks interpreter shutdown.
+_EVICTION_TIMER_SECS = 60.0
+_eviction_timer: "threading.Timer | None" = None
+_eviction_timer_lock = threading.Lock()
+
+
+def _periodic_evict_runs() -> None:
+    """Run the staleness sweep, then re-arm the timer."""
+    try:
+        _evict_stale_runs("")
+    except Exception:
+        LOGGER.debug("[webui] periodic eviction failed", exc_info=True)
+    finally:
+        _schedule_eviction_timer()
+
+
+def _schedule_eviction_timer() -> None:
+    """Arm a one-shot daemon Timer that calls ``_periodic_evict_runs`` once
+    after ``_EVICTION_TIMER_SECS`` seconds.  Idempotent: if a timer is
+    already armed, this is a no-op.
+    """
+    global _eviction_timer
+    with _eviction_timer_lock:
+        if _eviction_timer is not None and _eviction_timer.is_alive():
+            return
+        t = threading.Timer(_EVICTION_TIMER_SECS, _periodic_evict_runs)
+        t.daemon = True
+        t.name = "crucible-webui-eviction"
+        _eviction_timer = t
+        t.start()
+
+
+# Arm at import time so the sweep runs even before the first SSE poll.
+_schedule_eviction_timer()
 
 
 # ─── .env helpers ──────────────────────────────────────────────────────────────
@@ -1475,7 +1669,7 @@ def api_set_env():
     try:
         _save_env(data)
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        return _safe_500(exc, "api_save_env: _save_env")
     # Hot-reload the saved values into this process's os.environ so the
     # change takes effect without a WebUI restart.  Subsequent
     # subprocess spawns inherit os.environ via ``_child_env``, so the
@@ -1692,9 +1886,69 @@ def _run_worker(
         AFTER the standard PYTHONUTF8 / CRUCIBLE_RUN_ID seed so the operator's
         single-run toggle wins over ``.env`` defaults but never overwrites the
         correlation id.
+
+    v1.1.2 (audit fix G5-C-MED-6)
+    -----------------------------
+    Wraps the entire worker body in a ``threading.BoundedSemaphore`` acquire
+    so concurrent active runs are capped at ``_RUNS_MAX_CONCURRENT`` (default
+    4, env-override ``CRUCIBLE_WEBUI_MAX_CONCURRENT_RUNS``).  When the cap
+    is reached, additional ``/api/run`` / ``/webhook/trigger`` / ``/api/ab-test/run``
+    invocations block here in their respective threads — the operator/HTTP
+    caller already received their ``run_id`` and ``status=starting``, so the
+    SSE stream simply doesn't see line activity until a worker slot opens.
+    Subsequent runs still appear in the dashboard run list.  The semaphore
+    is bounded so a programming error that releases without acquiring
+    raises immediately rather than silently inflating the cap.
     """
     proc: "subprocess.Popen[str] | None" = None
+    # v1.1.2 (sixth-pass H-5): bound the semaphore acquire and re-check the
+    # cancellation flag immediately after.  Previously a saturated worker
+    # pool would pin this thread forever on ``acquire()`` and — once a slot
+    # opened — happily spawn the subprocess even though the operator had
+    # issued ``DELETE /api/run/<id>`` while we waited.  The blocked record
+    # also lacked an ``ended_at`` field, so ``_evict_stale_runs`` never
+    # reclaimed it (memory leak).  60 seconds is a generous burst-queue
+    # tolerance; longer-than-that means the operator's intent has almost
+    # certainly drifted.
+    _SEM_ACQUIRE_TIMEOUT_SEC = 60.0
+    acquired = False
     try:
+        try:
+            acquired = _runs_semaphore.acquire(timeout=_SEM_ACQUIRE_TIMEOUT_SEC)
+        except Exception:
+            acquired = False
+        if not acquired:
+            with _runs_lock:
+                _rec_to = _runs.get(run_id)
+                if _rec_to is not None:
+                    if _rec_to.get("status") != "cancelled":
+                        _rec_to["status"] = "error"
+                        _rec_to["output"].append(
+                            "[WEBUI ERROR] Worker slot acquire timed out after "
+                            f"{_SEM_ACQUIRE_TIMEOUT_SEC:.0f}s (cap={_RUNS_MAX_CONCURRENT})."
+                        )
+                    if _rec_to.get("ended_at") is None:
+                        _rec_to["ended_at"] = time.time()
+                    if _rec_to.get("returncode") is None:
+                        _rec_to["returncode"] = -1
+                    _rec_to["awaiting_input"] = False
+            return
+        # Re-check the cancellation flag now that we hold a worker slot.
+        # A DELETE that landed while we were queued must NOT result in a
+        # subprocess being spawned: the operator's intent was to abandon.
+        _cancelled_pre_spawn = False
+        with _runs_lock:
+            _rec_pre = _runs.get(run_id)
+            if _rec_pre is None or _rec_pre.get("status") == "cancelled":
+                _cancelled_pre_spawn = True
+                if _rec_pre is not None:
+                    if _rec_pre.get("ended_at") is None:
+                        _rec_pre["ended_at"] = time.time()
+                    if _rec_pre.get("returncode") is None:
+                        _rec_pre["returncode"] = -1
+                    _rec_pre["awaiting_input"] = False
+        if _cancelled_pre_spawn:
+            return
         # Force UTF-8 I/O on the child Python process so that its stdout
         # is always UTF-8-encoded, matching the encoding="utf-8" we use
         # when reading back.  Without this, Windows uses the console
@@ -1759,7 +2013,18 @@ def _run_worker(
             if run_rec is not None:
                 run_rec["stdin_pipe"] = proc.stdin
 
-        # Stream stdout line by line — no hard cap; output grows as needed.
+        # Stream stdout line by line.
+        # v1.1.2 (audit fix G5-C-MED-9): hard-cap the in-memory output ring
+        # at ``_RUNS_MAX_OUTPUT_LINES`` so a long-running chatty pipeline
+        # (8-hour runs are within the supported envelope) cannot consume
+        # GBs of Flask memory.  Older lines are evicted FIFO from the head;
+        # the ``output_evicted`` counter tracks how many lines were dropped
+        # so the SSE generator can serve a graceful "[NOTE] earlier output
+        # truncated" notice to slow resumers without breaking the
+        # cumulative ``sent`` index used for resume.  Tail is preserved
+        # because operators investigating cost / token usage / final
+        # verdict need the LAST lines, not the first; the truncated head
+        # is recoverable from saved_projects/ on disk.
         # Noisy SDK debug lines (httpx wire logs, LiteLLM internals, etc.)
         # are suppressed at the frontend display layer, not here, so the
         # full output is always available for post-run inspection.
@@ -1769,12 +2034,34 @@ def _run_worker(
         line_index = 0
         for line in proc.stdout:
             stripped = line.rstrip("\n")
+            # v1.1.2 (sixth-pass M-4): redact secrets and absolute paths
+            # from every captured stdout line before it lands in the run's
+            # output buffer.  15+ ``print(f"[Error] ...: {e}")`` call sites
+            # across section_01 / 02 / 04 / 05 / 06 historically embedded
+            # raw exception text that can carry ``sk-or-v1-…`` /
+            # ``sk-ant-…`` API keys, internal hostnames, and absolute
+            # filesystem paths.  Patching the source per call site is
+            # 15+ edits with the same one-letter regression every release;
+            # the capture boundary here is the single chokepoint every
+            # subprocess stdout line MUST pass through, so redacting here
+            # is structurally one fix covers all.  ``max_len`` is raised
+            # to 8000 so full pipeline output is preserved (the helper's
+            # default 300 is sized for short API error messages).
+            stripped = _redact_for_client(stripped, max_len=8000)
             with _runs_lock:
                 run_rec = _runs.get(run_id)
                 if run_rec is None:
                     line_index += 1
                     continue
-                run_rec["output"].append(stripped)
+                _out_buf = run_rec["output"]
+                _out_buf.append(stripped)
+                # FIFO eviction: drop oldest line(s) once buffer exceeds cap.
+                if len(_out_buf) > _RUNS_MAX_OUTPUT_LINES:
+                    _excess = len(_out_buf) - _RUNS_MAX_OUTPUT_LINES
+                    del _out_buf[:_excess]
+                    run_rec["output_evicted"] = (
+                        int(run_rec.get("output_evicted") or 0) + _excess
+                    )
 
                 # Feature 1: detect AWAIT_INPUT marker
                 m_await = _AWAIT_INPUT_RE.search(stripped)
@@ -1864,6 +2151,27 @@ def _run_worker(
                 proc.stdout.close()
             except Exception:
                 LOGGER.debug("[webui] swallowed exception", exc_info=True)
+        # v1.1.2 (audit fix G5-C-MED-6): release the worker-slot reservation
+        # acquired at the top of this function.  Release in the outermost
+        # finally so an exception during subprocess.Popen or any later step
+        # still returns the slot to the pool — without this a single
+        # crashing run would permanently shrink the worker pool.
+        #
+        # v1.1.2 (sixth-pass H-5): only release if the acquire actually
+        # succeeded.  The acquire is now bounded by
+        # ``_SEM_ACQUIRE_TIMEOUT_SEC`` and may legitimately return False,
+        # in which case releasing would inflate the cap (BoundedSemaphore
+        # would raise ValueError on the next over-release).
+        if acquired:
+            try:
+                _runs_semaphore.release()
+            except ValueError:
+                # BoundedSemaphore raises if released too many times — defensive,
+                # should not happen but never propagate this failure.
+                LOGGER.warning(
+                    "[webui] _runs_semaphore.release raised ValueError; "
+                    "worker-slot accounting may have drifted"
+                )
 
 
 # ── Run management ────────────────────────────────────────────────────────────
@@ -1887,6 +2195,9 @@ def api_start_run():
             "stdin": stdin_text,
             "status": "starting",
             "output": [],
+            # v1.1.2 (audit fix G5-C-MED-9): FIFO eviction counter for the
+            # capped output ring.  See _RUNS_MAX_OUTPUT_LINES.
+            "output_evicted": 0,
             "started_at": time.time(),
             "ended_at": None,
             "returncode": None,
@@ -1950,6 +2261,11 @@ def api_stream_run(run_id: str):
     def _generate():
         sent = resume_from
         idle_ticks = 0
+        # v1.1.2 (audit fix G5-C-MED-9): one-shot notice when the resumer
+        # has lost data due to head eviction (output ring cap).  Set to
+        # True after the notice is emitted so the SSE stream doesn't spam
+        # it on every poll.
+        truncation_notified = False
         try:
             while True:
                 # ── Snapshot run state under lock ─────────────────────────
@@ -1959,7 +2275,31 @@ def api_stream_run(run_id: str):
                 with _runs_lock:
                     run = _runs.get(run_id)
                     if run is not None:
-                        new_lines = run["output"][sent:]
+                        # v1.1.2 (audit fix G5-C-MED-9): map cumulative
+                        # ``sent`` to a buffer-local slice via the FIFO
+                        # eviction counter.  Three cases:
+                        #
+                        # 1. sent >= evicted: sliceable; serve [sent - evicted:].
+                        # 2. sent <  evicted: resumer lost data — slice from
+                        #    buffer start and (one-time) emit a truncation
+                        #    notice.  Sent is advanced to evicted so the
+                        #    consumer's cumulative index converges to
+                        #    where the buffer actually starts.
+                        evicted = int(run.get("output_evicted") or 0)
+                        if sent < evicted:
+                            new_lines = list(run["output"])
+                            if not truncation_notified:
+                                new_lines.insert(
+                                    0,
+                                    "[NOTE] Output buffer truncated: "
+                                    f"{evicted - sent} earlier line(s) evicted "
+                                    "due to memory cap. Tail preserved; head "
+                                    "is recoverable from saved_projects/.",
+                                )
+                                truncation_notified = True
+                            sent = evicted
+                        else:
+                            new_lines = run["output"][sent - evicted:]
                         run_status = run["status"]
                         run_rc = run.get("returncode", -1)
                     else:
@@ -1982,6 +2322,18 @@ def api_stream_run(run_id: str):
                     # fires on the frontend and resets the watchdog timer.  An SSE comment
                     # (": keepalive") would NOT trigger onmessage and would therefore fail
                     # to prevent the 10-min watchdog from firing during long LLM calls.
+                    #
+                    # v1.1.2 (audit fix G5-C-MED-10): IMPORTANT — keepalive
+                    # payloads do NOT increment ``sent``.  This is by design:
+                    # ``sent`` is the cumulative count of REAL output lines so
+                    # the resume-from-N replay logic stays correct.  If a
+                    # future maintainer "fixes" the keepalive to use an SSE
+                    # comment (`: keepalive`) the EventSource watchdog will
+                    # fire silently during long LLM stages — that was the
+                    # original bug this design pattern closes.  A regression
+                    # test in tests/test_v1_1_2_audit_fixes.py pins this
+                    # contract by reading the function source via
+                    # ``inspect.getsource``.
                     if idle_ticks % _SSE_KEEPALIVE_TICKS == 0:
                         yield f"data: {json.dumps({'__keepalive__': True})}\n\n"
 
@@ -1995,6 +2347,20 @@ def api_stream_run(run_id: str):
                 # Normal termination: run finished and all output sent
                 if run_status in ("done", "error", "cancelled"):
                     if not new_lines:
+                        # v1.1.2 (audit fix G5-C-MED-11): pad the final
+                        # ``__done__`` event with a 2 KB SSE comment so
+                        # proxies that buffer ≤ 4 KB (nginx with
+                        # ``proxy_buffering on``, Cloudflare with default
+                        # tier) flush immediately rather than holding the
+                        # tiny terminal event in a partial-fill buffer.
+                        # ``X-Accel-Buffering: no`` on the response
+                        # disables this at the nginx layer when present
+                        # but third-party CDNs / reverse proxies may not
+                        # honour the header — the padding guarantees the
+                        # flush.  Comment lines (``:`` prefix) are stripped
+                        # by EventSource before reaching ``onmessage`` so
+                        # the frontend sees nothing extra.
+                        yield ":" + (" " * 2048) + "\n\n"
                         yield f"data: {json.dumps({'__done__': True, 'returncode': run_rc})}\n\n"
                         return
 
@@ -2236,6 +2602,106 @@ def _read_jsonl_stream(path: Path) -> list[dict[str, Any]]:
     return out
 
 
+def _iter_jsonl_stream(path: Path) -> Iterator[dict[str, Any]]:
+    """Lazily yield decoded JSONL records from *path*.
+
+    v1.1.2 (audit fix G2-C-HIGH-2): the original ``_read_jsonl_stream``
+    materialises every line into a Python list, which made
+    ``/api/insights/summary``, ``/api/insights/events`` and
+    ``/api/run/<id>/insights`` O(N) in ledger size for every request.  The
+    user plan is to accumulate 2-4 weeks of real-world ledger data before
+    v1.2.0 ships; that is hundreds of thousands of lines, and a dashboard
+    poll would OOM the Flask process.  This generator yields one decoded
+    record at a time so callers can apply filters lazily and break early
+    when ``len(collected) >= limit`` is reached.
+
+    Defensive: malformed JSON lines are silently skipped (matching the
+    legacy list helper's behaviour); OSError on open is logged and the
+    generator yields nothing.
+    """
+    if not path.exists():
+        return
+    try:
+        fh = open(path, "r", encoding="utf-8")
+    except OSError as exc:
+        LOGGER.debug("insights: read %s failed: %s", path, exc)
+        return
+    try:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                obj = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(obj, dict):
+                yield obj
+    finally:
+        try:
+            fh.close()
+        except OSError:
+            pass
+
+
+def _tail_jsonl_stream(path: Path, n: int = 5) -> list[dict[str, Any]]:
+    """Return the last *n* well-formed JSON records of *path* without
+    materialising the whole file.
+
+    v1.1.2 (audit fix G2-C-HIGH-2): used by ``api_insights_summary`` so
+    the dashboard's recent-events feed reads only the trailing slice of
+    each stream rather than the entire JSONL.  The implementation reads
+    blocks from the end of the file via ``os.SEEK_END``-relative seeks,
+    keeps the last *n* parseable records, and stops once the buffer
+    contains enough.  Falls back to the full-file streaming reader on
+    any OSError (small ledger / unusual filesystem) so the dashboard
+    still works in degraded conditions.
+    """
+    if n <= 0 or not path.exists():
+        return []
+    block_size = 64 * 1024  # 64 KiB
+    keep: list[dict[str, Any]] = []
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            file_size = fh.tell()
+            pos = file_size
+            buf = b""
+            while pos > 0 and len(keep) < n:
+                read_size = min(block_size, pos)
+                pos -= read_size
+                fh.seek(pos)
+                chunk = fh.read(read_size) + buf
+                # Save any incomplete leading bytes for the next iteration.
+                first_nl = chunk.find(b"\n") if pos > 0 else -1
+                if first_nl >= 0:
+                    buf = chunk[:first_nl]
+                    chunk = chunk[first_nl + 1:]
+                else:
+                    buf = b""
+                # Parse the chunk in reverse so we keep the newest records.
+                lines = chunk.split(b"\n")
+                for raw in reversed(lines):
+                    stripped = raw.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        obj = json.loads(stripped.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        continue
+                    if isinstance(obj, dict):
+                        keep.append(obj)
+                        if len(keep) >= n:
+                            break
+    except OSError as exc:
+        LOGGER.debug("insights: tail %s failed: %s", path, exc)
+        # Degraded fallback: stream the whole file and slice.
+        all_records = list(_iter_jsonl_stream(path))
+        return all_records[-n:]
+    # ``keep`` was built newest-first; preserve that order.
+    return keep[:n]
+
+
 def _count_jsonl_lines(path: Path) -> int:
     if not path.exists():
         return 0
@@ -2277,9 +2743,11 @@ def api_insights_summary():
         lines = _count_jsonl_lines(path)
         streams[s] = {"lines": lines, "exists": path.exists()}
         if lines > 0:
-            # Pull the tail-most ~5 lines per stream for the global recent feed.
-            events = _read_jsonl_stream(path)
-            recent_pool.extend(events[-5:])
+            # v1.1.2 (audit fix G2-C-HIGH-2): tail-only read (seek to end +
+            # read backward) keeps the dashboard's recent-events feed O(n)
+            # in *tail size* rather than O(N) in *ledger size*.  Previously
+            # the entire JSONL was materialised, then sliced to 5.
+            recent_pool.extend(_tail_jsonl_stream(path, n=5))
     recent_pool.sort(key=lambda e: str(e.get("ts") or ""), reverse=True)
     return jsonify({
         "enabled": enabled,
@@ -2321,8 +2789,16 @@ def api_insights_events():
 
     root = _insights_root()
     collected: list[dict[str, Any]] = []
+    # v1.1.2 (audit fix G2-C-HIGH-2): stream lazily via ``_iter_jsonl_stream``
+    # instead of materialising every line, and cap the working set at
+    # ``limit * 4`` so a pathological accumulating ledger cannot OOM the
+    # Flask worker.  Once the cap is reached we still want to return a
+    # representative slice — we sort and truncate at the end as before.
+    soft_cap = max(limit * 4, 200)
     for s in target_streams:
-        for ev in _read_jsonl_stream(root / f"{s}.jsonl"):
+        if len(collected) >= soft_cap:
+            break
+        for ev in _iter_jsonl_stream(root / f"{s}.jsonl"):
             if run_id_filter and str(ev.get("run_id") or "") != run_id_filter:
                 continue
             if project_filter:
@@ -2334,6 +2810,8 @@ def api_insights_events():
             if kind_filter and str(ev.get("kind") or "") != kind_filter:
                 continue
             collected.append(ev)
+            if len(collected) >= soft_cap:
+                break
 
     # Sort newest first, then truncate.
     collected.sort(key=lambda e: str(e.get("ts") or ""), reverse=True)
@@ -2349,8 +2827,12 @@ def api_run_insights(run_id: str):
     """All insight events for a single run_id, grouped by stream."""
     root = _insights_root()
     grouped: dict[str, list[dict[str, Any]]] = {s: [] for s in _INSIGHTS_STREAMS}
+    # v1.1.2 (audit fix G2-C-HIGH-2): stream lazily.  Per-run row counts
+    # are bounded by the pipeline structure (one params/output, a handful
+    # of debate/error events per run) so no soft cap is required here —
+    # the filter itself bounds memory.
     for s in _INSIGHTS_STREAMS:
-        for ev in _read_jsonl_stream(root / f"{s}.jsonl"):
+        for ev in _iter_jsonl_stream(root / f"{s}.jsonl"):
             if str(ev.get("run_id") or "") == run_id:
                 grouped[s].append(ev)
     total = sum(len(v) for v in grouped.values())
@@ -2411,7 +2893,7 @@ def api_leaderboard():
             reverse=True,
         )
     except OSError as exc:
-        return jsonify({"error": str(exc)}), 500
+        return _safe_500(exc, "api_list_projects: SAVED_PROJECTS_DIR.iterdir")
 
     for d in dirs:
         if not d.is_dir() or d.name.startswith("."):
@@ -2532,7 +3014,23 @@ def cost_trend() -> Response:
     try:
         entries = sorted(saved_dir.iterdir(), key=_safe_mtime)
     except OSError as exc:
-        return jsonify({"runs": [], "error": str(exc)})
+        # v1.1.2 (sixth-pass H-4): redact the raw OSError before exposing
+        # it.  This path 200s on partial failure (frontend renders the
+        # empty-state) but historically embedded the absolute path of the
+        # saved-projects directory.
+        _log_id = uuid.uuid4().hex[:8]
+        try:
+            LOGGER.exception(
+                "[webui] api_list_projects iterdir failed (log_id=%s)",
+                _log_id,
+            )
+        except Exception:
+            pass
+        return jsonify({
+            "runs": [],
+            "error": "directory enumeration failed",
+            "log_id": _log_id,
+        })
 
     for entry in entries:
         if not entry.is_dir():
@@ -2643,6 +3141,9 @@ def webhook_trigger():
             "stdin": stdin_text,
             "status": "starting",
             "output": [],
+            # v1.1.2 (audit fix G5-C-MED-9): FIFO eviction counter for the
+            # capped output ring.  See _RUNS_MAX_OUTPUT_LINES.
+            "output_evicted": 0,
             "started_at": time.time(),
             "ended_at": None,
             "returncode": None,
@@ -2730,7 +3231,10 @@ def api_run_signal(run_id: str):
         # ValueError: "I/O operation on closed file" — raised when _run_worker's
         # finally block closes proc.stdin concurrently (race between process exit
         # and this signal handler).  Both are non-fatal from the caller's view.
-        return jsonify({"error": f"Failed to write to stdin: {exc}"}), 500
+        # v1.1.2 (sixth-pass H-4): route through ``_safe_500`` so the raw
+        # ``OSError(2, '...')`` / fd-path / pipe-name does not leak to the
+        # browser; operator gets a log_id to grep the full traceback.
+        return _safe_500(exc, "api_signal stdin write")
 
     with _runs_lock:
         run = _runs.get(run_id)
@@ -2987,10 +3491,25 @@ def _is_safe_url(url: str) -> bool:
     except ValueError:
         pass
     # Hostname is a DNS name — resolve and check all addresses
+    # v1.1.2 (audit fix G5-C-MED-7): bound the DNS lookup at ~3 seconds.
+    # ``socket.getaddrinfo`` honours ``socket.getdefaulttimeout()`` which
+    # Python initialises to ``None`` (infinite) — a hanging DNS server
+    # (no SERVFAIL, no NXDOMAIN, just no answer) would pin a Flask worker
+    # forever, and the webhook retry loop could pin multiple workers and
+    # take the whole WebUI down (Slowloris-on-DNS class).  We temporarily
+    # set the per-process default timeout to 3 s for the duration of the
+    # lookup and restore the previous value in the finally block.  The
+    # global default is used because ``getaddrinfo`` has no per-call
+    # timeout argument in stdlib.
+    _prior_default_timeout = socket.getdefaulttimeout()
     try:
-        infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
-    except socket.gaierror:
-        return False
+        socket.setdefaulttimeout(3.0)
+        try:
+            infos = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
+        except (socket.gaierror, socket.timeout, OSError):
+            return False
+    finally:
+        socket.setdefaulttimeout(_prior_default_timeout)
     for _fam, _type, _proto, _canon, sockaddr in infos:
         try:
             addr = ipaddress.ip_address(sockaddr[0])
@@ -3430,6 +3949,8 @@ def api_ab_test_run():
                 "stdin": stdin_text,
                 "status": "starting",
                 "output": [],
+                # v1.1.2 (audit fix G5-C-MED-9): see _RUNS_MAX_OUTPUT_LINES.
+                "output_evicted": 0,
                 "started_at": now,
                 "ended_at": None,
                 "returncode": None,
@@ -3571,7 +4092,7 @@ def api_budget_status():
         ).fetchone()
         all_time_data = {"cost": round(float(all_time_row[0]), 6), "run_count": int(all_time_row[1])}
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        return _safe_500(exc, "api_budget_status")
 
     def _env_float(name: str) -> float | None:
         raw = (os.environ.get(name, "") or "").strip()
@@ -3691,6 +4212,20 @@ def _send_notification_with_retry(
         except Exception as exc:
             error_msg = str(exc)
 
+        # v1.1.2 (sixth-pass H-4): redact the captured error message before
+        # the retry-state assignment so the in-process retry log AND the
+        # DB INSERT both store the scrubbed form.  Webhook history rows
+        # were previously written with raw ``str(exc)`` (carrying internal
+        # hostnames + URL credentials), then echoed back to the operator
+        # by ``api_webhook_history``.
+        if error_msg:
+            try:
+                error_msg = _redact_for_client(error_msg, max_len=500)
+            except Exception:
+                # If redaction itself fails, keep the raw text rather than
+                # losing the entire error — best-effort defence.
+                pass
+
         attempt_success = status_code in (200, 201, 202, 204)
         last_status  = status_code
         last_error   = error_msg
@@ -3762,7 +4297,23 @@ def api_notify_test():
         timeout=10.0,
     )
     status_code = 200 if result["success"] else 500
-    return jsonify(result), status_code
+    # v1.1.2 (sixth-pass H-4): scrub ``last_error`` before returning so a
+    # ``URLError(getaddrinfo)`` carrying an internal hostname or a webhook
+    # URL with embedded credentials cannot leak through this operator-only
+    # response.  Server-side log retains the unredacted detail.
+    if not result.get("success"):
+        try:
+            LOGGER.warning(
+                "[webui] api_notify_test all retries failed "
+                "(status=%s attempts=%s)",
+                result.get("last_status_code"),
+                result.get("attempts"),
+            )
+        except Exception:
+            pass
+    safe_result = dict(result)
+    safe_result["last_error"] = _redact_for_client(result.get("last_error"))
+    return jsonify(safe_result), status_code
 
 
 @app.route("/api/webhook/history")
@@ -3782,8 +4333,13 @@ def api_webhook_history():
             """
         ).fetchall()
     except Exception as exc:
-        return jsonify({"error": str(exc)}), 500
+        return _safe_500(exc, "api_webhook_history")
 
+    # v1.1.2 (sixth-pass H-4): scrub ``error_msg`` on read.  Old rows were
+    # persisted before the audit; running every read through
+    # ``_redact_for_client`` is a defence-in-depth that keeps a webhook URL
+    # with embedded credentials or an absolute path from leaking even when
+    # the historical DB row carries the raw text.
     history = [
         {
             "id":          row[0],
@@ -3792,7 +4348,7 @@ def api_webhook_history():
             "status_code": row[3],
             "success":     bool(row[4]),
             "attempt":     row[5],
-            "error_msg":   row[6],
+            "error_msg":   _redact_for_client(row[6]) if row[6] else None,
         }
         for row in rows
     ]
@@ -3925,7 +4481,21 @@ def api_v169_metrics():
                 content = fh.read()
             return Response(content, mimetype="text/plain; version=0.0.4; charset=utf-8")
         except OSError as exc:
-            return Response(f"# Error reading metrics.prom: {exc}\n", mimetype="text/plain")
+            # v1.1.2 (sixth-pass H-4): emit a log_id-stamped placeholder
+            # rather than the raw ``OSError`` (which carries the absolute
+            # path to ``saved_projects/<run>/metrics.prom``).  text/plain
+            # parser-tolerant: Prometheus' scrape ignores comment lines.
+            _log_id = uuid.uuid4().hex[:8]
+            try:
+                LOGGER.exception(
+                    "[webui] api_v169_metrics read failed (log_id=%s)", _log_id,
+                )
+            except Exception:
+                pass
+            return Response(
+                f"# Error reading metrics.prom (log_id={_log_id})\n",
+                mimetype="text/plain",
+            )
     # File not yet generated — attempt on-demand generation
     try:
         import importlib as _imp
@@ -3937,7 +4507,22 @@ def api_v169_metrics():
             return Response(content, mimetype="text/plain; version=0.0.4; charset=utf-8")
         return Response("# metrics.prom not written by generate_metrics\n", mimetype="text/plain")
     except Exception as exc:
-        return Response(f"# Error generating metrics: {exc}\n", mimetype="text/plain")
+        # v1.1.2 (sixth-pass H-4): same redaction pattern as the read
+        # branch above; ``Exception`` here captures importlib resolution
+        # failures whose message includes the absolute path to the
+        # crucible/features tree.
+        _log_id = uuid.uuid4().hex[:8]
+        try:
+            LOGGER.exception(
+                "[webui] api_v169_metrics generation failed (log_id=%s)",
+                _log_id,
+            )
+        except Exception:
+            pass
+        return Response(
+            f"# Error generating metrics (log_id={_log_id})\n",
+            mimetype="text/plain",
+        )
 
 
 # ─── Feature: Grafana dashboard download ──────────────────────────────────────
@@ -3970,4 +4555,4 @@ def api_v169_grafana_dashboard():
             dashboard = json.load(fh)
         return jsonify(dashboard)
     except (OSError, json.JSONDecodeError) as exc:
-        return jsonify({"error": str(exc)}), 500
+        return _safe_500(exc, "grafana dashboard read")

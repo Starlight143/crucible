@@ -4,9 +4,33 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Crucible</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<!--
+  v1.1.2 (sixth-pass H-6): the Google Fonts stylesheet is loaded dynamically
+  (its CSS body varies by User-Agent so SRI ``integrity=`` cannot be
+  computed in advance — the Mozilla SubResource Integrity spec acknowledges
+  this case explicitly).  Defence-in-depth instead:
+
+    * ``referrerpolicy="no-referrer"`` — prevents the originating URL from
+      leaking to Google Fonts on the stylesheet load AND on every glyph
+      load chained from it.
+    * ``crossorigin="anonymous"`` — opt out of credentialed CORS so a
+      compromised CDN cannot read session cookies (we don't set any on
+      that origin anyway, but the explicit flag forecloses the surface).
+    * ``onerror`` graceful-degrade — if Google Fonts is blocked (corporate
+      egress proxy, offline operator) the page falls back to system
+      ``sans-serif`` / monospace via the ``font-family`` declarations in
+      ``app.css`` instead of waiting on a hung resource.
+
+  See also the Chart.js CDN tag below which DOES carry SRI ``integrity=``
+  because its body is a static immutable build artefact.
+-->
+<link rel="preconnect" href="https://fonts.googleapis.com" crossorigin="anonymous" referrerpolicy="no-referrer">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin="anonymous" referrerpolicy="no-referrer">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+      rel="stylesheet"
+      crossorigin="anonymous"
+      referrerpolicy="no-referrer"
+      onerror="this.media='none';">
 <script
   src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"
   integrity="sha384-JUh163oCRItcbPme8pYnROHQMC6fNKTBWtRG3I3I0erJkzNgL7uxKlNwcrcFKeqF"

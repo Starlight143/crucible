@@ -107,12 +107,28 @@ def _entrypoint_detection_hint() -> str:
 def _run_smoke_test(
     entry: EntryPointSpec, tmp_dir: str, env: Dict[str, str]
 ) -> Tuple[str, Optional[str]]:
+    # v1.1.2 (audit fix G4-A2-MED-8): the generated smoke harness used to
+    # embed a hand-rolled whitelist ``in ('1', 'true', 'yes')`` that propagated
+    # the bug from line 973's pre-fix raw read.  We now emit a self-contained
+    # whitelist function that mirrors ``_env.env_bool`` semantics
+    # ({1, true, yes, on} → True / {0, false, no, off} → False / typo →
+    # default) so every downstream user-facing project inherits the canonical
+    # behaviour the project enforces everywhere else.
     smoke_code = "\n".join(
         [
             "import importlib.util",
             "import sys",
             "import os",
-            "require_snapshot = os.environ.get('CODEX_REQUIRE_SNAPSHOT', '').lower() in ('1', 'true', 'yes')",
+            "def _bool_env(name, default=False):",
+            "    raw = (os.environ.get(name) or '').strip().lower()",
+            "    if not raw:",
+            "        return default",
+            "    if raw in {'1', 'true', 'yes', 'on'}:",
+            "        return True",
+            "    if raw in {'0', 'false', 'no', 'off'}:",
+            "        return False",
+            "    return default  # typo -> default, never silent truthy",
+            "require_snapshot = _bool_env('CODEX_REQUIRE_SNAPSHOT', False)",
             "if require_snapshot:",
             "    print('SMOKE_REQUIRE_SNAPSHOT 1')",
             "path = " + json.dumps(entry.path),
@@ -608,11 +624,15 @@ def _run_quant_synthetic_dryrun(tmp_dir: str) -> Tuple[List[ReviewIssue], str]:
         # Per-call timeout is short so a hung subprocess can't wedge the
         # quality loop. The dry-run only exercises 30 days of GBM data, so
         # any honest backtest finishes well under this budget.
-        timeout = 60
-        try:
-            timeout = int(os.environ.get("CRUCIBLE_QUANT_DRYRUN_TIMEOUT", "60"))
-        except (TypeError, ValueError):
-            timeout = 60
+        # v1.1.2 (sixth-pass M-5): route through ``_env_int`` so a typo
+        # such as ``CRUCIBLE_QUANT_DRYRUN_TIMEOUT=unlimted`` falls back to
+        # the default 60 instead of crashing the quality loop with a
+        # ``ValueError`` (the previous ``int(...)`` form re-raised on the
+        # try/except chain only for ``TypeError`` / ``ValueError``, which
+        # masked the typo as a silent floor — operators expected typo
+        # detection per the project-wide env-bool/int whitelist discipline).
+        _raw_timeout = _env_int("CRUCIBLE_QUANT_DRYRUN_TIMEOUT", 60)
+        timeout = 60 if _raw_timeout is None else int(_raw_timeout)
         result = quant_smoke_dryrun(tmp_dir, timeout_seconds=max(10, timeout))
     except Exception as exc:
         return [], f"[quant_smoke] failed: {exc}"
@@ -970,11 +990,14 @@ def _has_conflicting_validation_mode_metadata(
 def requires_snapshot_validation(
     user_problem: Optional[str], code_bundle: CodeBundle, mode: Optional[str] = None
 ) -> bool:
-    forced = os.environ.get("CODEX_REQUIRE_SNAPSHOT", "").lower() in (
-        "1",
-        "true",
-        "yes",
-    )
+    # v1.1.2 (audit fix G4-A2-HIGH-3): route through ``_env_bool`` instead of
+    # a hand-rolled whitelist that was missing the ``"on"`` truthy token.
+    # Operators who set ``CODEX_REQUIRE_SNAPSHOT=on`` (a legitimate truthy
+    # form per the project's env-bool whitelist) previously got silently
+    # ignored.  ``_env_bool`` enforces the canonical
+    # {1, true, yes, on} → True / {0, false, no, off} → False / typo → default
+    # mapping consistently across the codebase.
+    forced = _env_bool("CODEX_REQUIRE_SNAPSHOT", False)
     if forced:
         return True
     if _has_conflicting_validation_mode_metadata(mode=mode, code_bundle=code_bundle):
@@ -1308,9 +1331,9 @@ def run_runtime_validation(
             # bundle attribute ``codegen_scope='production'``. Defaulting to
             # off here keeps backwards compatibility for existing tests and
             # callers that have not yet plumbed scope through.
-            require_tests = os.environ.get(
-                "CRUCIBLE_QUANT_REQUIRE_TESTS", ""
-            ).strip().lower() in ("1", "true", "yes", "on")
+            # v1.1.2 (audit fix G4-A2-HIGH-3): consistent whitelist via
+            # ``_env_bool`` — see ``requires_snapshot_validation`` above.
+            require_tests = _env_bool("CRUCIBLE_QUANT_REQUIRE_TESTS", False)
             bundle_scope = (
                 str(getattr(clean_bundle, "codegen_scope", "") or "").strip().lower()
             )
@@ -1337,9 +1360,11 @@ def run_runtime_validation(
         # they cannot update yet. The matrix in
         # crucible/features/mode_validation_matrix.py documents which rules
         # apply per mode and which deeper checks remain on the v1.0.6 list.
-        universal_enabled = os.environ.get(
-            "CRUCIBLE_UNIVERSAL_CROSSREF", "1"
-        ).strip().lower() not in ("0", "false", "no", "off")
+        # v1.1.2 (audit fix G4-A2-MED-5): route through ``_env_bool`` so the
+        # opt-out semantics match the canonical {1, true, yes, on}/{0, false,
+        # no, off} whitelist; previously the inverse hand-rolled list treated
+        # any typo (e.g. ``=off1``) as truthy.  Default stays True.
+        universal_enabled = _env_bool("CRUCIBLE_UNIVERSAL_CROSSREF", True)
         if universal_enabled and not is_quant_run:
             try:
                 universal_issues, universal_log = _run_universal_cross_reference_track(

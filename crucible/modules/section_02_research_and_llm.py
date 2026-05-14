@@ -14,17 +14,64 @@ if __package__ == "crucible.modules":
     from ..resilience import kickoff_crew_with_retry
     from ..runtime_logging import get_logger, log_event, log_exception
     from ..cancellation import OperationCancelledError as _OperationCancelledError
-    from ..run_correlation import get_run_id as _get_run_id
+    from ..run_correlation import get_run_id as _get_run_id, set_run_id as _set_run_id
     from ..features.run_insights import get_recorder as _get_insights_recorder
 else:  # pragma: no cover - direct script fallback
     from resilience import kickoff_crew_with_retry  # type: ignore[no-redef]
     from runtime_logging import get_logger, log_event, log_exception  # type: ignore[no-redef]
     from cancellation import OperationCancelledError as _OperationCancelledError  # type: ignore[no-redef]
-    from run_correlation import get_run_id as _get_run_id  # type: ignore[no-redef]
+    from run_correlation import (  # type: ignore[no-redef]
+        get_run_id as _get_run_id,
+        set_run_id as _set_run_id,
+    )
     from features.run_insights import get_recorder as _get_insights_recorder  # type: ignore[no-redef]
 
 
 LOGGER = get_logger(__name__)
+
+
+def _resolve_run_id_for_ledger_emit() -> str:
+    """Resolve a non-empty ``run_id`` for direction-debate ledger emits.
+
+    v1.1.2 (sixth-pass H-3): mirrors the three-tier fallback used by
+    ``section_07_selfcheck_output_main:1371-1384``.  Without the
+    fresh-uuid third tier an early section_02 emit (force-none /
+    parse-fail) that fires before any upstream code has bridged
+    ``CRUCIBLE_RUN_ID`` to the ContextVar can write ``run_id=""``,
+    violating the CLAUDE.md § 2 invariant and orphaning the row from
+    every downstream artefact (run_meta, telemetry, structured logs).
+
+    The minted run_id is also pinned back into the ContextVar so any
+    later emit point in the same process sees a consistent value.
+    """
+    import os as _os_local
+    import uuid as _uuid_local
+
+    candidate = (
+        (_get_run_id() or "").strip()
+        or _os_local.environ.get("CRUCIBLE_RUN_ID", "").strip()
+    )
+    if candidate:
+        return candidate
+    fresh = _uuid_local.uuid4().hex[:8]
+    try:
+        # ``_set_run_id`` is imported at the module level via the existing
+        # tri-modal package guard; no per-call import trampoline is needed.
+        _set_run_id(fresh)
+    except Exception:
+        # ContextVar binding is best-effort; the pipeline must not crash
+        # if the runtime_logging module is in a degraded state.
+        pass
+    try:
+        LOGGER.warning(
+            "section_02 direction-debate emit minted fallback run_id=%s "
+            "(both ContextVar and CRUCIBLE_RUN_ID resolved to empty)",
+            fresh,
+        )
+    except Exception:
+        pass
+    return fresh
+
 
 # ---------------------------------------------------------------------------
 # Provider URL helpers
@@ -958,14 +1005,28 @@ def _run_single_direction_debate(
                 audit_report=audit_report,
                 deterministic_ranking=ranking,
             )
-            if force_none and (
-                gap_info.get("critical_unknowns")
-                or gap_info.get("missing_evidence_areas")
-                or gap_info.get("research_queries")
-                or gap_info.get("weak_directions")
-                or gap_info.get("grounded_claims_needed", 0) > 0
-                or gap_info.get("citations_needed", 0) > 0
-            ):
+            # v1.1.2 (audit fix G2-A2-HIGH-2): the previous gate predicate
+            # required force_none AND a non-empty ``gap_info`` shape (critical
+            # unknowns / weak directions / citations needed).  A legitimate
+            # force-none verdict with a non-evidence-shaped reason (e.g.
+            # ``judge_explicit_none``, ``unanimous_reject``) carried no
+            # gap_info entries, so the entire telemetry path was silently
+            # skipped: no ``[Warn]`` print, no debug dump, no
+            # ``record_direction_debate_rejection`` ledger row.  That left
+            # v1.2.0 retrieval blind to one of the most actionable rejection
+            # classes — the judge explicitly killing a direction with no
+            # evidence-shaped reason.  We now ALWAYS emit telemetry on
+            # force_none; ``gap_info`` only controls how detailed the
+            # diagnostic dump is.
+            if force_none:
+                _has_gap_detail = bool(
+                    gap_info.get("critical_unknowns")
+                    or gap_info.get("missing_evidence_areas")
+                    or gap_info.get("research_queries")
+                    or gap_info.get("weak_directions")
+                    or gap_info.get("grounded_claims_needed", 0) > 0
+                    or gap_info.get("citations_needed", 0) > 0
+                )
                 # Diagnostic surface: the force-none gate used to return silently,
                 # so a user looking at the runner output had no idea which condition
                 # killed the decision (citations? grounded claims? weak directions?).
@@ -995,36 +1056,43 @@ def _run_single_direction_debate(
                     f"weak_directions={list(gap_info.get('weak_directions') or [])[:3]} "
                     f"critical_unknowns={list(gap_info.get('critical_unknowns') or [])[:3]})."
                 )
-                dump_path = _write_direction_debate_debug_dump(
-                    user_problem=user_problem,
-                    attempt=attempt + 1,
-                    llm=llm,
-                    direction_judge_llm=direction_judge_llm,
-                    elapsed_seconds=elapsed_seconds,
-                    stage_index_map=stage_index_map,
-                    result=direction_result,
-                    raw_candidates=raw_candidates,
-                    decision=decision,
-                    comparator_report=comparator_report,
-                    audit_report=audit_report,
-                    note=f"force_none:{reason}",
-                )
-                if dump_path:
-                    print(f"[Info] Direction debate debug dump: {dump_path}")
+                if _has_gap_detail:
+                    dump_path = _write_direction_debate_debug_dump(
+                        user_problem=user_problem,
+                        attempt=attempt + 1,
+                        llm=llm,
+                        direction_judge_llm=direction_judge_llm,
+                        elapsed_seconds=elapsed_seconds,
+                        stage_index_map=stage_index_map,
+                        result=direction_result,
+                        raw_candidates=raw_candidates,
+                        decision=decision,
+                        comparator_report=comparator_report,
+                        audit_report=audit_report,
+                        note=f"force_none:{reason}",
+                    )
+                    if dump_path:
+                        print(f"[Info] Direction debate debug dump: {dump_path}")
                 # v1.1.0 run_insights: record direction-debate rejection.
                 # The force-none gate is the most actionable failure surface
                 # for the v1.2.0 retrieval layer — it tells us which signals
                 # consistently produce un-grounded directions so a future
                 # run with the same signals can avoid them.  Best-effort,
-                # never raises.
+                # never raises.  v1.1.2: emitted unconditionally on
+                # force_none, regardless of gap_info shape (see above).
                 try:
                     _judge_verdict = ""
                     if decision is not None:
                         _judge_verdict = str(getattr(decision, "summary", "") or "")
                     _get_insights_recorder().record_direction_debate_rejection(
-                        run_id=_get_run_id() or os.environ.get("CRUCIBLE_RUN_ID", "").strip(),
+                        # v1.1.2 (sixth-pass H-3): three-tier fallback so an
+                        # early force-none emit cannot write ``run_id=""``
+                        # into the ledger.  ``mode`` also coerced to a
+                        # ``mode_unknown`` sentinel for v1.2.0 retrieval-
+                        # aggregation parity with resilience.error_record.
+                        run_id=_resolve_run_id_for_ledger_emit(),
                         project_name="stage0_pending",
-                        mode=mode,
+                        mode=str(mode or "mode_unknown"),
                         direction_id=str(getattr(decision, "selected_direction", "") or "unknown"),
                         rejection_reason="force_none",
                         judge_verdict=f"force_none:{reason} | {_judge_verdict}",
@@ -1092,9 +1160,10 @@ def _run_single_direction_debate(
         # v1.1.0 run_insights: record parse-failed rejection.
         try:
             _get_insights_recorder().record_direction_debate_rejection(
-                run_id=_get_run_id() or os.environ.get("CRUCIBLE_RUN_ID", "").strip(),
+                # v1.1.2 (sixth-pass H-3): three-tier fallback as above.
+                run_id=_resolve_run_id_for_ledger_emit(),
                 project_name="stage0_pending",
-                mode=mode,
+                mode=str(mode or "mode_unknown"),
                 direction_id=str(getattr(decision, "selected_direction", "") or "unknown"),
                 rejection_reason="judge_no_winner",
                 judge_verdict="parse_failed_after_fallbacks",

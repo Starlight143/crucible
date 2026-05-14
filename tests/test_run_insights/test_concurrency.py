@@ -192,7 +192,9 @@ def _mp_writer(root: str, tag: int, n: int) -> int:
     sys.platform == "win32" and "PYTEST_CURRENT_TEST" in os.environ,
     reason=(
         "Windows multiprocessing under pytest can hang on Python <3.13; "
-        "use the subprocess-based variant below for Windows coverage"
+        "the subprocess-based variant test_cross_process_writes_no_corruption_via_subprocess "
+        "below provides equivalent Windows coverage of the sidecar-lock "
+        "contract (v1.1.2 audit fix G6-D-HIGH-3: design intent restated)"
     ),
 )
 def test_cross_process_writes_no_corruption(tmp_path: Path):
@@ -203,6 +205,14 @@ def test_cross_process_writes_no_corruption(tmp_path: Path):
     sidecar contract is broken (e.g. someone replaces ``_file_lock_ctx``
     with a no-op on a future Python build), this test will see corrupt
     JSON lines or missing writes.
+
+    v1.1.2 (audit fix G6-D-HIGH-3): on Windows pytest the skipif above
+    triggers (pytest sets ``PYTEST_CURRENT_TEST``), so Windows coverage
+    of the sidecar-lock contract is provided EXCLUSIVELY by the
+    subprocess-based companion test
+    ``test_cross_process_writes_no_corruption_via_subprocess`` below.
+    Both POSIX and Windows MUST cover this contract — losing it silently
+    re-opens the v1.1.0 third-pass G-class file-lock regressions.
     """
     root = str(tmp_path / "ledger")
     N_PER_PROC = 50

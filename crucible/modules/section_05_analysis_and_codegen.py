@@ -5913,6 +5913,17 @@ def build_codegen_crew(
         include_analyst_findings=True,
     )
     mode_rule_text = "\n".join(_resolved_codegen_rule_lines(mode_config, gate_decision, scope=scope))
+    # v1.1.2 (audit fix G3-A2-HIGH-1): inject already-emitted Quant schema
+    # signatures into the single-shot codegen path too.  Previously only the
+    # staged batch worker (``_build_codegen_batch_crew`` at line 3711) called
+    # ``_extract_quant_schema_signatures``; small Quant projects that took
+    # the non-staged path (this entrypoint) silently bypassed the v1.0.5
+    # schema-first contract and re-opened the Trade-kwargs-mismatch failure
+    # mode.  For non-Quant projects ``current_bundle=None`` returns "" so
+    # this is a safe additive injection across all modes.
+    schema_signatures = _extract_quant_schema_signatures(
+        current_bundle=None, project_type=project_type
+    )
     # Validation-scope gate overrides user scope for agent prompts to keep goal/rules consistent.
     effective_prompt_scope = "mvp" if _gate_is_validation_scope(gate_decision) else scope
     agent_goal, agent_backstory, task_header = _codegen_scope_prompts(effective_prompt_scope)
@@ -5934,6 +5945,7 @@ def build_codegen_crew(
             "Mode: {mode_name}\n"
             "project_type must be '{project_type}'.\n"
             "Language hint: {language_hint}\n\n"
+            "{schema_signatures}\n\n"
             "User problem:\n{user_problem}\n\n"
             "Approved context:\n{approved_context}\n\n"
             "Rules:\n"
@@ -5950,6 +5962,10 @@ def build_codegen_crew(
         "user_problem": limit_text(user_problem, 4000),
         "approved_context": approved_context,
         "mode_rule_text": mode_rule_text,
+        # v1.1.2: see G3-A2-HIGH-1 comment above.  Empty string for non-Quant
+        # / first-batch case is intentional and the prompt template handles
+        # it gracefully via consecutive newlines.
+        "schema_signatures": schema_signatures,
     }
     return _build_codegen_single_task_crew(
         crew_name="codegen_crew",

@@ -23,7 +23,20 @@ from .quality import run_api_version_check, run_quality_loop, run_runtime_valida
 from .research import run_direction_debate, run_librarian_research
 from .runtime_api import get_runtime
 
+# v1.1.2 (audit fix G6-D-HIGH-1): single source-of-truth for the package
+# version.  Mirrors ``pyproject.toml::project.version`` so callers can do
+# ``crucible.__version__`` without an extra ``importlib.metadata`` round-trip.
+# Keep both in sync on every release; the regression test in
+# ``tests/test_v1_1_2_audit_fixes.py`` pins them to be equal.
+__version__ = "1.1.2"
+
 __all__ = [
+    # NOTE: ``__version__`` is intentionally NOT in __all__.  The
+    # existing ``test_crucible_runtime`` invariant requires every
+    # ``__all__`` entry to also be exposed on ``module_runtime``;
+    # ``__version__`` is package metadata, not a runtime API.  It is
+    # still accessible as ``crucible.__version__`` (Python module
+    # attribute lookup), just not exported via ``from crucible import *``.
     "get_runtime",
     "main",
     "run_self_check",

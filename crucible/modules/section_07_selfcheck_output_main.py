@@ -57,6 +57,7 @@ else:  # pragma: no cover - direct script fallback
 LOGGER = get_logger(__name__)
 
 import io as _io  # noqa: E402 — stdlib, placed after package imports intentionally
+import math  # noqa: E402 — stdlib, used by the v1.1.2 sixth-pass M-7 outcome_score finite gate
 
 
 def _atomic_write_text(path: str, content: str, encoding: str = "utf-8") -> None:
@@ -1357,7 +1358,31 @@ def main() -> None:
     if version_line:
         print(f"[Info] Dependency versions: {version_line}")
 
-    run_id = uuid.uuid4().hex
+    # v1.1.2: Reuse the run_id already bound to the run-correlation
+    # ContextVar by ``crucible/__main__.py`` or ``run_crucible_enhanced.py``
+    # (which read ``CRUCIBLE_RUN_ID`` injected by the WebUI / set their own
+    # fresh UUID4 for direct CLI invocations).  Generating a new id here
+    # used to desynchronise ``run_meta.json`` from every other artefact
+    # (Run Insights ledger, telemetry, structured logs) that already
+    # consumed the bridged id — violating the CLAUDE.md § 2 invariant and
+    # breaking v1.2.0 retrieval joins on run_id.  The defensive fallback
+    # below pins a fresh 8-char id into the ContextVar so any later emit
+    # point in this run sees the same value even if section_07 is invoked
+    # through an untested entry path.
+    _bridged_run_id = (
+        (_get_run_id() or "").strip()
+        or os.environ.get("CRUCIBLE_RUN_ID", "").strip()
+    )
+    if _bridged_run_id:
+        run_id = _bridged_run_id
+    else:
+        run_id = uuid.uuid4().hex[:8]
+        try:
+            _set_run_id(run_id)
+        except Exception:
+            # ContextVar binding is best-effort; pipeline must not crash
+            # if the runtime_logging module is in a degraded state.
+            pass
     run_snapshot = RunSnapshot(
         run_id=run_id,
         runtime_profile=runtime_profile.name,
@@ -2247,6 +2272,17 @@ def save_project_output(
     os.makedirs(base_dir, exist_ok=True)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    # v1.1.2 (sixth-pass M-10): also emit a TZ-aware UTC timestamp so the
+    # v1.2.0 Cloudflare retrieval layer (D1 + R2) can join across machines
+    # without DST / local-tz ambiguity.  ``timestamp`` stays local-time
+    # because that is what the ``saved_projects/<ts>_<name>`` directory
+    # naming uses and operators read it visually; ``timestamp_utc`` is the
+    # join key for cross-machine analytics.
+    try:
+        from datetime import timezone as _utc_tz
+        timestamp_utc = datetime.now(_utc_tz.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    except Exception:
+        timestamp_utc = ""
     run_meta_payload: Dict[str, Any] = dict(run_meta or {})
     gate_payload = _extract_saved_gate_payload(gate_decision, run_snapshot)
     authoritative_mode = _resolve_saved_mode_name(None, code, run_meta_payload, gate_payload)
@@ -2264,6 +2300,8 @@ def save_project_output(
 
     run_meta_payload.setdefault("project_name", proj_name)
     run_meta_payload.setdefault("timestamp", timestamp)
+    if timestamp_utc:
+        run_meta_payload.setdefault("timestamp_utc", timestamp_utc)
     if gate_payload:
         run_meta_payload.setdefault("gate_ready_for_codegen", gate_payload.get("ready_for_codegen"))
         run_meta_payload.setdefault("gate_confidence", gate_payload.get("confidence"))
@@ -2582,7 +2620,18 @@ def save_project_output(
             if _score_raw is None and result is not None:
                 _score_raw = getattr(result, "overall_score", None)
             if _score_raw is not None:
-                _outcome_score = float(_score_raw) / 100.0
+                _outcome_score_candidate = float(_score_raw) / 100.0
+                # v1.1.2 (sixth-pass M-7): reject non-finite ``_outcome_score``
+                # symmetrically with ``output_validation._coerce``'s NaN/Inf
+                # gate.  ``_score_raw="nan"`` / ``"infinity"`` survives
+                # ``float()`` and would propagate into the ledger; downstream
+                # consumers (``v1.2.0`` retrieval ranker) would then sort
+                # against an ``inf`` and either crash or produce undefined
+                # ordering.
+                if math.isfinite(_outcome_score_candidate):
+                    _outcome_score = _outcome_score_candidate
+                else:
+                    _outcome_score = None
         except (TypeError, ValueError):
             _outcome_score = None
 

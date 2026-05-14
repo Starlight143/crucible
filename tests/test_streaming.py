@@ -110,11 +110,25 @@ class TestStreamCrew:
         assert done.elapsed_seconds > 0.0
 
     def test_error_chunk_has_elapsed_seconds(self) -> None:
-        crew = ErrorCrew(RuntimeError("err"))
+        # v1.1.2 (audit fix G6-D-MED-3): match the ``done`` chunk pattern at
+        # line 104-110 — use a measurable delay before the exception so the
+        # ``> 0.0`` assertion has teeth on low-resolution Windows timers
+        # (CLAUDE.md § 9.5: ``>= 0.0`` on a non-negative float is tautology).
+        class _DelayedErrorCrew:
+            def __init__(self, exc: Exception, delay: float) -> None:
+                self._exc = exc
+                self._delay = delay
+
+            def kickoff(self) -> Any:
+                import time as _t
+                _t.sleep(self._delay)
+                raise self._exc
+
+        crew = _DelayedErrorCrew(RuntimeError("err"), delay=0.050)
         chunks = list(stream_crew(crew, poll_interval=0.01))
         err = next(c for c in chunks if c.kind == "error")
         assert isinstance(err.elapsed_seconds, float)
-        assert err.elapsed_seconds >= 0.0
+        assert err.elapsed_seconds > 0.0
 
     def test_timeout_yields_error_chunk(self) -> None:
         crew = FakeCrew(delay=10.0)  # will not finish within timeout

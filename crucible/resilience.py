@@ -550,6 +550,16 @@ def execute_with_retry(
     if last_error is not None:
         # v1.1.0 run_insights: emit error_record when retries are exhausted.
         # Best-effort; failure here must not mask the original error.
+        # v1.1.2 (audit fix G1-3/G1-4):
+        #   - Resolve run_id via the same three-tier chain used by section_07's
+        #     ``run_meta.json`` write, with ``.strip()`` on both sources.
+        #   - Apply explicit sentinels for empty mode / stage so downstream
+        #     v1.2.0 retrieval aggregations don't split per-mode failure counts
+        #     between ``""`` and the populated value.
+        #   - When run_id resolves to empty, emit a single-line warning before
+        #     the swallowing try/except so operators can spot orphaned rows
+        #     (the most common cause is the legacy flat-launcher path before
+        #     this same audit pass fixed it).
         try:
             if __package__ == "crucible":
                 from .features.run_insights import get_recorder as _ri_get_recorder
@@ -557,11 +567,26 @@ def execute_with_retry(
             else:  # pragma: no cover
                 from features.run_insights import get_recorder as _ri_get_recorder  # type: ignore[no-redef]
                 from run_correlation import get_run_id as _ri_get_run_id  # type: ignore[no-redef]
+            _resolved_run_id = (
+                (_ri_get_run_id() or "").strip()
+                or os.environ.get("CRUCIBLE_RUN_ID", "").strip()
+            )
+            if not _resolved_run_id:
+                try:
+                    LOGGER.warning(
+                        "resilience.error_record emitted with empty run_id; "
+                        "the row will be orphaned from saved-project / WebUI "
+                        "artefacts. Most common cause: the launcher entry "
+                        "point did not call run_correlation.set_run_id() at "
+                        "bootstrap."
+                    )
+                except Exception:
+                    pass
             _ri_get_recorder().record_error(
-                run_id=_ri_get_run_id() or os.environ.get("CRUCIBLE_RUN_ID", "").strip(),
+                run_id=_resolved_run_id,
                 project_name=str((log_fields or {}).get("project_name") or "stage_pending"),
-                mode=str((log_fields or {}).get("mode") or ""),
-                stage=str((log_fields or {}).get("stage") or operation_name),
+                mode=str((log_fields or {}).get("mode") or "mode_unknown"),
+                stage=str((log_fields or {}).get("stage") or operation_name or "stage_unknown"),
                 exception_class=type(last_error).__name__,
                 message=str(last_error)[:300],
                 retry_count=int(attempts),

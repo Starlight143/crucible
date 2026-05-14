@@ -62,8 +62,21 @@ def test_total_disable_returns_null_recorder(tmp_path, monkeypatch):
     monkeypatch.setenv("CRUCIBLE_RUN_INSIGHTS_DIR", str(tmp_path / "ledger"))
     reset_recorder()
     r = get_recorder()
-    # Null recorder has no backend.
-    assert getattr(r, "backend", "MISSING") in (None, "MISSING")
+    # v1.1.2 (audit fix G2-B-MED-5): null recorder's ``.backend`` now
+    # returns a ``_NoOpBackend`` stub (was ``None``) so reach-through
+    # ``recorder.backend.X`` works identically whether the subsystem is
+    # enabled or disabled.  Both shapes are acceptable as "null backend"
+    # — None for legacy callers, _NoOpBackend for the new parity-
+    # preserving contract.  We compare by class name rather than
+    # ``isinstance`` because ``reset_recorder()`` can reload the module
+    # under pytest and re-create the class object, breaking ``isinstance``
+    # while leaving the runtime contract intact.
+    backend_attr = getattr(r, "backend", "MISSING")
+    assert (
+        backend_attr is None
+        or backend_attr == "MISSING"
+        or type(backend_attr).__name__ == "_NoOpBackend"
+    )
     # All emit calls return None and don't crash.
     assert r.record_output_method(
         run_id="x", project_name="p", mode="Quant",

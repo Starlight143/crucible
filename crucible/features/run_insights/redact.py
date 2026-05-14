@@ -56,6 +56,21 @@ except ImportError:  # pragma: no cover — flat-launcher fallback
         _SENSITIVE_KEY_FRAGMENTS as _RL_FRAGMENTS,
     )
 
+# v1.1.2 (audit fix G2-B-MED-4): import canonical_json for set-element
+# ordering.  Separate try block so an import failure here doesn't
+# poison the env_bool / sensitive-key fragment imports above (a
+# circular-import or schema.py rename would otherwise break the entire
+# redact module instead of degrading gracefully).
+try:
+    from .schema import canonical_json as _canonical_json
+except ImportError:  # pragma: no cover — flat-launcher fallback
+    try:
+        from features.run_insights.schema import (  # type: ignore[no-redef]
+            canonical_json as _canonical_json,
+        )
+    except ImportError:
+        _canonical_json = None  # type: ignore[assignment]
+
 _REDACTED = "***REDACTED***"
 
 # Additional fragments matched as case-insensitive substrings of field names.
@@ -127,15 +142,24 @@ _VALUE_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     # generic ``sk-[A-Za-z0-9]{40,80}`` pattern from matching, so
     # without an explicit vendor pattern these keys leak verbatim.
     re.compile(r"(?<![A-Za-z0-9])sk-svcacct-[A-Za-z0-9_\-]{40,200}"),
+    # v1.1.2 (audit fix G2-B-HIGH-2): DeepSeek API keys are ``sk-`` + 32
+    # hex digits (35 chars total) — the v1.1.0 third-pass hardening
+    # tightened the generic OpenAI legacy pattern to ``{40,80}`` so DeepSeek
+    # keys silently fell through the entire tier-3 scanner.  With v1.1.1's
+    # Cost Tracking expansion the surface for DeepSeek error-message
+    # redaction grew, making this leak path real.  Must come BEFORE the
+    # generic OpenAI legacy pattern so this strict 32-hex format wins on
+    # DeepSeek tokens (which would also match the {40,80} alphanumeric
+    # pattern in some operator-rotated formats).
+    re.compile(r"(?<![A-Za-z0-9])sk-[A-Fa-f0-9]{32}(?![A-Za-z0-9])"),
     # OpenAI legacy keys: "sk-<48 alphanumeric>" — must come AFTER sk-ant /
-    # sk-or / sk-proj so the more-specific patterns win.  Boundary
-    # assertions prevent matching mid-token (e.g. inside a URL path).
+    # sk-or / sk-proj / DeepSeek-32-hex so the more-specific patterns win.
+    # Boundary assertions prevent matching mid-token (e.g. inside a URL path).
     re.compile(r"(?<![A-Za-z0-9])sk-[A-Za-z0-9]{40,80}(?![A-Za-z0-9])"),
     # Google Gemini / Cloud API keys: "AIza<35 alphanumeric>"
     re.compile(r"(?<![A-Za-z0-9])AIza[A-Za-z0-9_\-]{30,80}"),
     # xAI Grok: "xai-<alphanumeric>"
     re.compile(r"(?<![A-Za-z0-9])xai-[A-Za-z0-9]{40,120}"),
-    # DeepSeek: "sk-<32 hex>"  (subset of OpenAI legacy; matched above)
     # Slack bot / user tokens: xoxb-/xoxp-/xoxa-/xoxr-/xoxs-
     re.compile(r"xox[bparseu]-[A-Za-z0-9\-]{10,200}"),
     # GitHub PAT (classic & fine-grained), App tokens, OAuth, server-to-server
@@ -271,9 +295,32 @@ def _redact_value(
         # (the content-id depends on canonical byte equality).  We sort by
         # the canonical-JSON repr of each element after redaction so order
         # is reproducible regardless of insertion order.
+        #
+        # v1.1.2 (audit fix G2-B-MED-4): previously the sort key used
+        # ``json.dumps(..., sort_keys=True, default=str)`` which is NOT
+        # canonical — it uses Python-default float repr (``1.0`` vs V8's
+        # ``1``) and ``default=str`` for non-JSON leaves.  Two semantically
+        # identical sets containing the same floats could sort differently
+        # across Python builds, producing different in-payload list ordering
+        # → different canonical_json → different content_id → cross-process
+        # dedup breakage (the whole point of content_id).  Now sorts by the
+        # same canonical encoder the persistence layer uses, so set ordering
+        # is byte-for-byte deterministic across Python releases and
+        # platforms.
         redacted = [_redact_value(key, v, _visited) for v in value]
         try:
-            return sorted(redacted, key=lambda x: json.dumps(x, sort_keys=True, ensure_ascii=False, default=str))
+            if _canonical_json is not None:
+                return sorted(
+                    redacted,
+                    key=lambda x: _canonical_json({"_": x}).decode("utf-8"),
+                )
+            # Defensive: canonical_json should always be importable in the
+            # tri-modal layouts, but if the import failed, fall back to the
+            # legacy ``json.dumps`` path so the recorder still works.
+            return sorted(
+                redacted,
+                key=lambda x: json.dumps(x, sort_keys=True, ensure_ascii=False, default=str),
+            )
         except Exception:
             # Fallback: stringify keys for sort if any element is unhashable
             # under repr (shouldn't happen after our recursion strips them).

@@ -106,13 +106,13 @@ Post-processing and enhancement modules invoked by the Enhanced Runner after Sta
 | `saas` | cross_reference | active | X001, X002, X003, X004, W001, W002, W003 | v1.0.5 round 3 final: now runs on all non-Quant modes too. |
 | `saas` | mode_specific_lint | active | H001 | Web framework imported but missing from requirements.txt declaration. |
 | `saas` | dependency_audit | opt-in | dep-audit | pip-audit via --dependency-audit flag. |
-| `saas` | openapi_consistency | deferred | — | OpenAPI spec ↔ route handler consistency — planned for v1.0.6. |
+| `saas` | openapi_consistency | deferred | — | OpenAPI spec ↔ route handler consistency — planned for a future minor release (v1.0.6 was skipped — the v1.0.5 → v1.1.0 jump rolled all in-flight items into v1.1.x; these three remain on the roadmap without a pinned version). |
 | `agent` | cross_reference | active | X001, X002, X003, X004, W001, W002, W003 | v1.0.5 round 3 final. |
 | `agent` | mode_specific_lint | active | A001, A002 | Agent(...) missing role/goal/backstory; Tool/BaseTool missing description. |
-| `agent` | tool_use_smoke | deferred | — | Stubbed tool-use round-trip — planned for v1.0.6. |
+| `agent` | tool_use_smoke | deferred | — | Stubbed tool-use round-trip — planned for a future minor release (v1.0.6 was skipped — the v1.0.5 → v1.1.0 jump rolled all in-flight items into v1.1.x; these three remain on the roadmap without a pinned version). |
 | `scientist` | cross_reference | active | X001, X002, X003, X004, W001, W002, W003 | v1.0.5 round 3 final. |
 | `scientist` | mode_specific_lint | active | S001, S002 | Numerical work without explicit seed/RandomState; missing requirements.txt. |
-| `scientist` | data_leakage_check | deferred | — | Train/test split leakage detection — planned for v1.0.6. |
+| `scientist` | data_leakage_check | deferred | — | Train/test split leakage detection — planned for a future minor release (v1.0.6 was skipped — the v1.0.5 → v1.1.0 jump rolled all in-flight items into v1.1.x; these three remain on the roadmap without a pinned version). |
 
 `active` defences run by default. `opt-in` requires an env var or codegen scope flag. `deferred` is tracked-but-unimplemented debt — listed here so it stays visible until the rule lands. Set `CRUCIBLE_UNIVERSAL_CROSSREF=0` to opt out of the universal cross-reference layer for legacy callers (default ON).
 

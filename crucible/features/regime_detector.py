@@ -334,7 +334,12 @@ def _run_hmm_em(
     # Floor at the larger of ``global_std × 1e-6`` (a physically
     # meaningful 6-order-of-magnitude buffer below the dataset's
     # natural scale) and the absolute 1e-14 backstop.
-    _STD_FLOOR = max(global_std * 1e-6, 1e-14) if global_std > 0 else 1e-14
+    # v1.1.2 (sixth-pass H-1): tighten the gate from ``> 0`` to ``> 1e-14``
+    # per CLAUDE.md § 9.3 — a subnormal ``global_std`` (e.g. 5e-324) was
+    # truthy here and produced a 5e-320 floor, after which ``stds[k]`` kept
+    # the subnormal value, and the next ``_gaussian_pdf`` call divided into
+    # it and yielded ``inf``.
+    _STD_FLOOR = max(global_std * 1e-6, 1e-14) if global_std > 1e-14 else 1e-14
     stds: List[float] = [max(global_std, _STD_FLOOR)] * K
 
     # Uniform transition matrix and initial distribution

@@ -510,7 +510,13 @@ def _load_returns(run_dir: str) -> List[float]:
                     returns = []
                     for i in range(1, len(values)):
                         prev, curr = values[i - 1], values[i]
-                        if prev > 0 and math.isfinite(prev) and math.isfinite(curr):
+                        # v1.1.2 (sixth-pass H-1): align with the sibling fix in
+                        # ``quant_analytics._equity_to_returns`` (line 446) and the
+                        # CLAUDE.md § 9.3 standard.  ``prev > 0`` admits IEEE 754
+                        # subnormals (5e-324) which explode through the division
+                        # to ~1e+300 and poison every Monte-Carlo simulated path,
+                        # VaR / CVaR, prob_loss, etc.
+                        if prev > 1e-14 and math.isfinite(prev) and math.isfinite(curr):
                             returns.append((curr - prev) / prev)
                         else:
                             # v1.1.0: NaN sentinel — bootstrap pool filters
@@ -542,7 +548,9 @@ def _load_returns(run_dir: str) -> List[float]:
                     returns = []
                     for i in range(1, len(values)):
                         prev, curr = values[i - 1], values[i]
-                        if prev > 0 and math.isfinite(prev) and math.isfinite(curr):
+                        # v1.1.2 (sixth-pass H-1): same subnormal-admission fix
+                        # as the JSON branch above.
+                        if prev > 1e-14 and math.isfinite(prev) and math.isfinite(curr):
                             returns.append((curr - prev) / prev)
                         else:
                             # v1.1.0: NaN sentinel — bootstrap pool filters

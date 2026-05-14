@@ -122,8 +122,15 @@ from typing import Any, Iterable, Iterator, List, Mapping, Optional, Protocol, T
 # Tri-modal import (see recorder.py for the launcher matrix).
 try:
     from ...runtime_logging import get_logger
+    from .schema import canonical_record_line as _canonical_record_line
 except ImportError:  # pragma: no cover — flat-launcher fallback
     from runtime_logging import get_logger  # type: ignore[no-redef]
+    try:
+        from features.run_insights.schema import (  # type: ignore[no-redef]
+            canonical_record_line as _canonical_record_line,
+        )
+    except ImportError:  # pragma: no cover — both layouts failed
+        _canonical_record_line = None  # type: ignore[assignment]
 
 LOGGER = get_logger(__name__)
 
@@ -609,7 +616,26 @@ class LocalJSONLBackend:
                 "run_insights: event missing content_id; refusing to write"
             )
             return ""
-        line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+        # v1.1.2 (audit fix G2-B-MED-2): serialise the disk line with the
+        # same canonical encoder used to compute content_id (V8 float
+        # formatter, sort_keys=True, separators=(",", ":")) so the on-disk
+        # JSONL form IS the canonical form.  Previously this used Python-
+        # default ``json.dumps`` (insertion-order keys, native float repr),
+        # which diverged from canonical_json byte-for-byte — fine for
+        # today's read path (which re-parses + recomputes content_id),
+        # but a footgun for the v1.2.0 DualWriteBackend that will byte-
+        # copy lines to R2: the Cloudflare Worker can now strip
+        # ``content_id`` from the parsed line, re-canonicalise the rest,
+        # and verify the hash directly.  Falls back to the legacy
+        # ``json.dumps`` form only if the helper import failed
+        # (defensive — should be reachable in all tri-modal layouts).
+        if _canonical_record_line is not None:
+            try:
+                line = _canonical_record_line(record).decode("utf-8") + "\n"
+            except Exception:
+                line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
+        else:
+            line = json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n"
         with self._lock:
             try:
                 # v1.1.0 third-pass: hold a sidecar lock for the entire
@@ -652,6 +678,23 @@ class LocalJSONLBackend:
         if self._closed or not content_id or not payload:
             return ""
         path = self._blob_path(content_id)
+        # v1.1.2 (sixth-pass M-1): content-addressable short-circuit.  Two
+        # concurrent writers with the same content_id were previously racing
+        # on the temp-file ``os.replace``; on Windows one of the renames can
+        # raise ``PermissionError`` if the read side has the target open via
+        # ``read_blob`` (the OS still serialises atomic-rename through a
+        # FILE_SHARE_DELETE flag that Python's stdlib doesn't request).
+        # Skipping the second write here is correctness-preserving because
+        # both writers would have produced byte-identical content; it also
+        # halves the disk I/O for retry-heavy emit paths.
+        try:
+            if path.exists():
+                return f"{_BLOBS_DIRNAME}/{path.name}"
+        except OSError:
+            # ``path.exists`` can raise on permission-denied parent dirs;
+            # fall through to the full write so the eventual OSError below
+            # surfaces with the canonical ``write_blob`` warn-once.
+            pass
         try:
             # Atomic write: temp + replace, so partial blobs are never read.
             fd, tmp = tempfile.mkstemp(
@@ -734,6 +777,7 @@ class LocalJSONLBackend:
         and the prune-invalidation concern disappears.
         """
         path = self._stream_path(stream)
+        lock_path = self._stream_lock_path(stream)
         events: List[dict] = []
         next_cursor: Optional[str] = None
         try:
@@ -743,30 +787,42 @@ class LocalJSONLBackend:
         if limit <= 0:
             return events, None
         try:
-            with open(path, "rb") as fh:
-                if start_offset:
-                    try:
-                        fh.seek(start_offset)
-                    except OSError:
-                        pass
-                while True:
-                    line_bytes = fh.readline()
-                    if not line_bytes:
-                        break
-                    try:
-                        obj = json.loads(line_bytes.decode("utf-8"))
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        continue
-                    if not isinstance(obj, dict):
-                        continue
-                    if since and str(obj.get("ts") or "") < since:
-                        continue
-                    events.append(obj)
-                    if len(events) >= limit:
-                        # Record byte offset *after* this line so the next
-                        # call resumes from the next event.
-                        next_cursor = str(fh.tell())
-                        break
+            # v1.1.2 (sixth-pass M-1): acquire the same sidecar lock that
+            # write_event / prune_stream hold for the duration of the read.
+            # On Windows ``os.replace`` (the rename step of prune) cannot
+            # overwrite a file that another process holds open — without
+            # this lock, a prune racing against an in-flight read silently
+            # aborts with ``PermissionError``, gets warn-once-suppressed,
+            # and the file grows unbounded until the next quiet moment.
+            # Holding an exclusive lock here serialises reads with each
+            # other and with prune; both are infrequent enough that the
+            # serialisation is unobservable in practice.
+            with open(lock_path, "a+", encoding="utf-8") as lock_fh:
+                with _file_lock_ctx(lock_fh):
+                    with open(path, "rb") as fh:
+                        if start_offset:
+                            try:
+                                fh.seek(start_offset)
+                            except OSError:
+                                pass
+                        while True:
+                            line_bytes = fh.readline()
+                            if not line_bytes:
+                                break
+                            try:
+                                obj = json.loads(line_bytes.decode("utf-8"))
+                            except (json.JSONDecodeError, UnicodeDecodeError):
+                                continue
+                            if not isinstance(obj, dict):
+                                continue
+                            if since and str(obj.get("ts") or "") < since:
+                                continue
+                            events.append(obj)
+                            if len(events) >= limit:
+                                # Record byte offset *after* this line so the
+                                # next call resumes from the next event.
+                                next_cursor = str(fh.tell())
+                                break
         except FileNotFoundError:
             return [], None
         except OSError as exc:
@@ -862,11 +918,39 @@ class LocalJSONLBackend:
                                     # (deque stays empty); fall through
                                     # to total count.
                             if pending.strip():
-                                total_non_empty += 1
-                                if max_entries > 0:
-                                    if not pending.endswith(b"\n"):
-                                        pending = pending + b"\n"
-                                    kept.append(pending)
+                                # v1.1.2 (audit fix G2-B-MED-3): if the
+                                # final byte chunk has content after the
+                                # last ``\n``, that tail is necessarily a
+                                # writer-crash artefact: ``write_event``
+                                # writes the full ``line + "\n"`` atomically
+                                # under the sidecar lock and only fsyncs
+                                # after the newline.  Previously this
+                                # branch silently appended ``\n`` and
+                                # promoted the partial record into a
+                                # ``well-formed but JSON-invalid`` kept
+                                # line; the read path swallows the
+                                # downstream JSONDecodeError so the bad
+                                # row vanishes from queries — but the
+                                # original crash symptom (unterminated
+                                # tail) is also erased, making incident
+                                # forensics impossible.  We now drop the
+                                # partial pending and emit a one-time
+                                # warning so the operator sees the
+                                # writer-crash signal exactly once per
+                                # backend lifetime.
+                                self._warn_once(
+                                    "prune_partial_tail",
+                                    str(path),
+                                    "run_insights: prune detected un-newline-"
+                                    "terminated tail (%d bytes) in %s — "
+                                    "treating as writer-crash artefact and "
+                                    "dropping; the original record is lost "
+                                    "(subsequent identical events suppressed)",
+                                    len(pending),
+                                    path,
+                                )
+                                # Intentionally do NOT promote to total_non_empty
+                                # or kept — the partial bytes are discarded.
                         finally:
                             try:
                                 source_fh.close()

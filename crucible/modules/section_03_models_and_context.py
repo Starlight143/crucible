@@ -1794,15 +1794,17 @@ def _normalize_gate_decision(
         and not _gate_is_validation_scope(gate_decision)
         and gate_decision.overall_score is not None
     ):
-        try:
-            min_score_default = 60
-            min_score = int(
-                os.environ.get(
-                    "CRUCIBLE_PRE_CODEGEN_MIN_SCORE", str(min_score_default)
-                )
-            )
-        except (TypeError, ValueError):
-            min_score = 60
+        # v1.1.2 (audit fix G4-A2-MED-6): route through ``_env_int`` so the
+        # whitelist sentinel semantics (``none`` / ``unlimited`` → None →
+        # default) match the rest of the codebase.  Previously a raw
+        # ``int(os.environ.get(...))`` raised ``ValueError`` on non-numeric
+        # tokens and silently fell back to 60, surprising operators who
+        # tried ``=none`` expecting "disable the floor".  Now ``=none`` /
+        # ``=unlimited`` correctly return None and we treat that as "disable
+        # the floor" (escape hatch), matching the original intent of the
+        # ``min_score == 0`` branch below.
+        _raw_min_score = _env_int("CRUCIBLE_PRE_CODEGEN_MIN_SCORE", 60)
+        min_score = 0 if _raw_min_score is None else int(_raw_min_score)
         # min_score == 0 disables the floor entirely (escape hatch for tests).
         if min_score > 0 and gate_decision.overall_score < min_score:
             gate_decision.ready_for_codegen = False
@@ -2206,37 +2208,53 @@ def should_skip_content(name: str) -> bool:
     return False
 
 
+# v1.1.2 (sixth-pass H-M3): all quantifiers now have explicit upper bounds.
+# The previous ``{20,}`` / ``{8,}`` / ``{6,}`` / ``{10,}`` patterns were
+# unbounded, exposing this redactor (called on every uploaded file via
+# ``safe_read_text``) to ReDoS-style backtracking on adversarial input.
+# The Run Insights ``_VALUE_SECRET_PATTERNS`` set was bounded in v1.1.0
+# third-pass for the same reason; this codebase-wide twin must follow.
+# Upper bounds chosen to cover realistic real-world tokens plus generous
+# headroom:
+#   * sk-/gh-: 200 chars (real keys ~64; rotated formats ≤120)
+#   * credential values:  500 chars (covers long base64 tokens + headroom)
+#   * JWT segments: header 300, payload 2000, signature 300 (matches
+#     recorder.py contract).
+# A DeepSeek-style ``sk-[32 hex]`` pattern is added BEFORE the generic
+# ``sk-[A-Za-z0-9]{20,200}`` so DeepSeek keys produce the expected
+# vendor-shaped match.
 REDACT_RULES = [
-    (re.compile(r"(bearer\s+)[A-Za-z0-9\-._~+/]+=*", re.IGNORECASE), r"\1[REDACTED]"),
-    (re.compile(r"\bsk-[A-Za-z0-9]{20,}\b"), "[REDACTED]"),
-    (re.compile(r"\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}\b"), "[REDACTED]"),
+    (re.compile(r"(bearer\s+)[A-Za-z0-9\-._~+/]{20,500}=*", re.IGNORECASE), r"\1[REDACTED]"),
+    (re.compile(r"\bsk-[A-Fa-f0-9]{32}\b"), "[REDACTED]"),
+    (re.compile(r"\bsk-[A-Za-z0-9]{20,200}\b"), "[REDACTED]"),
+    (re.compile(r"\b(ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,200}\b"), "[REDACTED]"),
     (re.compile(r"\b(AKIA|ASIA)[0-9A-Z]{16}\b"), "[REDACTED:AWS_ACCESS_KEY_ID]"),
     (
         re.compile(r"(aws_secret_access_key\s*[:=]\s*)([A-Za-z0-9/+=]{40})", re.IGNORECASE),
         r"\1[REDACTED]",
     ),
     (
-        re.compile(r"(x-api-key\s*[:=]\s*)(['\"]?)[^'\"\s]{8,}", re.IGNORECASE),
+        re.compile(r"(x-api-key\s*[:=]\s*)(['\"]?)[^'\"\s]{8,500}", re.IGNORECASE),
         r"\1\2[REDACTED]",
     ),
     (
-        re.compile(r"(\bapi_?key\b\s*[:=]\s*)(['\"]?)[^'\"\s]{8,}", re.IGNORECASE),
+        re.compile(r"(\bapi_?key\b\s*[:=]\s*)(['\"]?)[^'\"\s]{8,500}", re.IGNORECASE),
         r"\1\2[REDACTED]",
     ),
     (
-        re.compile(r"(\bsecret\b\s*[:=]\s*)(['\"]?)[^'\"\s]{8,}", re.IGNORECASE),
+        re.compile(r"(\bsecret\b\s*[:=]\s*)(['\"]?)[^'\"\s]{8,500}", re.IGNORECASE),
         r"\1\2[REDACTED]",
     ),
     (
-        re.compile(r"(\btoken\b\s*[:=]\s*)(['\"]?)[^'\"\s]{8,}", re.IGNORECASE),
+        re.compile(r"(\btoken\b\s*[:=]\s*)(['\"]?)[^'\"\s]{8,500}", re.IGNORECASE),
         r"\1\2[REDACTED]",
     ),
     (
-        re.compile(r"(\b(password|passwd)\b\s*[:=]\s*)(['\"]?)[^'\"\s]{6,}", re.IGNORECASE),
+        re.compile(r"(\b(password|passwd)\b\s*[:=]\s*)(['\"]?)[^'\"\s]{6,500}", re.IGNORECASE),
         r"\1\3[REDACTED]",
     ),
     (
-        re.compile(r"\beyJ[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\.[a-zA-Z0-9_-]{10,}\b"),
+        re.compile(r"\beyJ[a-zA-Z0-9_-]{10,300}\.[a-zA-Z0-9_-]{10,2000}\.[a-zA-Z0-9_-]{10,300}\b"),
         "[REDACTED:JWT]",
     ),
 ]

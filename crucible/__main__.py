@@ -17,7 +17,10 @@ else:
     from cli import main  # type: ignore[no-redef]
 
 try:
-    _set_run_id(_os.environ.get("CRUCIBLE_RUN_ID") or None)
+    # v1.1.2 (sixth-pass H-3): strip before ``or None`` so a misconfigured
+    # ``CRUCIBLE_RUN_ID="   "`` does not silently produce whitespace-only
+    # run_ids that defeat downstream ``if run_id`` checks.
+    _set_run_id((_os.environ.get("CRUCIBLE_RUN_ID") or "").strip() or None)
 except Exception:
     # Correlation-id binding must never break the pipeline boot.
     pass

@@ -5,129 +5,334 @@ Versioning follows [Semantic Versioning](https://semver.org/). The first public 
 
 ---
 
-## [v1.1.1] — 2026-05-14
+## [v1.1.2] — 2026-05-14
 
 ### Fixed
+- **`run_meta.json["run_id"]` desynchronised from the Run Insights
+  ledger** (`crucible/modules/section_07_selfcheck_output_main.py`).
+  Section_07 minted a fresh `uuid.uuid4().hex` (32-char) instead of
+  resolving the run-correlation ContextVar (8-char hex from
+  `webui/app.py`'s `uuid.uuid4().hex[:8]`), so `run_meta["run_id"]`
+  and the ledger's `run_id` diverged silently — breaking the v1.2.0
+  retrieval join that associates a saved project with its own
+  Stage 0 debate rejections. Now resolves via the canonical
+  three-tier chain `_get_run_id() →
+  os.environ.get("CRUCIBLE_RUN_ID").strip() → fresh
+  uuid.uuid4().hex[:8]` (matches `record_output_method` /
+  `record_runtime_params`); the defensive fallback calls
+  `_set_run_id(...)` so any later emit converges on the same id.
+  Non-retroactive — pre-v1.1.2 saved projects keep their mismatched
+  ids; v1.2.0 retrieval falls back to `(project_name, timestamp)`
+  join with a tolerance window for those rows.
 
-- **Dashboard cost was $0.00 for runs on ``deepseek-v4-flash`` / ``deepseek-v4-pro``
-  despite real OpenRouter spend** (`crucible/modules/section_00_bootstrap_and_utils.py`).
-  Root cause was two-fold:
-  1. ``OPENROUTER_MODEL_PRICING`` had no entries for the v3/v4 DeepSeek
-     IDs the operator is actually using.  ``_get_model_pricing()`` fell
-     through to ``(0.0, 0.0)``, ``extract_and_set_usage_from_crew()`` took
-     the ``pricing_known=False`` branch, and the run snapshot recorded
-     ``total_cost_usd=0.0`` / ``cost_source="estimated"`` for every
-     stage — which the v1.0.5 promotion path correctly copied into
-     ``run_meta.json`` (the promotion wasn't broken; the source data
-     was zero to begin with).
-  2. OpenRouter only populates ``response.usage.cost`` (the actual
-     billed USD amount) when the request body carries
-     ``"usage": {"include": true}``.  Crucible's CrewAI/litellm LLM
-     construction never set this flag, so even when the local pricing
-     table DID resolve, the cost estimate was a multiplication of
-     `tokens × table_price` instead of the real OpenRouter charge.
-- **A — Pricing table extended for v3/v4 DeepSeek IDs + family-prefix
-  fallback.**  Explicit entries added: ``deepseek/deepseek-v3-chat``,
-  ``deepseek-v3-coder``, ``deepseek-v3-reasoner``, ``deepseek-r1``,
-  ``deepseek-v4-flash``, ``deepseek-v4-pro``.  New
-  ``OPENROUTER_MODEL_FAMILY_PRICING`` table keyed by vendor prefix
-  (``deepseek/deepseek-r``, ``deepseek/``, ``openai/gpt-5``,
-  ``openai/gpt-4o``, ``anthropic/``, ``google/``, ``z-ai/``,
-  ``minimax/``, ``meta-llama/``, ``mistralai/``) so a brand-new model
-  variant within a known family (e.g. future ``deepseek-v5-flash``,
-  ``openai/gpt-6.0``) gets a non-zero estimate rather than silently
-  collapsing to ``cost_source="estimated"`` / 0.  Longest matching
-  prefix wins, so ``deepseek/deepseek-r1-distill-future`` resolves to
-  reasoner-tier pricing rather than the generic chat-tier fallback.
-  Family entries are CONSERVATIVE (set to the cheapest in-family
-  variant) so under-reporting is preferred over over-billing surprise.
-- **B — Request body now opts into OpenRouter's usage accounting.**
-  New ``inject_openrouter_usage_extra_body()`` helper merges
-  ``additional_params={"extra_body": {"usage": {"include": True}}}``
-  into the crewai.LLM kwargs.  Forwarded through crewai.LLM →
-  litellm → openai SDK → request body so the response now carries
-  ``usage.cost`` (actual billed USD) and the existing
-  ``set_openrouter_usage()`` path picks it up automatically.  Helper
-  is idempotent, merges with any pre-existing ``extra_body`` /
-  ``usage`` keys, preserves operator-set ``include=False`` overrides,
-  and is defensive against non-dict ``additional_params`` values.
-  Wired into three LLM construction sites:
-  - ``section_02_research_and_llm._create_openrouter_llm`` (main
-    direction-judge / librarian / primary LLM).
-  - ``section_01_extraction_and_reformat._make_formatter_llm`` (schema
-    reformatting LLM).
-  - ``section_05_analysis_and_codegen._make_codegen_llm`` (codegen
-    LLM — the single largest cost sink in a Quant run; without this,
-    cost summaries under-reported by ~70 %).
-  The two sibling helpers detect OpenRouter via the
-  ``_quant_llm_provider`` attribute that ``_create_openrouter_llm``
-  stamps onto the main LLM.
-- **Cost-source labelling correctness preserved.**  When ``usage.cost``
-  arrives from OpenRouter, ``set_openrouter_usage()`` labels the
-  context ``cost_source="openrouter_api"`` (highest priority in
-  ``_USAGE_COST_SOURCE_PRIORITY``).  Falling through to the local
-  pricing table (Tier 1 or Tier 2 fallback) labels it
-  ``"openrouter_tokens_with_pricing"`` / ``"crewai_metrics_with_pricing"``.
-  The label remains ``"estimated"`` only when BOTH the API opt-in
-  failed AND the model is outside every known vendor family — a
-  genuinely-untracked model that the operator should add to the
-  pricing table.
+### Audit-fix sweep (two 4-agent post-release passes)
 
-### Test coverage — v1.1.1 (31 new tests)
+Two thematic 4-agent audits ran after the initial v1.1.2 fix landed.
+All findings are attributed to v1.1.2 (no version bump); grouped by
+area below.
 
-- New `tests/test_v1_1_1_cost_tracking_regressions.py`:
-  - ``TestGetModelPricingV4Variants`` (4 tests) — v3/v4 explicit
-    entries resolve to the correct tier.
-  - ``TestGetModelPricingFamilyFallback`` (7 tests) — future
-    variants within known families fall back to non-zero pricing;
-    longest-prefix-wins tie-break; unknown vendors still emit
-    ``(0, 0)``; exact entries beat family fallback.
-  - ``TestFamilyPricingTableInvariants`` (2 tests) — every family
-    entry has positive prices; ``deepseek-v4-flash`` / ``v4-pro``
-    are EXPLICIT entries (not fallback-only).
-  - ``TestInjectOpenRouterUsageExtraBody`` (9 tests) — full branch
-    coverage of the merge helper including idempotence, merge into
-    existing structures at all three nesting levels, operator-False
-    override preservation, and three classes of malformed input.
-  - ``TestExtraBodyWiringInCallSites`` (3 tests) — ``inspect.getsource``
-    structural pins that the three LLM construction sites still
-    call the helper (catches a future refactor that drops the
-    injection silently — same anti-pattern documented in CLAUDE.md
-    § 9.6 producer→consumer wiring rule).
-  - ``TestCostZeroRegressionForV4Models`` (6 parametrised cases) —
-    every v3/v4 variant resolves to a ``pricing_known=True`` price,
-    so ``extract_and_set_usage_from_crew`` cannot fall into the
-    ``cost_source="estimated"`` / zero-cost branch for these IDs.
+- **Run-id discipline at every producer site.** `run_crucible.py`
+  flat launcher now bridges `CRUCIBLE_RUN_ID` (was missing — only
+  `__main__.py` and `run_crucible_enhanced.py:main()` did, so
+  `error_record` emits under the flat launcher wrote `run_id=""`).
+  `set_run_id` / `run_context` apply `.strip()` before truthiness
+  check so a whitespace-only env value can no longer mint a
+  3-space id. `resilience.error_record` and `section_02`
+  direction-debate emits use the canonical three-tier chain with
+  `LOGGER.warning` on empty resolution; `mode` / `stage` defaults
+  switched to `mode_unknown` / `stage_unknown` sentinels for
+  v1.2.0 retrieval aggregation parity. `recorder._emit` strips
+  before the 64-char truncate.
+- **v1.2.0 retrieval observability.**
+  `record_direction_debate_rejection` no longer gated on
+  `gap_info` content — every `force_none` verdict telemetered
+  (was silently dropped for non-evidence-shaped reasons like
+  `judge_explicit_none` / `unanimous_reject`).
+  `InsightsRecorder._warned_once` split into
+  `_warned_unknown_reason` + `_warned_emit_failed` (a benign
+  first log was muting every subsequent backend WARN). DeepSeek
+  `sk-` + 32 hex matches a vendor-specific tier before the
+  generic `{40,80}` pattern. `LocalJSONLBackend.write_event`
+  uses canonical JSON for byte-for-byte parity with the v1.2.0
+  Cloudflare `DualWriteBackend`. `prune_stream` drops
+  writer-crash partial tails (was promoting them with a
+  synthetic `\n`). Set-of-floats redaction uses `canonical_json`
+  for cross-platform `content_id` stability.
+  `_NullRecorder.backend` is now `_NoOpBackend` (was `None`,
+  breaking the `.backend.X` parity contract). WebUI insights
+  endpoints switched to lazy `_iter_jsonl_stream` /
+  `_tail_jsonl_stream` so multi-week ledgers cannot OOM the
+  dashboard.
+- **WebUI memory ceiling, concurrent cap, and exception hygiene.**
+  New `_runs_semaphore = BoundedSemaphore(_RUNS_MAX_CONCURRENT)`
+  (default 4, env `CRUCIBLE_WEBUI_MAX_CONCURRENT_RUNS`, ceiling
+  64) caps concurrent runs; `acquire(timeout=60)` re-checks
+  `status` after acquire so a cancelled run doesn't spawn
+  subprocess; release guarded by an `acquired` flag against
+  `BoundedSemaphore` over-release. Per-run output buffer capped
+  at `_RUNS_MAX_OUTPUT_LINES` (default 50 000) via FIFO
+  eviction; SSE resume index adjusts cumulative `sent` and
+  emits a one-shot truncation notice.
+  `_periodic_evict_runs` daemon timer fires every 60 s for
+  headless deployments. `socket.getaddrinfo` in `_is_safe_url`
+  bounded at 3 s (Slowloris-on-DNS defence).
+  `X-Forwarded-Host` gated on `CRUCIBLE_TRUST_FORWARDED`
+  opt-in, split on first comma for multi-hop proxy chains.
+  Nine endpoints (`api_save_env`, `api_list_projects`,
+  `api_budget_status`, `api_webhook_history`, `api_notify_test`,
+  `api_run_signal`, `api_v169_metrics` × 2, `cost_trend`,
+  grafana dashboard) route through a new `_safe_500` helper
+  that logs the full exception via `LOGGER.exception` and
+  returns a `log_id`-stamped generic 500.
+  `_redact_for_client` strips secrets via
+  `_VALUE_SECRET_PATTERNS` + Windows/POSIX absolute-path
+  patterns; applied to `last_error`, `error_msg`, DB write
+  side, and captured pipeline stdout (single-point redact at
+  the `_run_worker` capture boundary, covering 15+
+  `print(f"[Error] ... {e}")` call sites across
+  `section_01/02/04/05/06`). SSE `__done__` pre-padded with a
+  2 KB SSE comment to force proxy flush.
+- **Subnormal floor sweep across quant features.** v1.1.0
+  fifth-pass tightened `prev > 0` → `prev > 1e-14` in
+  `quant_analytics`/`regime_detector`/`dynamic_correlation`/
+  `factor_analyzer`; the sibling paths in `monte_carlo`,
+  `risk_attribution`, `tearsheet._equity_to_returns`,
+  `regime_detector._STD_FLOOR`, `portfolio_backtest`, and
+  `transaction_cost_model` kept the loose floor and could
+  detonate on an IEEE 754 subnormal `prev` (5e-324 → return
+  ≈ 1e+300 after the division). All seven now use `> 1e-14`.
+  `dynamic_correlation._align_return_series` switched from
+  `0.0` missing-observation default to `float("nan")` so the
+  existing `_pearson_r` NaN-strip (v1.1.0 G-9) sees the gap
+  correctly.
+- **SSRF hardening in `web_research/http_clients.py`.** LLM
+  citation-fetch path used a weaker SSRF guard than the WebUI:
+  `_is_public_http_url` only rejected via `ip.is_global`,
+  allowing multicast, IPv4-mapped IPv6, 6to4 / NAT64 wrapping
+  private v4, reserved ranges, userinfo smuggling
+  (`http://victim@evil.com/`), and IPv6 scope-id. Helper now
+  mirrors `webui.app._addr_is_safe` (v1.1.0 fifth-pass G-2).
+  `httpx.Client(follow_redirects=True)` disabled; new
+  `_request_with_safe_redirects` revalidates every hop, caps at
+  3 hops, and per RFC 7231 §6.4 demotes 301/302/303 +
+  POST/PUT/PATCH to GET-without-body so the original body
+  cannot replay against the redirected endpoint.
+- **`section_03` REDACT_RULES ReDoS hardening.** Eight unbounded
+  `{N,}` quantifiers (sk-/gh prefix, credentials × 4, password,
+  JWT three segments) bounded to realistic limits matching the
+  v1.1.0 third-pass `_VALUE_SECRET_PATTERNS` discipline (sk-/gh
+  ≤ 200, credentials ≤ 500, JWT 300/2000/300). DeepSeek
+  `sk-[A-Fa-f0-9]{32}` vendor-specific pattern added before the
+  generic `sk-[A-Za-z0-9]{20,200}`.
+- **env_bool / env_int whitelist unification.** Four hand-rolled
+  call sites (`CODEX_REQUIRE_SNAPSHOT`, `CRUCIBLE_UNIVERSAL_CROSSREF`,
+  `CRUCIBLE_QUANT_REQUIRE_TESTS` in `section_06`, plus the
+  generated smoke-test stub) routed through `_env_bool` for
+  consistent `{1, true, yes, on}` semantics. Two raw
+  `int(os.environ.get(...))` paths (`CRUCIBLE_PRE_CODEGEN_MIN_SCORE`
+  in `section_03`, `CRUCIBLE_QUANT_DRYRUN_TIMEOUT` in
+  `section_06`) routed through `_env_int` so typo sentinels
+  (`unlimted`) trip the project-wide whitelist warning instead
+  of silently flooring.
+- **Schema-first non-staged path + finite-only float gates.**
+  `build_codegen_crew` now passes `_extract_quant_schema_signatures`
+  into its prompt template (only the staged batch worker did
+  before; small Quant projects on the single-shot path bypassed
+  the v1.0.5 schema-first contract).
+  `output_validation._coerce(float)` rejects NaN / Inf via
+  `math.isfinite` (symmetric with `_env.env_float`'s
+  `finite_only`); `section_07._outcome_score` gated through the
+  same `math.isfinite`; `_coerce_json_dict` uses
+  `json.dumps(allow_nan=False)` so NaN / Infinity literals
+  cannot round-trip through the LLM-controlled path.
+- **Cross-process file locking + content-addressable short-circuit.**
+  `read_events` now acquires the sidecar lock `_stream_lock_path`
+  for the duration of the read (was racing against
+  `prune_stream`'s `os.replace` on Windows, where the held-open
+  file rejected the rename and silently aborted with
+  `PermissionError`). `write_blob` adds a `path.exists()`
+  short-circuit before `tempfile.mkstemp` — content-addressable
+  storage makes this correctness-preserving and halves disk I/O
+  for retry-heavy emit paths.
+- **`streaming._worker` re-raises `(SystemExit, KeyboardInterrupt)`.**
+  The previous `except BaseException` clause posted the
+  operator signal onto the result queue as an "error" chunk,
+  hiding Ctrl-C / SIGTERM intent. Now narrowed to `Exception`
+  after the explicit signal re-raise.
+- **`run_meta.json["timestamp_utc"]` additive seam.** v1.2.0
+  retrieval joins across machines; a naive local-time
+  `timestamp` goes ambiguous across DST / TZ. Now emits an
+  additive `timestamp_utc` field (`YYYY-MM-DDTHH:MM:SS.ffffffZ`);
+  folder name stays local-time for operator readability.
+- **Defence-in-depth on the Google Fonts CDN**
+  (`webui/templates/index.html`). SRI does not apply (CSS body
+  varies by UA per MDN); hardened via
+  `referrerpolicy="no-referrer"` + `crossorigin="anonymous"` +
+  `onerror` graceful-degrade to system fonts if the CDN is
+  blocked.
+- **WebUI bilingual + CSRF coverage.** Three `stage_models`
+  tooltips (`librarian_model`, `primary_model`,
+  `direction_judge_model`) converted to `{en, zh}` per CLAUDE.md
+  § 10 bilingual invariant. `setLanguage` POST now sets an
+  explicit `X-Requested-With` header so a future early-load
+  script using native XHR cannot silently 403 the
+  language-save call.
+- **Version + docs + CI hygiene.** `pyproject.toml::project.version`
+  bumped `1.0.0` → `1.1.2` (was stuck at `1.0.0` despite six
+  follow-on releases; wheels built from this tree advertised
+  the wrong version). Added `crucible.__version__` mirror in
+  `crucible/__init__.py`; regression test pins both equal on
+  every release. 4 README variants no longer cite `1747 tests`
+  (version-agnostic pointer to `CHANGELOG.md`).
+  `ARCHITECTURE.md` removed three references to never-shipped
+  `v1.0.6`. `.github/workflows/ci.yml::compileall -x` extended
+  to `(saved_projects|skill_staging|\.crucible_insights)`.
+  `requirements.txt` carries `>=` minimum-version floors for
+  `crewai`, `langchain-openai`, `litellm`, `pydantic`,
+  `httpx`, `tiktoken`, `flask`.
+  `test_streaming.py::test_error_chunk_has_elapsed_seconds`
+  now uses a measurable 50 ms delay + `> 0.0` matching the
+  sibling Windows-resolution pattern.
+
+### Observed but not patched (rationale)
+
+- **WebUI per-line `_runs_lock` acquisition** — batching to
+  50 ms / N-line flushes would touch the worker hot loop; the
+  perf win at 3+ concurrent runs does not outweigh regression
+  risk. Deferred until a representative load test exists.
+- **`cost_tracker.py` integer micro-cents refactor** —
+  docstring promises integer micro-cents; implementation uses
+  floats end-to-end. Functionally correct for the cost
+  magnitudes this project handles; integer conversion is a
+  v1.2.0-scope refactor.
+- **`_create_openrouter_llm` mutates `os.environ`** —
+  subprocess isolation contains the leak in the current
+  WebUI architecture; in-process re-entrant LLM usage is not
+  on the v1.2.0 roadmap.
+- **DSR sample-moment Bessel correction** — verified against
+  Bailey & López de Prado (2014) §3.1 which explicitly uses
+  biased (population) moments per the paper's stated
+  rationale; current code matches the paper and is
+  intentionally NOT Bessel-corrected.
+- **DNS-rebinding hardening for `_is_public_http_url`** —
+  adding `socket.getaddrinfo` per-call would break the
+  existing offline-mocked-httpx test suite (`api.example.com`
+  is a common synthetic hostname). Deferred behind a future
+  `CRUCIBLE_WEB_RESEARCH_STRICT_DNS` env flag.
 
 ### Validation
 
-- pytest: **2 487 passed, 1 skipped** (up from 2 451).  31 new tests
-  in ``tests/test_v1_1_1_cost_tracking_regressions.py`` covering both
-  the pricing-table fix and the ``extra_body`` injection helper +
-  call-site wiring.  Two pre-existing tests in
-  ``test_openrouter_cost_tracking.py`` updated to reflect the new
-  family-fallback contract (``gpt-5.4-pro`` now resolves to frontier-
-  tier family pricing instead of zero; the defensive-against-bleeding
-  intent is preserved by the new ``test_truly_unknown_vendor_still
-  _returns_zero`` test that uses ``cohere/`` — a vendor outside every
-  family prefix).  Zero regressions.
-- `crucible/smoke_test.py`: 5/5 OK; `run_crucible.py --self-check`: OK.
+- pytest: **2 588 passed, 1 skipped** (+101 over the v1.1.1
+  baseline of 2 487). New regression coverage in
+  `tests/test_v1_1_2_run_id_consistency.py` (14 tests for the
+  section_07 line-1360 fix),
+  `tests/test_v1_1_2_audit_fixes.py` (48 tests across seven
+  groups), `tests/test_v1_1_2_sixth_pass.py` (39 tests across
+  twelve classes for the second-pass H-N / M-N fixes).
+- `crucible/smoke_test.py`: 5/5 OK.
+- `run_crucible.py --self-check`: OK.
 
 ### Compatibility
 
-- Drop-in for v1.1.0.  No env-var defaults flipped, no public schema
-  changes.
-- Behavioural note: runs using OpenRouter will now produce slightly
-  larger response payloads (the additional ``usage.cost`` /
-  ``usage.cost_details`` fields).  No measurable latency impact —
-  the fields are pre-computed server-side and add ~100 bytes per
-  response.
-- Operators with custom model IDs outside the vendor families
-  enumerated in ``OPENROUTER_MODEL_FAMILY_PRICING`` should add an
-  explicit entry to ``OPENROUTER_MODEL_PRICING``; behaviour
-  otherwise unchanged (still emits ``cost_source="estimated"``
-  with 0 cost, but at least the OpenRouter API opt-in will fill in
-  the real cost when available).
+- Drop-in for v1.1.1. No env-var defaults flipped, no public
+  schema breaks, no public API rename.
+- Two new env knobs (`CRUCIBLE_WEBUI_MAX_CONCURRENT_RUNS=4`,
+  `CRUCIBLE_WEBUI_MAX_OUTPUT_LINES_PER_RUN=50000`) have safe
+  defaults larger than any historical real-world workload.
+- `pyproject.toml::project.version` corrected `1.0.0` →
+  `1.1.2`: wheels built from this tree now advertise the
+  right version; `importlib.metadata.version("crucible")`
+  returns `1.1.2`. Operators pinning the previous (wrong)
+  `1.0.0` should update — package contents have always been
+  v1.0.5+ regardless of the wheel label.
+- `run_meta.json` gains an additive `timestamp_utc` field
+  (existing local-time `timestamp` unchanged).
+- Pre-v1.1.2 saved projects keep their mismatched `run_id`
+  values; v1.2.0 retrieval should fall back to
+  `(project_name, timestamp)` join with a tolerance window
+  for those rows.
+
+---
+
+## [v1.1.1] — 2026-05-14
+
+### Fixed
+- **Dashboard cost was $0.00 on DeepSeek v3/v4 models despite real
+  OpenRouter spend** (`crucible/modules/section_00_bootstrap_and_utils.py`).
+  Two-fold root cause: (a) `OPENROUTER_MODEL_PRICING` had no entries for
+  `deepseek-v4-flash` / `v4-pro` / `v3-chat` / `v3-coder` /
+  `v3-reasoner` / `r1`, so `_get_model_pricing()` fell through to
+  `(0.0, 0.0)`, `extract_and_set_usage_from_crew()` took the
+  `pricing_known=False` branch, and `total_cost_usd=0.0` /
+  `cost_source="estimated"` was the source data the v1.0.5 promotion
+  path correctly copied into `run_meta.json` (the promotion wasn't
+  broken; the source was zero); (b) OpenRouter only populates
+  `response.usage.cost` (actual billed USD) when the request body
+  carries `"usage": {"include": true}`, which crewai/litellm LLM
+  construction never set — so even when the local table DID resolve,
+  the estimate was `tokens × table_price`, not the real OpenRouter
+  charge.
+- **A — Pricing table extended + family-prefix fallback.** Explicit
+  entries added for all v3/v4 DeepSeek IDs. New
+  `OPENROUTER_MODEL_FAMILY_PRICING` keyed by vendor prefix
+  (`deepseek/deepseek-r`, `deepseek/`, `openai/gpt-5`, `openai/gpt-4o`,
+  `anthropic/`, `google/`, `z-ai/`, `minimax/`, `meta-llama/`,
+  `mistralai/`) so a brand-new variant within a known family (e.g.
+  future `deepseek-v5-flash`, `openai/gpt-6.0`) gets a non-zero
+  estimate rather than silently collapsing to zero. Longest-matching
+  prefix wins, so `deepseek-r1-distill-future` resolves to reasoner
+  tier rather than generic chat. Family entries are CONSERVATIVE
+  (cheapest in-family variant) so under-reporting is preferred over
+  over-billing surprise.
+- **B — Request body opts into OpenRouter usage accounting.** New
+  `inject_openrouter_usage_extra_body()` helper merges
+  `additional_params={"extra_body": {"usage": {"include": True}}}` into
+  crewai.LLM kwargs → litellm → openai SDK → request body, so the
+  response now carries `usage.cost` and the existing
+  `set_openrouter_usage()` picks it up automatically. Idempotent, merges
+  with pre-existing `extra_body` / `usage` keys, preserves operator-set
+  `include=False` overrides, defensive against non-dict
+  `additional_params`. Wired into three LLM construction sites:
+  `section_02_research_and_llm._create_openrouter_llm` (main /
+  direction-judge / librarian), `section_01_extraction_and_reformat._make_formatter_llm`
+  (schema reformatter), and `section_05_analysis_and_codegen._make_codegen_llm`
+  (codegen — single largest cost sink in a Quant run; without this,
+  summaries under-reported by ~70 %). The two sibling helpers detect
+  OpenRouter via the `_quant_llm_provider` attribute stamped by
+  `_create_openrouter_llm`.
+- **Cost-source labelling correctness preserved.** `usage.cost` from
+  OpenRouter → `cost_source="openrouter_api"` (highest priority in
+  `_USAGE_COST_SOURCE_PRIORITY`); local table fallback →
+  `"openrouter_tokens_with_pricing"` / `"crewai_metrics_with_pricing"`;
+  remains `"estimated"` only when BOTH the API opt-in failed AND the
+  model is outside every known vendor family — a genuinely-untracked
+  model that the operator should add explicitly.
+
+### Validation
+- pytest: **2 487 passed, 1 skipped** (up from 2 451; +31 in
+  `tests/test_v1_1_1_cost_tracking_regressions.py`: 4 v3/v4 explicit-
+  entry resolutions, 7 family-fallback cases (longest-prefix tie-break,
+  unknown vendors still return `(0,0)`, exact entries beat family),
+  2 family-table invariants (positive prices, v4-flash/v4-pro are
+  EXPLICIT not fallback-only), 9 `inject_openrouter_usage_extra_body`
+  branch tests (idempotence, three nesting levels, operator-False
+  override preservation, three malformed-input classes), 3
+  `inspect.getsource` structural pins on the three LLM construction
+  sites per CLAUDE.md § 9.6 producer→consumer wiring rule, 6
+  parametrised cost-zero regression pins for v3/v4 IDs). Two
+  pre-existing tests in `test_openrouter_cost_tracking.py` updated for
+  the new family-fallback contract (`gpt-5.4-pro` now resolves via
+  family pricing instead of zero; `cohere/` retained as the truly-
+  unknown-vendor zero case). Zero regressions.
+- `crucible/smoke_test.py`: 5/5 OK; `run_crucible.py --self-check`: OK.
+
+### Compatibility
+- Drop-in for v1.1.0. No env-var defaults flipped, no public schema
+  changes. OpenRouter responses now ~100 bytes larger (server-pre-
+  computed `usage.cost` / `usage.cost_details`); no measurable latency
+  impact. Operators with custom IDs outside the vendor families in
+  `OPENROUTER_MODEL_FAMILY_PRICING` should add explicit
+  `OPENROUTER_MODEL_PRICING` entries.
 
 ---
 

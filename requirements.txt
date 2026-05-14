@@ -9,15 +9,26 @@
 # ============================================================================
 
 # --- Core (always required) -------------------------------------------------
-crewai
-langchain-openai
-litellm
-pydantic
-httpx
+# v1.1.2 (sixth-pass M-11): minimum-version bounds on the core dependencies
+# so the CI ``actions/setup-python`` cache key (hash of requirements.txt) is
+# at least semantically meaningful — without any pins, the same content hash
+# could resolve to wildly different installed versions across CI runs and
+# ``pip-audit`` results would be non-reproducible from one PR to the next.
+# Upper bounds are deliberately omitted on the core deps to stay compatible
+# with the rolling-release model of crewai / langchain; pinning a lock file
+# for full reproducibility is tracked separately (would require ``pip-compile``
+# in a follow-up).  These floors reflect the API surfaces actually consumed
+# by the codebase (httpx ``follow_redirects=`` kwarg, pydantic v2 model
+# validators, flask ``stream_with_context``, etc.).
+crewai>=0.30
+langchain-openai>=0.1
+litellm>=1.30
+pydantic>=2.0
+httpx>=0.24
 
 # --- Token counting / context budget ----------------------------------------
 # Used by context_budget.py and context_pressure.py for accurate token counts.
-tiktoken
+tiktoken>=0.5
 
 # --- .env loading (runtime configuration) -----------------------------------
 # Used by crucible/runtime_logging.py to honour CRUCIBLE_LOG_LEVEL
@@ -81,7 +92,7 @@ opentelemetry-sdk
 opentelemetry-exporter-otlp
 
 # --- Optional — web UI -------------------------------------------------------
-flask
+flask>=2.3
 
 # --- Optional — extended feature modules -------------------------------------
 # scheduler.py: built-in APScheduler job scheduling

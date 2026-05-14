@@ -2110,6 +2110,15 @@ def prepare_data(
         return csv_text, count, start, end
 
     # ── Forced source paths (HIGH 2: respect integrity guard on failure) ────
+    # v1.1.2 (audit fix G2-B-HIGH-3): when an explicit forced source fails AND
+    # ``BACKTEST_REQUIRE_REAL_DATA=0``, the fall-through to the auto cascade
+    # and then to synthetic must surface a DISTINCT warning identifying the
+    # explicitly-requested source.  Previously the synthetic annotation only
+    # said "guard off ... synthetic data", with no signal that the operator's
+    # forced ``BACKTEST_DATA_SOURCE=yfinance`` was silently downgraded.  We
+    # now stash the failed forced source onto ``profile["forced_source_failed"]``
+    # so the caller (``run_backtest`` warning path at line 3717-3724) can
+    # emit a distinct second warning.
     if data_source == "project":
         path = _run_project_data_provider(code_dir)
         if path:
@@ -2123,6 +2132,7 @@ def prepare_data(
                 "BACKTEST_DATA_SOURCE=project was requested but "
                 "data_provider.py is missing, failed, or wrote no usable CSV."
             )
+        profile["forced_source_failed"] = "project"
         # Fall through to synthetic only when guard is off — see end of fn.
 
     if data_source == "yfinance":
@@ -2137,6 +2147,7 @@ def prepare_data(
                 f"BACKTEST_DATA_SOURCE=yfinance was requested for "
                 f"{effective_symbol!r} but the fetch returned no usable rows."
             )
+        profile["forced_source_failed"] = "yfinance"
 
     if data_source == "binance":
         csv_text, count, start, end = _try_binance(effective_symbol)
@@ -2150,6 +2161,7 @@ def prepare_data(
                 f"BACKTEST_DATA_SOURCE=binance was requested for "
                 f"{effective_symbol!r} but the fetch returned no usable rows."
             )
+        profile["forced_source_failed"] = "binance"
 
     if data_source == "synthetic":
         # Explicit synthetic request — block when integrity guard is on.
@@ -3716,14 +3728,45 @@ def run_backtest_pipeline(
             report._data_file = result.data_path
             if result.source_label == "synthetic":
                 seed_used = (result.profile or {}).get("synthetic_seed_used")
+                # v1.1.2 (audit fix B-LOW-9): annotate the seed provenance so
+                # an operator copying the seed for reproduction knows whether
+                # the env was pinned (``BACKTEST_SYNTHETIC_SEED=<int>``) or
+                # the seed was drawn from ``SystemRandom`` per run.
+                _seed_env_raw = os.environ.get("BACKTEST_SYNTHETIC_SEED", "").strip()
+                _seed_source = (
+                    "env-pinned"
+                    if (_seed_env_raw and _seed_env_raw.lstrip("-").isdigit())
+                    else "random-draw"
+                )
                 report.warnings.append(
                     "BACKTEST_REQUIRE_REAL_DATA is off and the backtest ran "
-                    f"against synthetic-GBM data (seed={seed_used}). Sharpe / "
+                    f"against synthetic-GBM data (seed={seed_used}, source: "
+                    f"{_seed_source}). Sharpe / "
                     "drawdown / win-rate / equity curve here are statistically "
                     "random and MUST NOT be used to evaluate strategy quality, "
                     "compare variants, or seed retrieval/ranking. Treat this "
                     "run as a plumbing smoke test only."
                 )
+                # v1.1.2 (audit fix G2-B-HIGH-3): if the operator explicitly
+                # forced a real-data source via ``BACKTEST_DATA_SOURCE`` AND
+                # that source failed AND ``BACKTEST_REQUIRE_REAL_DATA=0`` let
+                # the cascade silently downgrade to synthetic, emit a distinct
+                # second warning calling out the forced choice that was
+                # ignored.  Without this the operator who set
+                # ``BACKTEST_DATA_SOURCE=yfinance`` for a reason (e.g.
+                # validating one provider's correctness) cannot tell the
+                # forced source was silently bypassed.
+                _forced_failed = (result.profile or {}).get("forced_source_failed")
+                if _forced_failed:
+                    report.warnings.append(
+                        f"BACKTEST_DATA_SOURCE={_forced_failed!r} was explicitly "
+                        "requested by the operator but the fetch returned no "
+                        "usable rows.  Because BACKTEST_REQUIRE_REAL_DATA is off "
+                        "the cascade silently downgraded to synthetic-GBM — your "
+                        f"forced-source choice ({_forced_failed!r}) was ignored. "
+                        "Re-run with BACKTEST_REQUIRE_REAL_DATA=1 to make this "
+                        "failure mode raise BacktestDataIntegrityError instead."
+                    )
         except BacktestDataIntegrityError as exc:
             # Keep the integrity-guard refusal distinct in the error list so
             # the WebUI / report layer can render the multi-line explanation

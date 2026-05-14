@@ -698,7 +698,7 @@ python crucible/smoke_test.py
 python -m pytest tests -q -p no:cacheprovider
 ```
 
-> All 1747 tests pass (6 skipped) at the time of writing.
+> The full pytest suite passes on every release; see `CHANGELOG.md` for the per-version baseline test count and `tests/` for the actual files.
 
 ### unittest
 
@@ -1361,7 +1361,7 @@ crucible/
 ├── webui/
 │   ├── app.py                      # Flask backend + REST API
 │   └── templates/index.html        # Single-page frontend
-├── tests/                          # Full test suite (1747 tests + regression suite)
+├── tests/                          # Full test suite (comprehensive; see CHANGELOG.md for the current baseline) + regression suite
 │   └── regression/
 │       ├── golden_constraints.json # Golden constraint templates
 │       └── test_regression_runner.py

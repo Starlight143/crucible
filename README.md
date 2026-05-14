@@ -277,7 +277,7 @@ graph TD
 ## Testing
 
 ```bash
-# Full test suite (1747 tests)
+# Full test suite (see CHANGELOG.md for the current baseline)
 python -m pytest tests -q -p no:cacheprovider
 
 # Smoke test (fast, no LLM calls)
@@ -312,7 +312,7 @@ crucible/
 ├── webui/
 │   ├── app.py                      # Flask backend + REST API
 │   └── templates/index.html        # Single-page frontend
-└── tests/                          # 1747 tests
+└── tests/                          # comprehensive test suite (see CHANGELOG.md)
 ```
 
 For a detailed description of every infrastructure module, feature module, and pipeline section, see [ARCHITECTURE.md](ARCHITECTURE.md).

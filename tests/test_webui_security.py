@@ -27,11 +27,26 @@ if str(_REPO_ROOT) not in sys.path:
 @pytest.fixture
 def client():
     """Flask test client.  Imports lazily so tests in other modules
-    that need a different env do not collide."""
+    that need a different env do not collide.
+
+    v1.1.2 (sixth-pass M-9): cancel the module-level ``_eviction_timer``
+    daemon scheduled by ``importlib.reload`` so we don't accumulate one
+    zombie ``threading.Timer`` per test in this module (20+ tests ×
+    ~30 s interval = noticeable pytest-session-end overhead).  The next
+    reload re-arms a fresh timer, so functionality is unaffected.
+    """
     from webui import app as webui_app
     importlib.reload(webui_app)
     webui_app.app.config["TESTING"] = True
-    return webui_app.app.test_client()
+    try:
+        yield webui_app.app.test_client()
+    finally:
+        _t = getattr(webui_app, "_eviction_timer", None)
+        if _t is not None:
+            try:
+                _t.cancel()
+            except Exception:
+                pass
 
 
 # ─── 1. MAX_CONTENT_LENGTH (1 MB cap, 413 JSON response) ─────────────────────
@@ -113,15 +128,18 @@ def test_origin_null_post_without_xhr_returns_403(client):
     )
 
 
-def test_referer_matches_forwarded_host_passes_csrf(client):
+def test_referer_matches_forwarded_host_passes_csrf(client, monkeypatch):
     """v1.1.0 fourth-pass (F-3): when ``X-Forwarded-Host`` matches
     the Referer host, the same-origin check must accept it as
     same-origin so reverse-proxy deployments don't 403 every
     legitimate non-XHR POST.
 
-    Note: this exercises the X-Forwarded-Host fallback inside the
-    gate even when ProxyFix is NOT wired up (the env var path).
+    v1.1.2 (audit fix G5-C-MED-4): the ``X-Forwarded-Host`` consultation
+    is now gated on ``CRUCIBLE_TRUST_FORWARDED`` to prevent header-spoof
+    bypass on standalone deployments.  Set the env var here to opt into
+    the trust path that this regression test exercises.
     """
+    monkeypatch.setenv("CRUCIBLE_TRUST_FORWARDED", "1")
     resp = client.post(
         "/api/run",
         json={"mode": "Quant", "user_problem": "x"},

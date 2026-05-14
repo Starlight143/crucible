@@ -4,7 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "crucible"
-version = "1.0.0"
+# v1.1.2 (audit fix G6-D-HIGH-1): version was previously stuck at "1.0.0"
+# despite six follow-on releases (v1.0.1 → v1.1.2).  Any wheel built from
+# this source tree advertised itself as 1.0.0; ``importlib.metadata.version("crucible")``
+# returned the wrong number; dependency-resolver pinning was incoherent.
+# Keep this in sync with the latest CHANGELOG entry on every release.
+version = "1.1.2"
 description = "AI-native multi-agent research engine for quant, SaaS, agent, and scientific research workflows."
 readme = "README.md"
 requires-python = ">=3.10"

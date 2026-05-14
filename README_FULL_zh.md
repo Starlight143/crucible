@@ -701,7 +701,7 @@ python crucible/smoke_test.py
 python -m pytest tests -q -p no:cacheprovider
 ```
 
-> 目前 1747 項測試全數通過(6 skipped)。
+> 每一版發佈完整 pytest 套件全數通過；該版本的測試數請見 `CHANGELOG.md`。
 
 ### unittest
 
@@ -1364,7 +1364,7 @@ crucible/
 ├── webui/
 │   ├── app.py                      # Flask backend + REST API
 │   └── templates/index.html        # 單頁前端
-├── tests/                          # 完整測試套件(1747 tests + regression suite)
+├── tests/                          # 完整測試套件（測試數請見 CHANGELOG.md）+ regression suite
 │   └── regression/
 │       ├── golden_constraints.json # Golden constraint 範本
 │       └── test_regression_runner.py

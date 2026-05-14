@@ -150,7 +150,15 @@ class InsightsRecorder:
         self._inline_max_bytes = inline_max_bytes
         self._writes_since_prune: Dict[str, int] = {}
         self._lock = threading.Lock()
-        self._warned_once = False
+        # v1.1.2 (audit fix G2-B-HIGH-1): split the single ``_warned_once``
+        # flag into two independent channels so a benign debate event with an
+        # unrecognised ``rejection_reason`` no longer permanently mutes the
+        # critical emit-failure warning (and vice versa).  Prior to this fix
+        # the first ``unrecognised reason`` log silently disabled the only
+        # signal for every subsequent canonical-json / disk-full / backend
+        # exception during the same process lifetime.
+        self._warned_unknown_reason = False
+        self._warned_emit_failed = False
 
     # -- public emitters --------------------------------------------------------
 
@@ -322,12 +330,12 @@ class InsightsRecorder:
             "auditor_blocked", "judge_no_winner",
         }
         reason = str(rejection_reason or "").strip().lower() or "judge_no_winner"
-        if reason not in known and not self._warned_once:
+        if reason not in known and not self._warned_unknown_reason:
             LOGGER.debug(
                 "run_insights: unrecognised rejection_reason=%r (recording verbatim)",
                 rejection_reason,
             )
-            self._warned_once = True
+            self._warned_unknown_reason = True
 
         payload: Dict[str, Any] = {
             "direction_id": str(direction_id or "unknown"),
@@ -427,7 +435,13 @@ class InsightsRecorder:
             ev = InsightEvent(
                 kind=kind,
                 stage=stage,
-                run_id=str(run_id or "")[:64],
+                # v1.1.2 (sixth-pass H-3): apply ``.strip()`` BEFORE the
+                # 64-char truncation.  v1.1.2 G-1 standardised ``.strip()`` at
+                # ``run_correlation.set_run_id`` / ``run_context``, but this
+                # emit path bypassed both and could persist whitespace-only
+                # run_ids that look truthy to ``or``-fallbacks and break the
+                # 8-char-hex assumption every downstream consumer holds.
+                run_id=str(run_id or "").strip()[:64],
                 project_name=str(project_name or "unknown")[:128],
                 mode=_normalise_mode(mode) or "unknown",
                 signals=signals,
@@ -442,11 +456,11 @@ class InsightsRecorder:
             self._maybe_prune(stream)
             return content_id or None
         except Exception as exc:  # noqa: BLE001 — must never break pipeline
-            if not self._warned_once:
+            if not self._warned_emit_failed:
                 LOGGER.warning(
                     "run_insights: emit failed (kind=%s): %s", kind.value, exc
                 )
-                self._warned_once = True
+                self._warned_emit_failed = True
             return None
 
     def _maybe_prune(self, stream: str) -> None:
@@ -490,12 +504,53 @@ class InsightsRecorder:
 
 # ── No-op recorder ────────────────────────────────────────────────────────────
 
+class _NoOpBackend:
+    """A no-op stand-in for :class:`backends.StorageBackend` used when the
+    recorder subsystem is disabled.
+
+    v1.1.2 (audit fix G2-B-MED-5): previously ``_NullRecorder.backend``
+    returned ``None``, which broke parity with the live ``InsightsRecorder``
+    (whose ``.backend`` is a real :class:`StorageBackend`).  Any code path
+    that reached through ``recorder.backend.read_events(...)`` or
+    ``.write_blob(...)`` worked in dev (subsystem enabled) but raised
+    ``AttributeError`` in prod whenever the operator set
+    ``CRUCIBLE_RUN_INSIGHTS_ENABLED=0``.  This stub implements the full
+    backend protocol with no-op returns so the parity promise holds at every
+    API level.
+    """
+
+    _init_failed = False
+
+    def write_event(self, _stream: str, _record: Mapping[str, Any]) -> str:
+        return ""
+
+    def write_blob(self, _payload: bytes, *, suffix: str = ".bin") -> str:  # noqa: ARG002
+        return ""
+
+    def read_events(self, _stream: str, *, limit: Optional[int] = None) -> List[Dict[str, Any]]:  # noqa: ARG002
+        return []
+
+    def prune_stream(self, _stream: str, _max_entries: int) -> int:  # noqa: ARG002
+        return 0
+
+    def flush(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+
 class _NullRecorder:
     """No-op recorder used when ``CRUCIBLE_RUN_INSIGHTS_ENABLED=0``.
 
     Every emit method silently returns ``None``.  Lazy: never opens a file,
-    never registers a sink.
+    never registers a sink.  ``.backend`` returns a :class:`_NoOpBackend`
+    so call sites that reach through ``recorder.backend.X`` work
+    identically whether the subsystem is enabled or disabled.
     """
+
+    def __init__(self) -> None:
+        self._backend = _NoOpBackend()
 
     def record_output_method(self, **_kw: Any) -> None: return None
     def record_error(self, **_kw: Any) -> None: return None
@@ -503,8 +558,10 @@ class _NullRecorder:
     def record_runtime_params(self, **_kw: Any) -> None: return None
     def flush(self) -> None: return None
     def close(self) -> None: return None
+
     @property
-    def backend(self) -> None: return None  # type: ignore[return-value]
+    def backend(self) -> "_NoOpBackend":
+        return self._backend
 
 
 # ── Process-global singleton ──────────────────────────────────────────────────

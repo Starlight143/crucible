@@ -258,9 +258,17 @@ def _equity_to_returns(equity: List[float]) -> List[float]:
     # Guard positive and finite: negative equity produces mathematically valid
     # but semantically wrong returns (leveraged strategies should not have
     # account equity go below zero); NaN/Inf propagate into Sharpe/Calmar.
+    #
+    # v1.1.2 (sixth-pass H-1): tighten ``> 0`` to ``> 1e-14`` per CLAUDE.md
+    # § 9.3.  Previous threshold admitted IEEE 754 subnormals (~5e-324) which
+    # then divided into a flat ``curr`` to produce a ~1e+300 return, instantly
+    # detonating every Sharpe / Sortino / Calmar / win-rate / monthly-heatmap
+    # statistic.  ``else 0.0`` substitution is intentional — see _sharpe /
+    # _sortino which short-circuit on near-zero std and would otherwise
+    # require coordinated NaN handling.
     return [
         (equity[i] - equity[i - 1]) / equity[i - 1]
-        if equity[i - 1] > 0
+        if equity[i - 1] > 1e-14
         and math.isfinite(equity[i - 1])
         and math.isfinite(equity[i])
         else 0.0

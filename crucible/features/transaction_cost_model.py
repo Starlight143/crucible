@@ -575,9 +575,13 @@ def _load_backtest_data(run_dir: str) -> Tuple[List[float], List[int], Optional[
     # bars (as the previous comprehension did) would shrink the returns
     # array and shift all subsequent signal placements by the number of
     # skipped bars.
+    #
+    # v1.1.2 (sixth-pass H-1): tighten ``> 0`` to ``> 1e-14`` per
+    # CLAUDE.md § 9.3 to reject IEEE 754 subnormals that would otherwise
+    # explode through the division.
     returns = [
         (equity[i] - equity[i - 1]) / equity[i - 1]
-        if equity[i - 1] > 0
+        if equity[i - 1] > 1e-14
         and _math.isfinite(equity[i - 1])
         and _math.isfinite(equity[i])
         else 0.0

@@ -41,6 +41,7 @@ Usage::
 from __future__ import annotations
 
 import json
+import math
 import re
 import threading
 from dataclasses import dataclass, field
@@ -333,10 +334,30 @@ def _coerce(value: Any, type_: Type[Any]) -> Tuple[Any, Optional[str]]:
     Returns (coerced_value, error_message_or_None).
     """
     if isinstance(value, type_):
-        # Guard: bool is a subclass of int in Python, so isinstance(True, int) is True.
-        # A bool value must not silently pass as a valid int without explicit coercion.
+        # Guard: bool is a subclass of int in Python, so isinstance(True, int)
+        # is True — the early-return would otherwise hand back a ``bool`` for
+        # an int-typed field, leaking the bool-subtype semantics (``True is 1``
+        # would still be False, ``json.dumps(...)`` would write ``true`` instead
+        # of ``1``).  ``int(value)`` returns a plain ``int`` (``type(int(True))
+        # is int``), so the field gets the explicit numeric form the schema
+        # promises.  This is intentionally an accepting conversion, not a
+        # rejection: callers wanting bool↦int rejection should declare the
+        # field as ``int`` with a ``FieldSpec.validator`` that excludes bool.
         if type_ is int and isinstance(value, bool):
             return int(value), None
+        # v1.1.2 (audit fix G3-A1-HIGH-2): when ``value`` is ALREADY a float,
+        # the isinstance early-return would bypass the finite check below.
+        # Apply the same NaN/Inf reject here so a Python-level ``float("nan")``
+        # passed in directly (not as a string) is also rejected at the schema
+        # boundary.
+        if type_ is float and isinstance(value, float) and not isinstance(value, bool):
+            if not math.isfinite(value):
+                return None, (
+                    f"Cannot coerce {value!r} to float: non-finite floats "
+                    f"(NaN, +Inf, -Inf) are rejected by schema validation. "
+                    "Override via FieldSpec.validator if the field is "
+                    "expected to legitimately carry sentinel non-finite values."
+                )
         return value, None
     # Special cases
     if type_ is bool:
@@ -362,9 +383,29 @@ def _coerce(value: Any, type_: Type[Any]) -> Tuple[Any, Optional[str]]:
         if isinstance(value, bool):
             return float(value), None
         try:
-            return float(value), None
+            coerced = float(value)
         except (ValueError, TypeError):
             return None, f"Cannot coerce {value!r} to float"
+        # v1.1.2 (audit fix G3-A1-HIGH-2): reject NaN / ±Inf at the schema
+        # boundary.  ``float("nan")`` / ``float("inf")`` are valid Python
+        # values but they silently bypass every downstream gate
+        # (``if confidence > 0.5`` is False for NaN, Infinity propagates
+        # through cost/risk math producing invalid sort orders).  The
+        # project-wide ``finite_only`` discipline in ``_env.env_float``
+        # already enforces this on operator-controlled env vars; this
+        # extension applies the same rule to LLM-controlled schema input,
+        # closing the symmetric prompt-injection path where a model emits
+        # ``{"confidence": "nan"}`` or ``{"score": "Infinity"}`` and a
+        # downstream consumer reads a numerically-plausible but
+        # statistically-meaningless value.
+        if not math.isfinite(coerced):
+            return None, (
+                f"Cannot coerce {value!r} to float: non-finite floats "
+                f"(NaN, +Inf, -Inf) are rejected by schema validation. "
+                "Override via FieldSpec.validator if the field is "
+                "expected to legitimately carry sentinel non-finite values."
+            )
+        return coerced, None
     if type_ is int:
         try:
             return int(value), None

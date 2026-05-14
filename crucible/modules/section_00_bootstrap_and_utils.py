@@ -1665,7 +1665,18 @@ def _coerce_json_dict(value: Any) -> Optional[dict]:
     if isinstance(value, str):
         return _extract_first_json_object(value)
     try:
-        return json.loads(json.dumps(value, ensure_ascii=False))
+        # v1.1.2 (sixth-pass M-7): ``json.dumps`` defaults to ``allow_nan=True``
+        # which produces the non-standard literals ``NaN`` / ``Infinity`` /
+        # ``-Infinity`` (RFC 8259 forbids them).  ``json.loads`` then accepts
+        # them back, so a payload like ``{"confidence": float("nan")}`` round-
+        # trips with NaN intact and silently bypasses every downstream
+        # ``if x > 0.5`` gate (``NaN > anything`` is always False).  Force
+        # ``allow_nan=False`` to raise on non-finite floats and let the
+        # caller see ``None``, symmetric with ``output_validation._coerce``'s
+        # finite-only contract.
+        return json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False))
+    except (TypeError, ValueError):
+        return None
     except Exception:
         return None
 

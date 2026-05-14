@@ -380,9 +380,16 @@ def _load_returns_from_run_dir(run_dir: str, lookback: int) -> List[float]:
                             except (ValueError, TypeError):
                                 pass
                 if len(values) >= 2:
+                    # v1.1.2 (sixth-pass H-1): tighten ``> 0`` to ``> 1e-14`` per
+                    # CLAUDE.md § 9.3 so IEEE 754 subnormals (e.g. 5e-324) cannot
+                    # explode through the division and poison every component-VaR
+                    # / CVaR computation downstream.  ``else 0.0`` is preserved
+                    # (rather than ``float("nan")``) because component-VaR's
+                    # covariance step is not NaN-aware and switching would
+                    # require a coordinated downstream refactor.
                     returns = [
                         (values[i] - values[i - 1]) / values[i - 1]
-                        if values[i - 1] > 0
+                        if values[i - 1] > 1e-14
                         and math.isfinite(values[i - 1])
                         and math.isfinite(values[i])
                         else 0.0
@@ -410,9 +417,10 @@ def _load_returns_from_run_dir(run_dir: str, lookback: int) -> List[float]:
                                 except (ValueError, TypeError):
                                     continue
                 if len(values) >= 2:
+                    # v1.1.2 (sixth-pass H-1): see JSON-branch comment above.
                     returns = [
                         (values[i] - values[i - 1]) / values[i - 1]
-                        if values[i - 1] > 0
+                        if values[i - 1] > 1e-14
                         and math.isfinite(values[i - 1])
                         and math.isfinite(values[i])
                         else 0.0

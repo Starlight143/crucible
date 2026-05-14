@@ -224,7 +224,15 @@ class TestApiSetEndpointHotReload(unittest.TestCase):
     def test_save_env_failure_does_not_mutate_os_environ(self):
         """If ``_save_env`` raises, the response must be a 500 and
         ``os.environ`` must remain untouched — process state must never
-        run ahead of disk."""
+        run ahead of disk.
+
+        v1.1.2 (audit fix G7-C-HIGH-1): the 500 response no longer
+        embeds the raw exception message (``"disk full"`` etc.) because
+        SQLite / OSError / URLError messages can leak filesystem paths
+        and internal hostnames.  We now check for the generic
+        ``"internal error"`` body + a non-empty ``log_id`` so the
+        operator can correlate to the WebUI log for the redacted detail.
+        """
         os.environ.pop("CRUCIBLE_TEST_FAIL_KEY", None)
         with mock.patch.object(webui_app, "_save_env", side_effect=OSError("disk full")):
             r = self.client.post(
@@ -232,7 +240,13 @@ class TestApiSetEndpointHotReload(unittest.TestCase):
                 json={"CRUCIBLE_TEST_FAIL_KEY": "should-not-leak"},
             )
         self.assertEqual(r.status_code, 500)
-        self.assertIn("disk full", r.get_json()["error"])
+        body = r.get_json()
+        self.assertEqual(body.get("error"), "internal error")
+        # Must NOT leak the raw exception message.
+        self.assertNotIn("disk full", body.get("error", ""))
+        self.assertNotIn("disk full", body.get("detail", ""))
+        # log_id must be present and non-empty for operator correlation.
+        self.assertTrue(body.get("log_id"))
         # The hot-reload hook never fired because we returned early on the
         # exception path.
         self.assertNotIn("CRUCIBLE_TEST_FAIL_KEY", os.environ)

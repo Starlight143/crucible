@@ -176,9 +176,20 @@ function setLanguage(lang, opts) {
   // Persist to .env unless caller said this is the initial sync (which already
   // came FROM .env and would just write the same value back).
   if (!opts || opts.persist !== false) {
+    // v1.1.2 (audit fix G7-C-MED-12): explicit ``X-Requested-With``
+    // header on the language-toggle save so the wire format mirrors
+    // what backends expect even without the same-origin fetch shim.
+    // The shim still injects it for /api/* paths but pinning it
+    // explicitly here protects against a future regression where an
+    // early-load script uses native XHR or a polyfill that bypasses
+    // the shim — without the explicit header that script would
+    // silently 403 with no UI signal.
     fetch('/api/env', {
       method:  'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: {
+        'Content-Type': 'application/json',
+        'X-Requested-With': 'XMLHttpRequest',
+      },
       body:    JSON.stringify({ [LANG_ENV_KEY]: lang }),
     }).catch(() => { /* non-fatal — localStorage still has it */ });
   }
@@ -376,9 +387,14 @@ const FLAG_GROUPS = [
   { id:'stage_models', title:'Per-Stage Model Overrides', icon:'🎛️', open:false,
     flags:[],
     inputs:[
-      { key:'librarian_model',       label:'Librarian Model',       ph:'(default from .env)', kind:'text', modes:'b', types:[1,2,3,4], tip:'Override OPENROUTER_LIBRARIAN_MODEL / provider librarian model for this run only. Sent as --librarian-model flag.' },
-      { key:'primary_model',         label:'Analysis Model',        ph:'(default from .env)', kind:'text', modes:'b', types:[1,2,3,4], tip:'Override the primary analysis model for this run only. Sent as --primary-model flag.' },
-      { key:'direction_judge_model', label:'Direction Judge Model', ph:'(default from .env)', kind:'text', modes:'b', types:[1,2,3,4], tip:'Override the direction judge model for this run only. Sent as --direction-judge-model flag.' },
+      // v1.1.2 (audit fix G7-C-HIGH-3): convert tip strings to bilingual
+      // {en, zh} objects so Chinese-mode operators see Chinese tooltips for
+      // these three stage-model overrides.  CLAUDE.md § 10's bilingual
+      // invariant for KEY_META extends to FLAG_GROUPS.inputs[*].tip and
+      // FLAG_GROUPS.selects[*].tip; getDesc() in app.js handles both forms.
+      { key:'librarian_model',       label:'Librarian Model',       ph:'(default from .env)', kind:'text', modes:'b', types:[1,2,3,4], tip:{en:'Override OPENROUTER_LIBRARIAN_MODEL / provider librarian model for this run only. Sent as --librarian-model flag.', zh:'僅此次執行覆寫 OPENROUTER_LIBRARIAN_MODEL（或對應 provider 的 librarian model）。會以 --librarian-model 旗標傳入子程序。'} },
+      { key:'primary_model',         label:'Analysis Model',        ph:'(default from .env)', kind:'text', modes:'b', types:[1,2,3,4], tip:{en:'Override the primary analysis model for this run only. Sent as --primary-model flag.', zh:'僅此次執行覆寫主要分析模型。會以 --primary-model 旗標傳入子程序。'} },
+      { key:'direction_judge_model', label:'Direction Judge Model', ph:'(default from .env)', kind:'text', modes:'b', types:[1,2,3,4], tip:{en:'Override the direction judge model for this run only. Sent as --direction-judge-model flag.', zh:'僅此次執行覆寫 direction judge 模型。會以 --direction-judge-model 旗標傳入子程序。'} },
     ]},
   { id:'diff',      title:'Diff & Version Control', icon:'🔀', open:false,
     flags:['diff_aware'],

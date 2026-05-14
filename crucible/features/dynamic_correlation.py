@@ -562,7 +562,10 @@ def _align_return_series(
 ) -> Tuple[List[str], Dict[str, List[float]]]:
     """
     Align multiple (timestamp, return) series on a common sorted timestamp set.
-    Missing returns are filled with 0.0.
+    Missing returns are filled with ``float("nan")`` so that pairwise Pearson r
+    in ``_pearson_r`` (already NaN-aware per v1.1.0 fifth-pass G-9) can skip
+    the missing observation rather than treating it as a correlated flat-day
+    zero return.
     Returns (common_timestamps, aligned_return_dict).
     """
     all_ts: set = set()
@@ -575,9 +578,16 @@ def _align_return_series(
     sorted_ts = sorted(all_ts)
     aligned: Dict[str, List[float]] = {}
 
+    # v1.1.2 (sixth-pass H-1): substitute ``float("nan")`` (was ``0.0``) for
+    # missing observations.  A multi-asset universe with sparse overlap
+    # (asset A trades Mon-Fri, asset B trades 24/7) would otherwise see a
+    # string of correlated zeros across all assets — inflating
+    # ``avg_correlation``, deflating ``diversification_score`` and biasing
+    # every PCA component.  ``_pearson_r`` (line 120) already strips NaN
+    # pairs, so the producer side is the only correctness gap.
     for label, (ts_list, returns) in raw.items():
         ts_map: Dict[str, float] = dict(zip(ts_list, returns))
-        aligned[label] = [ts_map.get(ts, 0.0) for ts in sorted_ts]
+        aligned[label] = [ts_map.get(ts, float("nan")) for ts in sorted_ts]
 
     return sorted_ts, aligned
 

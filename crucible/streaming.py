@@ -150,7 +150,15 @@ def stream_crew(
             result_q.put(("done", res))
         except OperationCancelledError as exc:
             result_q.put(("cancelled", exc))
-        except BaseException as exc:
+        # v1.1.2 (sixth-pass H-8): ``SystemExit`` and ``KeyboardInterrupt`` are
+        # ``BaseException`` subclasses; the previous catch-all would have
+        # serialised them onto the result queue as "error" chunks, hiding the
+        # operator's intent.  Re-raise them inside the worker thread so the
+        # main thread's own signal handler (or atexit) sees them, and the
+        # generator times out normally rather than misclassifying.
+        except (SystemExit, KeyboardInterrupt):
+            raise
+        except Exception as exc:
             result_q.put(("error", exc))
 
     thread = threading.Thread(

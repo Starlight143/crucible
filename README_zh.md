@@ -346,7 +346,7 @@ python run_crucible_enhanced.py run \
 ## 驗證與測試
 
 ```bash
-# 全量 pytest（1747 項測試）
+# 全量 pytest（測試數請見 CHANGELOG.md）
 python -m pytest tests -q -p no:cacheprovider
 
 # Smoke test
@@ -416,7 +416,7 @@ crucible/
 ├── webui/
 │   ├── app.py                      # Flask backend + REST API
 │   └── templates/index.html        # 前端 SPA
-└── tests/                          # 1747 項測試
+└── tests/                          # 完整測試套件（測試數請見 CHANGELOG.md）
 ```
 
 各基礎設施模組、功能模組與 pipeline section 的詳細說明，見 [ARCHITECTURE.md](ARCHITECTURE.md)。

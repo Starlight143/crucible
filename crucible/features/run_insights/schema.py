@@ -492,6 +492,35 @@ def canonical_json(event: Mapping[str, Any]) -> bytes:
     ).encode("utf-8")
 
 
+def canonical_record_line(event: Mapping[str, Any]) -> bytes:
+    """Return the canonical-form JSONL line for *event*, **including**
+    ``content_id`` (UTF-8 bytes; trailing newline NOT included).
+
+    v1.1.2 (audit fix G2-B-MED-2): companion helper to :func:`canonical_json`
+    used by :meth:`backends.LocalJSONLBackend.write_event` so the on-disk
+    JSONL form IS the canonical form.  The Cloudflare Worker (v1.2.0
+    DualWriteBackend target) can byte-copy disk lines to R2 and verify
+    content_id directly — strip the ``content_id`` key from the parsed line
+    and re-canonicalise the rest; the result matches :func:`canonical_json`
+    output for the same record.
+
+    Differs from :func:`canonical_json` only in that ``content_id`` is
+    preserved, so the on-disk row stays self-describing (reader code can
+    read content_id without recomputing).  Every other rule (sorted keys,
+    V8 float repr, NaN→null) is identical, so the disk row sorted-and-
+    stripped equals the canonical_json bytes for the same event.
+    """
+    normalised = _normalise_for_canonical(dict(event))
+    return json.dumps(
+        normalised,
+        cls=_V8FloatJSONEncoder,
+        sort_keys=True,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode("utf-8")
+
+
 def compute_content_id(event: Mapping[str, Any]) -> str:
     """Return ``"sha256:<hex>"`` content-addressable ID for *event*.
 

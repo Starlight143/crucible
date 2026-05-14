@@ -64,8 +64,17 @@ def set_run_id(run_id: Optional[str] = None) -> str:
     -------
     This does NOT return a reset token, so the change persists for the rest
     of the current context.  Prefer ``run_context()`` for scoped usage.
+
+    Notes
+    -----
+    v1.1.2 (audit fix G1-2): inputs are ``.strip()``-ed before the truthiness
+    check, so whitespace-only strings (e.g. ``"   "`` from a misconfigured
+    CI / Settings UI / blank-padded env value) trigger the fresh-UUID
+    fallback rather than silently pinning a three-space run_id that fails to
+    match the WebUI's ``_runs[run_id]`` dict.
     """
-    rid = run_id or str(uuid.uuid4())
+    candidate = (run_id or "").strip() if isinstance(run_id, str) else (run_id or "")
+    rid = candidate or str(uuid.uuid4())
     _RUN_ID.set(rid)
     update_log_context(run_id=rid)
     return rid
@@ -91,8 +100,15 @@ def run_context(run_id: Optional[str] = None) -> Iterator[str]:
 
         with run_context() as rid:
             emit("pipeline.started", payload={"run_id": rid})
+
+    Notes
+    -----
+    v1.1.2 (audit fix G1-2): mirrors ``set_run_id``'s whitespace-stripping
+    so a blank-padded explicit ``run_id`` is treated as "unset" and a fresh
+    UUID is generated instead.
     """
-    rid = run_id or str(uuid.uuid4())
+    candidate = (run_id or "").strip() if isinstance(run_id, str) else (run_id or "")
+    rid = candidate or str(uuid.uuid4())
     token = _RUN_ID.set(rid)
     update_log_context(run_id=rid)
     try:

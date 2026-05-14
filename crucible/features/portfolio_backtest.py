@@ -300,11 +300,13 @@ def _daily_returns(equity: List[float]) -> List[float]:
     """Compute simple period-over-period returns from an equity series."""
     if len(equity) < 2:
         return []
-    # Use `> 0 and isfinite` rather than `!= 0.0`: NaN passes `!= 0` in Python
-    # and would produce NaN returns that silently corrupt Sharpe/Sortino/Calmar.
+    # v1.1.2 (sixth-pass H-1): tighten the denominator floor from ``> 0.0`` to
+    # ``> 1e-14`` per CLAUDE.md § 9.3.  Previous threshold admitted IEEE 754
+    # subnormals; division then explodes to ~1e+300 and silently corrupts the
+    # downstream Sharpe / Sortino / Calmar statistics.
     return [
         (equity[i] - equity[i - 1]) / equity[i - 1]
-        if equity[i - 1] > 0.0
+        if equity[i - 1] > 1e-14
         and math.isfinite(equity[i - 1])
         and math.isfinite(equity[i])
         else 0.0
