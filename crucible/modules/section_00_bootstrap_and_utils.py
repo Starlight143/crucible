@@ -1567,6 +1567,29 @@ try:
             return message
 
         def on_inbound(self, message: httpx.Response) -> httpx.Response:
+            # v1.1.3 — Force-load the body before delegating to the sync
+            # capture helper.  Crewai's HTTPTransport runs ``on_inbound``
+            # with the response stream still unread; the capture helper
+            # then calls ``response.json()`` synchronously, which raises
+            # ``ResponseNotRead`` on async responses (silently swallowed
+            # by the helper's broad except).  ``read()`` is idempotent
+            # on already-loaded bodies, so this is a no-op when the
+            # stream is sync-readable and a body-loader otherwise.
+            try:
+                content_type = ""
+                headers = getattr(message, "headers", None)
+                if headers is not None:
+                    try:
+                        content_type = str(headers.get("content-type", "") or "").lower()
+                    except Exception:
+                        content_type = ""
+                if not content_type or "event-stream" not in content_type:
+                    try:
+                        message.read()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             _capture_openrouter_usage_from_http_response(message)
             return message
 
@@ -1574,6 +1597,25 @@ try:
             return message
 
         async def aon_inbound(self, message: httpx.Response) -> httpx.Response:
+            # v1.1.3 — Same body-load fix as on_inbound, but via aread()
+            # for the async transport path.  Without aread(), the body
+            # is still streamed and the sync ``response.json()`` inside
+            # the capture helper raises ResponseNotRead.
+            try:
+                content_type = ""
+                headers = getattr(message, "headers", None)
+                if headers is not None:
+                    try:
+                        content_type = str(headers.get("content-type", "") or "").lower()
+                    except Exception:
+                        content_type = ""
+                if not content_type or "event-stream" not in content_type:
+                    try:
+                        await message.aread()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             _capture_openrouter_usage_from_http_response(message)
             return message
 

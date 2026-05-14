@@ -5,6 +5,82 @@ Versioning follows [Semantic Versioning](https://semver.org/). The first public 
 
 ---
 
+## [v1.1.3] — 2026-05-15
+
+### Fixed
+- **OpenRouter `usage.cost` was silently dropped for every codegen +
+  formatter call**, leaving the run summary's
+  `cost_source="crewai_metrics_with_pricing"` (token × local-table
+  estimate) instead of the authoritative `"openrouter_api"` (actual
+  billed USD).  v1.1.1 wired
+  `inject_openrouter_usage_extra_body` at three LLM construction
+  sites — `section_02._create_openrouter_llm` (main / direction-judge
+  / librarian), `section_01._make_formatter_llm`, and
+  `section_05._make_codegen_llm` — so every request body opted into
+  `usage: {include: true}`.  But only section_02 *also* registered the
+  HTTP interceptor (`get_openrouter_http_interceptor()`) and langchain
+  callback handler (`get_openrouter_callback_handler()`) that actually
+  capture the returned `usage.cost`.  Sections 01 and 05 sent the
+  opt-in flag with no reader on the other end → response cost field
+  silently elided → fallback to local pricing table.  Codegen is the
+  single largest cost sink in a Quant run, so a missing interceptor
+  there under-reports the entire summary by a wide margin and the
+  divergence becomes glaringly visible when switching model tiers
+  (e.g. `deepseek/deepseek-v4-pro` → `-flash`: the local table's
+  `(0.14/M, 0.28/M)` estimate for v4-flash diverges from the actual
+  OpenRouter bill in a way the v4-pro `(0.55/M, 2.19/M)` row happens
+  to mask).  Section_01 and section_05 now register
+  `interceptor=` + `callbacks=[...]` inside the same
+  `if provider_tag == LLM_PROVIDER_OPENROUTER:` branch as the
+  pre-existing opt-in injection — identical wiring to section_02:2157-2163,
+  scoped so non-OpenRouter providers (Alibaba, Ollama) don't get a
+  spurious interceptor attached.  Idempotent merge into pre-existing
+  `kwargs["callbacks"]` and `kwargs["interceptor"]` (operator overrides
+  preserved).
+- **`OpenRouterUsageHTTPInterceptor.on_inbound` / `aon_inbound`
+  silently swallowed every capture attempt for unread response
+  streams.**  Both hooks delegated straight to the synchronous
+  `_capture_openrouter_usage_from_http_response`, which calls
+  `response.json()` — but crewai's `HTTPTransport` hands the
+  interceptor a `httpx.Response` whose body has NOT been read yet.
+  `response.json()` then raises `httpx.ResponseNotRead`, which the
+  capture helper's broad `except Exception: return False` swallows,
+  and OpenRouter's `usage.cost` is dropped on the floor.  Both hooks
+  now force-load the body before delegating — sync `message.read()`
+  in `on_inbound`, `await message.aread()` in `aon_inbound`.  Reads
+  are idempotent (no-op when already loaded) and skipped for
+  `content-type: text/event-stream` responses so streaming chat
+  completions are unaffected.
+
+### Validation
+- pytest: **2 605 passed, 1 skipped** (+17 over the v1.1.2 baseline of
+  2 588).  Primary new coverage is
+  `tests/test_v1_1_3_openrouter_cost_capture.py`: 6 structural pins on
+  section_01 / section_05 interceptor wiring inside the OpenRouter
+  branch, 5 behavioural pins on the body-read fix (sync + async +
+  event-stream skip + source-order check), 2 end-to-end pins driving
+  the interceptor with a realistic OpenRouter response and asserting
+  `cost_source="openrouter_api"` with exact `usage.cost`, plus the
+  token-pricing fallback when `usage.cost` is omitted upstream.
+- `crucible/smoke_test.py`: 5/5 OK.
+- `run_crucible.py --self-check`: OK.
+
+### Compatibility
+- Drop-in for v1.1.2.  No env-var defaults flipped, no public schema
+  breaks, no public API rename.  Operators with a custom
+  `_make_formatter_llm` / `_make_codegen_llm` override that passes
+  pre-built `callbacks=[...]` or `interceptor=...` are honoured —
+  v1.1.3 only appends the OpenRouter handler to an existing callback
+  list and only sets `interceptor=` when the kwarg is absent.
+- Existing pre-v1.1.3 saved projects carry `cost_source="crewai_metrics_with_pricing"`
+  or `"estimated"`; v1.1.3+ runs will start emitting `"openrouter_api"`
+  once OpenRouter responses successfully reach the interceptor.  Run
+  history with both source labels coexists; the higher priority
+  (`openrouter_api`) wins in `_summarize_cost_source` aggregation
+  whenever any record has it.
+
+---
+
 ## [v1.1.2] — 2026-05-14
 
 ### Fixed

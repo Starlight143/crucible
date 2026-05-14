@@ -105,10 +105,28 @@ def _make_formatter_llm(main_llm: Any, max_tokens: Optional[int] = None) -> Any:
         # responses.  Without this, every formatter call would emit
         # ``cost_source="estimated"`` and zero out the cost summary even
         # if the main LLM was correctly configured.
+        #
+        # v1.1.3 — Wire the HTTP interceptor + callback handler here too.
+        # Without these, the request body carries ``usage: {include: true}``
+        # but the response's ``usage.cost`` field is silently dropped on
+        # the floor (no hook reads it), and cost tracking falls back to the
+        # local pricing table → ``cost_source="crewai_metrics_with_pricing"``
+        # instead of the authoritative ``"openrouter_api"``.
         try:
             provider_tag = str(getattr(main_llm, "_quant_llm_provider", "") or "").strip().lower()
             if provider_tag == LLM_PROVIDER_OPENROUTER:
                 inject_openrouter_usage_extra_body(kwargs)
+                callback_handler = get_openrouter_callback_handler()
+                if callback_handler is not None:
+                    existing_callbacks = kwargs.get("callbacks")
+                    if isinstance(existing_callbacks, list):
+                        if callback_handler not in existing_callbacks:
+                            existing_callbacks.append(callback_handler)
+                    else:
+                        kwargs["callbacks"] = [callback_handler]
+                http_interceptor = get_openrouter_http_interceptor()
+                if http_interceptor is not None and "interceptor" not in kwargs:
+                    kwargs["interceptor"] = http_interceptor
         except Exception:
             pass
 

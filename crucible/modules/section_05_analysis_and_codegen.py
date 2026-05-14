@@ -183,10 +183,29 @@ def _make_codegen_llm(main_llm: Any) -> Any:
         # main LLM.  Codegen calls are the single largest cost sink in a
         # Quant run; without this, every codegen response loses the
         # billed-cost field and the run summary under-reports by ~70%.
+        #
+        # v1.1.3 — Wire the HTTP interceptor + callback handler here too.
+        # The opt-in flag alone is not enough: without the interceptor,
+        # ``usage.cost`` returned by OpenRouter is never captured and the
+        # final cost_source degrades to ``crewai_metrics_with_pricing``
+        # (a token×local-table estimate that diverges from the actual
+        # OpenRouter bill — especially visible after switching model tiers
+        # like deepseek-v4-pro → -flash).
         try:
             provider_tag = str(getattr(main_llm, "_quant_llm_provider", "") or "").strip().lower()
             if provider_tag == LLM_PROVIDER_OPENROUTER:
                 inject_openrouter_usage_extra_body(kwargs)
+                callback_handler = get_openrouter_callback_handler()
+                if callback_handler is not None:
+                    existing_callbacks = kwargs.get("callbacks")
+                    if isinstance(existing_callbacks, list):
+                        if callback_handler not in existing_callbacks:
+                            existing_callbacks.append(callback_handler)
+                    else:
+                        kwargs["callbacks"] = [callback_handler]
+                http_interceptor = get_openrouter_http_interceptor()
+                if http_interceptor is not None and "interceptor" not in kwargs:
+                    kwargs["interceptor"] = http_interceptor
         except Exception:
             pass
 
