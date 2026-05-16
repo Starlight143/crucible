@@ -5,6 +5,114 @@ Versioning follows [Semantic Versioning](https://semver.org/). The first public 
 
 ---
 
+## [v1.1.4] — 2026-05-16
+
+### Fixed
+- **Run Insights ledger polluted by test runs** — empirical inspection of
+  the operator's real `.crucible_insights/` ledger at v1.1.4 ship time
+  found **897 of 952 (94 %) output events were test pollution**:
+  `project_name ∈ {banner_test, Quant_analysis, agent_analysis, test,
+  phase0_validation_*, ...}` with `run_id=""`, versus only 3 real user
+  runs.  Origin: ~6 test files (`test_failure_banner.py`,
+  `test_v105_round2_extras.py`, `test_crucible_runtime.py`,
+  `test_run_registry.py`, `test_integration_stage_flow.py`,
+  `test_direction_gate_feedback.py`) exercise `save_project_output` or
+  `record_*` paths without redirecting `CRUCIBLE_RUN_INSIGHTS_DIR` to
+  `tmp_path` per CLAUDE.md § 9.5.  v1.2.0 retrieval would have seen this
+  as 897 orphaned `run_id=""` rows mixed with the actual signal — a
+  fatal signal-to-noise inversion for any avoidance-hint synthesis.
+  Closed structurally with an **autouse pytest fixture in
+  `tests/conftest.py`** that sets `CRUCIBLE_RUN_INSIGHTS_DIR` to a
+  per-test `tmp_path / "_crucible_insights"` directory and resets the
+  module-level recorder singleton so the env var takes effect on the
+  next `get_recorder()` call.  Tests that already monkeypatch the env
+  var per-test (well-isolated recorder tests) are unaffected — their
+  explicit monkeypatch overrides this autouse one cleanly.  Belt-and-
+  braces fix that doesn't require touching every test file.
+- **Crypto classifier vocabulary expansion** — v1.1.0's pattern only
+  matched explicit ticker tokens (`btc|eth|sol|...`) and CEX names
+  (`binance|bybit|okx`), so real operator inputs like
+  `cross-exchange options arbitrage` (got `asset:crypto` + spurious
+  `asset:uncategorized`) and `liquidity_mining_market_making` (got
+  `asset:uncategorized` outright) classified incorrectly.  v1.1.4
+  pattern adds: DeFi terms (`defi`/`dex`/`cex`/`amm`/`stablecoin`),
+  multi-word crypto idioms (`liquidity mining`/`liquidity pool`/
+  `yield farming`/`market making`/`market maker`/`on-chain`/
+  `off-chain`/`lp tokens`), EVM chain names (`ethereum`/`solana`/
+  `polygon`/`avalanche`/`arbitrum`/`optimism`/`base`/`polkadot`/
+  `cosmos`/`tron`/`ton`), unique-named protocols (`uniswap`/`aave`/
+  `gmx`/`dydx`/`pancakeswap`/`sushiswap`/`makerdao`/`lido`/`raydium`),
+  additional stablecoins (`usdc`/`dai`/`frax`/`lusd`/`weth`/`wbtc`),
+  and additional CEX/DEX names (`kraken`/`kucoin`/`gate.io`/`bitfinex`/
+  `htx`).  `curve` / `compound` / `jupiter` are intentionally
+  **excluded** because they collide with English / finance vocabulary
+  (`yield curve` / `compound interest` / planet Jupiter); operators
+  mentioning these protocols typically include other unique DeFi
+  context tokens that still trigger `crypto` correctly.  Gold / forex /
+  equity / bonds / oil / futures classifications unchanged.
+- **Instrument matcher word boundaries + `instrument:options` added** —
+  v1.1.0's substring match `"perp" in text` misfired on
+  `"perpendicular"` / `"perpetually"`, and `"spot" in text` on
+  `"spotify"` / `"spotlight"`.  v1.1.4 uses `\b`-anchored regex so only
+  the intended tokens trigger.  Adds `instrument:options` (was missing
+  entirely — direction-debate emits for `cross_exchange_options_*`
+  strategies previously left the instrument facet blank or got an
+  unrelated `instrument:perpetual` from a stray substring match).
+  Priority order **options > perpetual > futures > spot** so that at
+  most one `instrument:*` tag emits per event — eliminating the
+  co-occurrence noise (`asset:crypto` + `asset:uncategorized` for the
+  same run) observed in real ledger records.
+- **One-shot orphan-pruning maintenance helper** — new module
+  `crucible.features.run_insights.maintenance` exports
+  `prune_orphan_events(root=".crucible_insights", dry_run=False)`.
+  Walks every JSONL stream, drops events with empty / whitespace
+  `run_id`, rewrites each file atomically via `tempfile.mkstemp` →
+  `os.replace`.  Per-stream sidecar lock acquired so a concurrent
+  writer cannot interleave a half-line during the rewrite.
+  Idempotent: second invocation reports zero removals.  `dry_run=True`
+  reports counts without writing.  Skips the `blobs/` subdirectory —
+  blob GC is a separate concern handled by the v1.1.0
+  `_cleanup_orphan_tempfiles` path.  Local ledger cleanup applied at
+  v1.1.4 ship time: 1690 of 1696 polluted output + params events
+  removed, all 6 debate events and 3 real-run output / params events
+  preserved.
+
+### Validation
+- pytest: **2 635 passed, 1 skipped** (+30 over the v1.1.3 baseline of
+  2 605).  Primary new coverage is
+  `tests/test_v1_1_4_classifier_and_isolation.py` (26 tests across
+  four classes): `TestCryptoVocabExpansion` (9 — DeFi / market-making /
+  liquidity-mining / chain-name / unambiguous-protocol classification
+  + the "non-crypto inputs still classify correctly" regression guard
+  + the `yield curve → bonds` disambiguation pin),
+  `TestInstrumentDisambiguation` (8 — options / call / put / CJK
+  options / word-bounded perp + spot / priority order + end-to-end
+  through `extract_signals`), `TestConftestLedgerIsolation` (2 — env
+  var points at a per-test tmp_path under pytest's tmp root +
+  structural pin that conftest.py defines the autouse fixture),
+  `TestPruneOrphanEvents` (5 — orphan removed / real preserved /
+  idempotent / dry-run no-op / whitespace-only run_id treated as
+  orphan / missing root → empty summary).
+- `crucible/smoke_test.py`: 5/5 OK.
+- `run_crucible.py --self-check`: OK.
+
+### Compatibility
+- Drop-in for v1.1.3.  No env-var defaults flipped, no public schema
+  breaks, no public API rename.
+- The classifier vocabulary expansion is additive: every operator
+  input that classified to a non-`uncategorized` category at v1.1.3
+  classifies to the same category at v1.1.4.  Some inputs that
+  previously fell to `uncategorized` will now classify to `crypto`
+  (intended).
+- Existing ledger files predating v1.1.4 with `run_id=""` orphan rows
+  remain on disk until `maintenance.prune_orphan_events()` is invoked.
+  The autouse conftest fixture only prevents *new* test pollution.
+  Operators wishing to clean their existing ledger should run:
+  `python -c "from crucible.features.run_insights.maintenance import
+  prune_orphan_events; print(prune_orphan_events('.crucible_insights'))"`.
+
+---
+
 ## [v1.1.3] — 2026-05-15
 
 ### Fixed

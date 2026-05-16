@@ -108,10 +108,54 @@ _ASSET_PATTERNS: List[tuple[str, re.Pattern[str]]] = [
     ("gold",     re.compile(r"\b(gold|xau(usd)?|黃金|黄金)\b", re.IGNORECASE)),
     ("silver",   re.compile(r"\b(silver|xag(usd)?|白銀|白银)\b", re.IGNORECASE)),
     ("oil",      re.compile(r"\b(crude.?oil|brent|wti|原油)\b", re.IGNORECASE)),
+    # v1.1.4 — Extended crypto vocabulary.  v1.1.0's pattern only matched
+    # explicit ticker tokens (btc/eth/...) and CEX names (binance/...), so
+    # real operator inputs like "cross-exchange options arbitrage" or
+    # "liquidity mining market-making" silently fell to ``uncategorized``.
+    # Additions (lowercase, word-bounded for ASCII; loose match for CJK):
+    #   * DeFi/AMM terms: defi, dex, cex, amm, liquidity (mining|pool),
+    #     yield farm(ing), staking, lp.tokens, market.making, market.maker
+    #   * On/off-chain: on-chain, off-chain, blockchain, wallet
+    #   * Chain names: ethereum, solana, polygon, avalanche, bsc, arbitrum,
+    #     optimism, base, polkadot, cosmos, near, tron, ton
+    #   * Protocol mentions: uniswap, aave, gmx, dydx, pancakeswap,
+    #     sushiswap, makerdao, lido, raydium.  Intentionally excluded
+    #     because they collide with common English / finance vocabulary:
+    #     - ``curve`` ("yield curve" is a bonds term)
+    #     - ``compound`` ("compound interest" / "compound annual return")
+    #     - ``jupiter`` (planet / NASA mission / generic name).
+    #     Operators mentioning these protocols typically include other
+    #     DeFi context tokens (uniswap, aave, AMM, DEX, etc.) which still
+    #     trigger ``crypto`` correctly.
+    #   * Stablecoins beyond usdt: usdc, dai, frax, lusd, weth, wbtc
+    #   * Additional CEX/DEX: kraken, kucoin, gate.io, bitfinex, htx
+    # Patterns must NOT match inside unrelated words (perp inside
+    # "perpendicular" was a v1.1.0 footgun closed in v1.1.4 by the
+    # ``(?<![A-Za-z0-9])...(?![A-Za-z0-9])`` outer guard preserved here).
     ("crypto",   re.compile(
         r"(?<![A-Za-z0-9])"
-        r"(?:btc|eth|sol|xrp|ada|doge|crypto|perp(?:etual)?|binance|"
-        r"bybit|okx|加密|币|幣|usdt|busd)"
+        r"(?:"
+        r"btc|eth|sol|xrp|ada|doge|crypto|perp(?:etual)?|"
+        r"binance|bybit|okx|kraken|kucoin|bitfinex|htx|gate\.io|"
+        r"加密|币|幣|usdt|usdc|busd|dai|frax|lusd|weth|wbtc|"
+        r"defi|dex|cex|amm|stablecoin|"
+        r"ethereum|solana|polygon|avalanche|avax|bsc|arbitrum|optimism|"
+        r"polkadot|cosmos|tron|ton|"
+        r"uniswap|aave|gmx|dydx|pancakeswap|sushiswap|"
+        r"makerdao|lido|raydium|"
+        r"blockchain|wallet"
+        r")"
+        r"(?![A-Za-z0-9])"
+        r"|"
+        # Multi-word crypto phrases (word boundary on outer edges only;
+        # internal whitespace / hyphen tolerated to match operator spelling
+        # variants like "liquidity-mining", "market making", "yield farm").
+        r"(?<![A-Za-z0-9])"
+        r"(?:liquidity[\s\-]?(?:mining|pool)|"
+        r"yield[\s\-]?farm(?:ing)?|"
+        r"market[\s\-]?mak(?:er|ing)|"
+        r"(?:on|off)[\s\-]?chain|"
+        r"lp[\s\-]?token(?:s)?)"
         r"(?![A-Za-z0-9])",
         re.IGNORECASE,
     )),
@@ -203,12 +247,39 @@ def _framework_signals(text: str) -> List[str]:
 
 
 def _instrument_signals(text: str) -> List[str]:
+    """Return at most one ``instrument:*`` tag identifying the trading
+    primitive the user is working with.
+
+    v1.1.4 — Three fixes over v1.1.0:
+
+    * **Word boundaries.**  The original substring-match (``"perp" in t``)
+      misfired on ``"perpendicular"``, ``"perpetually"``, and ``"spot"``
+      inside ``"spotify"`` / ``"spotlight"``.  Switched to ``\\b``-anchored
+      regex so only the intended tokens trigger.
+    * **Added ``instrument:options``.**  Direction-debate emits for
+      strategies like ``cross_exchange_options_arbitrage`` previously
+      missed this tag entirely while still picking up the ASSET-level
+      ``options`` category via ``_ASSET_PATTERNS`` — leaving the instrument
+      facet blank or, worse, picking up an unrelated ``perpetual`` from
+      another word in the user_problem.
+    * **Priority order.**  ``options`` is now the most specific instrument
+      (a call/put on perp / spot / future is still an option-shaped
+      payoff), then ``perpetual`` (most common in crypto), then ``futures``
+      (CME-style), then ``spot`` (catch-all).  Only one tag emits per
+      event, so co-occurrence noise that polluted v1.1.0 records is
+      eliminated.
+    """
     out: List[str] = []
     t = text.lower()
-    if "perpetual" in t or "perp" in t: out.append("instrument:perpetual")
-    elif "spot" in t:                    out.append("instrument:spot")
-    elif "futures" in t or "期貨" in text or "期货" in text:
+    if re.search(r"\boption(?:s)?\b", t) or re.search(r"\b(?:call|put)\b", t) \
+            or "選擇權" in text or "选择权" in text:
+        out.append("instrument:options")
+    elif re.search(r"\bperp(?:s|etual(?:s)?)?\b", t):
+        out.append("instrument:perpetual")
+    elif re.search(r"\bfutures?\b", t) or "期貨" in text or "期货" in text:
         out.append("instrument:futures")
+    elif re.search(r"\bspot\b", t):
+        out.append("instrument:spot")
     return out
 
 
