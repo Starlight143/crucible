@@ -582,7 +582,24 @@ def _save_env(data: dict[str, str]) -> None:
     """
     Write key/value pairs back to .env, preserving comments from .env.example.
     Uses an atomic temp-file + os.replace pattern to avoid corruption on failure.
+
+    v1.1.6 fix: the front-end ``saveSettings`` flow (since v1.1.0) only POSTs
+    keys whose input value differs from the page-render baseline — so ``data``
+    is the *dirty* subset, not the full env state.  The previous loop body
+    treated "key not in data" as "use the .env.example raw line", which
+    silently reset every untouched key (including real API keys) to its
+    template default whenever the operator saved an unrelated setting.
+
+    Fix: load the current ``.env`` first and merge ``data`` over it; then
+    iterate the template against the *merged* dict.  Unchanged keys now
+    resolve to their on-disk value, dirty keys resolve to the POSTed value,
+    and keys present only in ``.env`` (not in the template — operator-only
+    overrides) are appended after the template body instead of being dropped.
+    All four cases are pinned by ``tests/test_webui_env_save_preserves_unchanged.py``.
     """
+    current = _load_env() if ENV_FILE.exists() else {}
+    merged: dict[str, str] = {**current, **data}
+
     template = ENV_EXAMPLE if ENV_EXAMPLE.exists() else None
     if template:
         out_lines: list[str] = []
@@ -594,17 +611,20 @@ def _save_env(data: dict[str, str]) -> None:
                 continue
             if "=" in stripped:
                 k = stripped.partition("=")[0].strip()
-                if k in data:
-                    out_lines.append(f"{k}={_quote_env_value(data[k])}")
+                if k in merged:
+                    out_lines.append(f"{k}={_quote_env_value(merged[k])}")
                     written.add(k)
                 else:
+                    # Key is commented-out or otherwise absent from both
+                    # current .env and the POST payload — leave the raw
+                    # template line untouched.
                     out_lines.append(raw)
-        for k, v in data.items():
+        for k, v in merged.items():
             if k not in written:
                 out_lines.append(f"{k}={_quote_env_value(v)}")
         content = "\n".join(out_lines) + "\n"
     else:
-        content = "\n".join(f"{k}={_quote_env_value(v)}" for k, v in data.items()) + "\n"
+        content = "\n".join(f"{k}={_quote_env_value(v)}" for k, v in merged.items()) + "\n"
 
     # Atomic write: write to sibling temp file then rename
     env_dir = ENV_FILE.parent

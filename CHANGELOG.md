@@ -5,6 +5,69 @@ Versioning follows [Semantic Versioning](https://semver.org/). The first public 
 
 ---
 
+## [v1.1.6] — 2026-05-19
+
+### Fixed
+- **`webui.app._save_env` silently reset every untouched key to its
+  `.env.example` default on every Settings save** — high-impact data-
+  loss bug that wiped operator-set API keys whenever an unrelated
+  toggle was changed.  Reproducer: operator's `.env` carries
+  `OPENROUTER_API_KEY=sk-or-v1-<real>`; they open Settings, flip a
+  single boolean (e.g. `STRICT_JSON`), and click Save.  Since v1.1.0
+  the front-end `saveSettings` only POSTs the *dirty* subset of keys
+  (it explicitly stopped sending the full snapshot to avoid the
+  separate "empty input persists `KEY=""`" bug at
+  `webui/static/js/app.js:3231`), so the payload contains only
+  `{"STRICT_JSON":"0"}`.  The previous `_save_env` body iterated
+  `.env.example` and treated "key not in POST payload" as "emit the
+  raw template line" — which for `OPENROUTER_API_KEY` is the
+  documentation placeholder `sk-or-v1-xxxxxxxxxxxxxxxxxxxx`.  Net
+  effect: the real OpenRouter key was overwritten by the placeholder
+  on every Save, forcing the operator to re-paste it after every
+  unrelated edit.  Same failure mode applied to every other key
+  documented in `.env.example` (Alibaba key, OpenAI key, model
+  overrides, budget thresholds, etc.).  **Git push had nothing to do
+  with this** — `.env` is gitignored and has never been part of any
+  commit; the timing correlation was incidental (operators tend to
+  visit Settings before / after a release).  Fix loads the current
+  `.env` via the existing `_load_env()` helper at the top of
+  `_save_env`, builds `merged = {**current, **data}`, and iterates
+  the template against `merged` instead of `data`.  Unchanged keys
+  now resolve to their on-disk value; dirty keys still resolve to
+  the POSTed value; keys present only in `.env` (operator-only
+  overrides not declared in the template) are appended after the
+  template body instead of being dropped on the floor.  The
+  fallback branch for "template file missing" also operates on
+  `merged` so a deleted `.env.example` no longer nukes the operator's
+  existing values.
+
+### Validation
+- pytest: new `tests/test_webui_env_save_preserves_unchanged.py`
+  (8 tests across the four scenarios + a comment-preservation pin
+  + a `inspect.getsource()` structural pin that the
+  `_load_env()` + `merged` construction stays in `_save_env`).
+  All 8 pass; the unchanged-key preservation test fails loudly on
+  the pre-v1.1.6 code path, confirming the regression guard.
+- `tests/test_v1_1_2_audit_fixes.py::test_pyproject_version_matches_package_version`
+  + `test_pyproject_version_is_at_least_1_1_2` both pass: `pyproject.toml`
+  and `crucible.__version__` updated in lock-step to `"1.1.6"`.
+- `crucible/smoke_test.py`: 5/5 OK.
+
+### Compatibility
+- Drop-in for v1.1.5.  Pure bug fix — no env-var defaults flipped,
+  no public schema breaks, no public API rename, no CLI flag change.
+- Operators who previously saved Settings on v1.1.0 – v1.1.5 and lost
+  their API keys will need to re-paste those keys once on v1.1.6;
+  every subsequent Save will preserve them correctly.  No migration
+  script — the bug is on the *write* path, not the *read* path, so
+  there is nothing on disk to migrate.
+- Keys that exist in `.env` but not in `.env.example` (operator-only
+  overrides — common for internal `CRUCIBLE_*` debug knobs) are now
+  preserved on Save where previously they could be silently dropped
+  if the POST payload didn't carry them.  This is additive.
+
+---
+
 ## [v1.1.5] — 2026-05-19
 
 ### Added
