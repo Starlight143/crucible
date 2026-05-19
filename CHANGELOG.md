@@ -5,6 +5,40 @@ Versioning follows [Semantic Versioning](https://semver.org/). The first public 
 
 ---
 
+## [v1.1.7] — 2026-05-19
+
+### Changed
+- **Short README rewritten for new-user onboarding** — `README.md`
+  and `README_zh.md` restructured around a 5-question decision path
+  (what is it / what for / how to start / how it works / can I trust
+  the output).  Length cut from 344 → 162 lines (EN) and
+  448 → 162 lines (ZH).  Adds three status badges (License / Python
+  / test count), a 4-role grid (Quant / SaaS / Scientist / Agent),
+  and replaces the ASCII pipeline diagram with a mermaid LR flow
+  that renders natively in the GitHub README preview.  The WebUI
+  launch path is now the recommended first step; CLI flag reference
+  and Gunicorn deployment fold into `<details>` blocks.  Long
+  content (full mode descriptions, every CLI flag, stage-by-stage
+  details) stays in `README_FULL.md` / `README_FULL_zh.md`; the EN
+  and ZH short variants remain structurally aligned section for
+  section.  No code or config touched; `README_FULL.md`,
+  `README_FULL_zh.md`, and `Crucible.png` are unchanged.
+
+### Validation
+- `pyproject.toml` and `crucible.__version__` bumped to `"1.1.7"`
+  in lock-step so `test_pyproject_version_matches_package_version`
+  stays green.
+- Docs-only release — pytest / smoke / self-check intentionally
+  skipped (only `README.md`, `README_zh.md`, and the version pin
+  files were touched).
+
+### Compatibility
+- Drop-in for v1.1.6.  Pure documentation change — no Python source
+  touched, no env-var defaults flipped, no public schema breaks, no
+  public API rename, no CLI flag change.
+
+---
+
 ## [v1.1.6] — 2026-05-19
 
 ### Fixed
