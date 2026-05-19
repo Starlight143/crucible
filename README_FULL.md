@@ -1,5 +1,14 @@
 # Crucible — Detailed User Manual
 
+<p align="center">
+  <img src="Crucible.png" alt="Crucible" width="640">
+</p>
+
+**Languages / 語言:** **English (current)** · [中文完整手冊](README_FULL_zh.md)
+**Short version / 簡短版本:** [Short English README](README.md) · [簡短中文 README](README_zh.md)
+
+---
+
 **An AI-native multi-agent research engine that turns investment research, SaaS product analysis, agent architecture evaluation, and academic paper reproduction into repeatable, auditable, quality-gated multi-stage workflows.**
 
 > This is the **detailed user manual**. For a high-level overview see [README.md](README.md). For internal architecture see [ARCHITECTURE.md](ARCHITECTURE.md). For version history see [CHANGELOG.md](CHANGELOG.md).

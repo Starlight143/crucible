@@ -1,5 +1,14 @@
 # Crucible — 詳細使用手冊
 
+<p align="center">
+  <img src="Crucible.png" alt="Crucible" width="640">
+</p>
+
+**語言 / Languages:** **中文（目前頁面）** · [Full English manual](README_FULL.md)
+**簡短版本 / Short version:** [簡短中文 README](README_zh.md) · [Short English README](README.md)
+
+---
+
 **AI 原生多代理研究引擎 — 將投資研究、SaaS 產品分析、Agent 架構評估與學術論文實踐分解為可重複、可審計、帶風險閘門的多階段流程。**
 
 > 這是 **詳細使用手冊**。高階概覽請見 [README.md](README.md)。內部架構請見 [ARCHITECTURE.md](ARCHITECTURE.md)。版本歷史請見 [CHANGELOG.md](CHANGELOG.md)。

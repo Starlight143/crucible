@@ -28,7 +28,7 @@ from .runtime_api import get_runtime
 # ``crucible.__version__`` without an extra ``importlib.metadata`` round-trip.
 # Keep both in sync on every release; the regression test in
 # ``tests/test_v1_1_2_audit_fixes.py`` pins them to be equal.
-__version__ = "1.1.4"
+__version__ = "1.1.5"
 
 __all__ = [
     # NOTE: ``__version__`` is intentionally NOT in __all__.  The

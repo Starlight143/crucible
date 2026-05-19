@@ -5,6 +5,44 @@ Versioning follows [Semantic Versioning](https://semver.org/). The first public 
 
 ---
 
+## [v1.1.5] — 2026-05-19
+
+### Added
+- **README cross-document navigation + project banner image** — the four
+  user-facing README variants (`README.md`, `README_zh.md`,
+  `README_FULL.md`, `README_FULL_zh.md`) now carry a centred
+  `Crucible.png` banner at the top followed by a two-line language /
+  manual switcher.  Each variant marks its own page as
+  "current / 目前頁面" (bold, non-clickable) and links the remaining
+  three with descriptive labels: short variants offer `English` ↔ `中文`
+  plus jumps to either full manual; long variants offer the matching
+  full-manual language switch plus jumps back to either short README.
+  Image is referenced via a repo-relative path so GitHub renders it
+  inline on every README page without an external host or a release
+  asset upload.  Layout uses HTML `<p align="center">` so the banner
+  centres in the GitHub-rendered view; markdown body remains the
+  single source of truth.
+
+### Validation
+- Existing pytest suite unaffected — the regression test in
+  `tests/test_v1_1_2_audit_fixes.py::test_no_readme_has_stale_1747_test_count`
+  still passes against all four updated READMEs (the navigation
+  preamble adds no test-count claims that could go stale).
+- `tests/test_v1_1_2_audit_fixes.py::test_pyproject_version_matches_package_version`
+  + `test_pyproject_version_is_at_least_1_1_2` both pass: `pyproject.toml`
+  and `crucible.__version__` updated in lock-step to `"1.1.5"`.
+
+### Compatibility
+- Drop-in for v1.1.4.  Pure documentation / packaging change — no
+  Python source touched, no env-var defaults flipped, no public
+  schema breaks, no public API rename.
+- `Crucible.png` already lives at the repo root and is tracked by git;
+  no `.gitattributes` / `.gitignore` adjustment needed.  Mirror
+  forks / vendored copies that omit the image will see a broken-image
+  placeholder but the textual content is unaffected.
+
+---
+
 ## [v1.1.4] — 2026-05-16
 
 ### Fixed

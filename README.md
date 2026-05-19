@@ -1,5 +1,14 @@
 # Crucible
 
+<p align="center">
+  <img src="Crucible.png" alt="Crucible" width="640">
+</p>
+
+**Languages / 語言:** **English (current)** · [中文](README_zh.md)
+**Full manuals / 完整介紹:** [Full English manual](README_FULL.md) · [完整中文手冊](README_FULL_zh.md)
+
+---
+
 **An AI-native multi-agent research engine that turns investment research, SaaS product analysis, and agent architecture evaluation into repeatable, auditable, quality-gated multi-stage workflows.**
 
 ---
