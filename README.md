@@ -7,7 +7,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/license-AGPL--3.0%20%2F%20Commercial-blue" alt="License">
   <img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python">
-  <img src="https://img.shields.io/badge/tests-2588%2B%20passing-brightgreen" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-3104%2B%20passing-brightgreen" alt="Tests">
 </p>
 
 <p align="center">

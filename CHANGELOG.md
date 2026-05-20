@@ -7,373 +7,203 @@ Versioning follows [Semantic Versioning](https://semver.org/). The first public 
 
 ## [v1.1.8] — 2026-05-20
 
+Two-theme release: Direction Debate Audit Mode (the per-specialist
+disagreement log Mira Chen's v1.1.7 feedback identified as the gate's
+most-valuable output) plus Web Research Hardening + Direction Gate
+Tuning (resolves the "3 iterations all force-none" diagnostic and the
+DuckDuckGo / GitHub anonymous-search rate-limit problems).  Default is
+OFF for every new audit feature — pre-v1.1.7 sequential debate flow is
+preserved bit-for-bit when audit mode is disabled.
+
 ### Added
-- **Direction Debate Audit Mode** — captures the per-specialist disagreement
-  log Mira Chen's feedback on v1.1.7 design identified as the gate's most-
-  valuable output.  Eight new env keys (`CRUCIBLE_DEBATE_AUDIT_MODE`,
-  `CRUCIBLE_DEBATE_REQUIRE_STRUCTURED_FINDINGS`,
-  `CRUCIBLE_DEBATE_ISOLATION_MODE`, `CRUCIBLE_DEBATE_EXTERNAL_CRITIC`,
-  `CRUCIBLE_DEBATE_CRITIC_OVERRIDE_PROCEED`,
-  `CRUCIBLE_DEBATE_CONSENSUS_RISK_THRESHOLD`,
-  `CRUCIBLE_DEBATE_CRITIC_MAX_ATTEMPTS`,
-  `CRUCIBLE_RUN_INSIGHTS_RECORD_DEBATE_FINDING`,
-  `CRUCIBLE_RUN_INSIGHTS_RECORD_GATE_VERDICT`) gate every facet.  Default
-  is OFF — pre-v1.1.7 sequential debate flow is preserved bit-for-bit
-  when audit mode is disabled.
-- **Eight new pydantic models** in `section_03_models_and_context.py`:
-  `SpecialistFinding`, `GateVerdict`, `ConsensusRiskReport`, `Disagreement`,
-  `Concern`, `EvidenceRef`, `BranchSpec`, `AuditTrail`.  Each carries
-  pydantic `model_validator` invariants — for example `GateVerdict` enforces
-  that `KILL` requires ≥1 `failed_invariants`, `NEEDS_MORE_DATA` requires
-  ≥1 `blocking_evidence_queries`, `BRANCH` requires ≥2 `branched_paths`,
-  and `PROCEED` requires `selected_direction ∈ {A..G}`.  Because each
-  decision shape has a structurally different required-field set, the
-  model cannot silently downgrade a hard `KILL` into a vague
-  `NEEDS_MORE_DATA` by choosing the easier-to-fill field.
-- **Two new EventKind values** — `DIRECTION_DEBATE_FINDING` and
-  `DIRECTION_DEBATE_VERDICT` — share the existing `debate.jsonl` stream
-  (no new stream file).  The finding event is written once per specialist
-  (5+ per run in audit mode); the verdict event is written once per
-  direction-debate attempt with the gate's terminal decision.  Together
-  they form the v1.1.8 audit trail.
-- **`record_debate_finding()` and `record_gate_verdict()`** in
-  `crucible/features/run_insights/recorder.py`.  Both swallow backend
-  failures, use the tri-modal import pattern, route through
-  `_V8FloatJSONEncoder` for canonical_json / content_id, and respect the
-  three-tier `run_id` fallback chain.
-- **`crucible/features/direction_debate/` package** (new) with:
-  - `consensus.py` — deterministic, embedding-free
-    `compute_consensus_risk()` that computes Jaccard-based concern
-    diversity, assumption overlap, confidence variance, and a weighted
-    `groupthink_score` ∈ [0, 1].  Flags `zero_disagreement_recorded` (the
-    canonical groupthink tell), `low_diversity_high_confidence`,
-    `all_high_confidence_low_variance`,
-    `<role>_too_confident_no_concerns`, and `high_assumption_overlap`.
-  - `critic.py` — External Critic (Stage 0 sixth agent) that re-judges
-    the Judge's verdict using ONLY the raw research evidence and the
-    Judge's terminal decision token.  Critic does NOT see prior agents'
-    chain-of-thought, so it is isolated from sequential anchoring bias.
-    v1.1.8 uses the same model family as the Judge (`critic_model_family`
-    field is reserved for v1.3.0 cross-family Critics).  Parse failures
-    return `NEEDS_MORE_DATA` (never `KILL`) so a flaky LLM cannot
-    silently destroy viable directions.
-- **Five new CLI flags** in `run_crucible_enhanced.py`: `--audit-mode`,
-  `--debate-isolation {sequential,hybrid}`,
-  `--external-critic` / `--no-external-critic`, and
-  `--critic-can-override` / `--no-critic-override`.  Each translates to
-  an env override at the top of `cmd_run` before any section module
-  reads env at runtime.
-- **WebUI Settings page surfaces all eight new env keys** under a new
-  "Direction Debate Audit" group (icon ⚖️) placed adjacent to the
-  existing "Direction & Gate Control" group.  Two per-run toggles
-  (`debate_audit_mode` and `debate_external_critic`) also appear in the
-  Idea / Path mode flag panel.  Every new `KEY_META` entry is bilingual
-  `{en, zh}` per the v1.1.0 invariant; every new `FLAG_META` entry is
-  bilingual; `ENV_BACKED_FLAGS` (frontend) and
-  `_RUN_INSIGHTS_FLAG_TO_ENV` (backend) declare the same two flag → env
-  mappings in lockstep.
-- **Stage 0 contradiction detection** in
-  `section_07_selfcheck_output_main.py:main()` — when the operator sets
-  `CRUCIBLE_DEBATE_AUDIT_MODE=1` but `CRUCIBLE_RUN_INSIGHTS_ENABLED=0`,
-  the audit trail has nowhere to land; we now warn and silently force-
-  disable audit mode for this process.
+- **Direction Debate Audit Mode** — 8 new env keys
+  (`CRUCIBLE_DEBATE_AUDIT_MODE`, `_REQUIRE_STRUCTURED_FINDINGS`,
+  `_ISOLATION_MODE`, `_EXTERNAL_CRITIC`, `_CRITIC_OVERRIDE_PROCEED`,
+  `_CONSENSUS_RISK_THRESHOLD`, `_CRITIC_MAX_ATTEMPTS`, plus 2 ledger
+  toggles), 5 CLI flags (`--audit-mode`, `--debate-isolation`,
+  `--external-critic`/`--no-external-critic`,
+  `--critic-can-override`/`--no-critic-override`), and 8 new pydantic
+  models in `section_03_models_and_context.py` (`SpecialistFinding`,
+  `GateVerdict`, `ConsensusRiskReport`, `Disagreement`, `Concern`,
+  `EvidenceRef`, `BranchSpec`, `AuditTrail`).  `GateVerdict` enforces
+  per-decision required-field invariants so the model cannot silently
+  downgrade a hard `KILL` into a vague `NEEDS_MORE_DATA`.
+- **`crucible/features/direction_debate/` package** — `consensus.py`
+  computes deterministic, embedding-free Jaccard-based concern diversity
+  + assumption overlap + confidence variance + weighted
+  `groupthink_score` ∈ [0, 1].  `critic.py` adds the Stage 0 sixth
+  agent External Critic that re-judges the Judge's verdict using ONLY
+  raw evidence + the Judge's decision token (no CoT exposure → no
+  anchoring bias).  Critic parse failures fall back to
+  `NEEDS_MORE_DATA`, never `KILL`.
+- **Two audit-mode ledger event kinds** (`DIRECTION_DEBATE_FINDING`,
+  `DIRECTION_DEBATE_VERDICT`) and matching recorder methods.  Both share
+  the existing `debate.jsonl` stream so `_STREAM_FILENAMES` /
+  `_VALID_STREAMS` invariants are unchanged.
+- **Web Research Hardening** (`crucible/web_research/`):
+  - Q1: disk-persistent search cache (SQLite, per-provider TTL 12-168 h)
+    at `saved_projects/.cache/search_cache.sqlite3`; two-tier L1 memory
+    + L2 disk lookup wired into `_qcache_get` / `_qcache_set` in
+    section_04 so all providers benefit.  Cuts repeat-run HTTP cost 80 %+.
+  - Q2: per-provider adaptive cooldown that doubles on consecutive 429
+    (rate limit) or 202 (DDG bot-detection) responses, capped at 30 min.
+  - Q3: per-query-class fallback chain (general / code / academic /
+    docs) with `classify_query()` heuristic on
+    `site:` / `filetype:` / arxiv / github keywords.
+  - Q4: four new zero-auth providers — OpenAlex, Crossref, Wikipedia,
+    SearXNG.  Default `LIBRARIAN_EXTRA_PROVIDERS=openalex,crossref,wikipedia`;
+    SearXNG opt-in (public instance reliability varies).
+  - Q5: parallel multi-provider fan-out via `ThreadPoolExecutor` with
+    synchronous public API; env-gated `LIBRARIAN_ASYNC_FANOUT_ENABLED=1`
+    (default ON) with sequential fallback.
+  - Q6: cross-provider query deduplication via
+    `(normalised_query, query_class)` coverage map; ~30 % HTTP-call
+    savings on typical runs.
+  - Q7: per-provider health observability (counts for requests / 200 /
+    429 / 202 / timeouts / errors / citations / cache hits) emitted as
+    `PROVIDER_HEALTH_SUMMARY` ledger event at end-of-stage.
+  - Q8: domain authoritative-source pinning via
+    `crucible/config/domain_pins.json` (JSON, not YAML — repo doesn't
+    depend on PyYAML).  Initial pin set covers 10 domains across crypto
+    perpetuals, ethereum on-chain, tradfi metrics, tradfi market
+    structure, scientific methods, SaaS payments, SaaS auth, SaaS cloud
+    arch, and agent LLM cookbooks.  All URLs https-only (SSRF safety,
+    structurally pinned by tests).
+  - Q9: HTTP/2 + keep-alive in `http_clients._http_client()` —
+    HTTP/2 when `h2` package is installed, graceful degrade to HTTP/1.1
+    otherwise.  SSRF invariant (`follow_redirects=False` + manual
+    redirect walker) preserved under HTTP/2.
+  - Q10: bilingual query expansion for CJK queries.  Unicode-range
+    detection (no extra deps), caller-supplied translation function
+    produces English mirror when native results fall below
+    `LIBRARIAN_BILINGUAL_QUERY_THRESHOLD=3`.
+- **Three additional EventKind values + recorder methods**:
+  `PROVIDER_COOLDOWN_ENGAGED` (→ `error` stream),
+  `PROVIDER_HEALTH_SUMMARY` (→ `output` stream),
+  `DIRECTION_DEBATE_DEGRADED_PROCEED` (→ `debate` stream).  Still 4
+  stream files total (`_VALID_STREAMS` invariant unchanged).
+- **23 new env keys** in `.env.example` (Librarian Search Cache,
+  Provider Resilience, Extra Providers, Query Quality, Direction Gate
+  Tuning groups) plus the 8 audit-mode keys.  All bilingual-described
+  in WebUI `KEY_META`; 6 new Settings groups; 3 per-run flags
+  (`debate_audit_mode`, `debate_external_critic`,
+  `debate_tolerate_unverifiable_evidence`) in the Idea/Path mode flag
+  panel.  Frontend `ENV_BACKED_FLAGS` and backend
+  `_RUN_INSIGHTS_FLAG_TO_ENV` stay in lockstep per CLAUDE.md § 1.
+- **`ClaimAttribution` schema migration (P2)** — two new Optional
+  fields `direction_key: Literal["A".."G"]` and
+  `field_name: Literal["thesis","primary_metric","fastest_test",
+  "major_risk","data_sources"]`, both `default=None` for backward
+  compatibility.  Existing ledger entries parse cleanly; the auditor
+  falls back to semantic matching when tags are absent.
 
 ### Changed
-- **`section_04:build_direction_debate_crew()`** gained two keyword-only
-  parameters `audit_mode` and `isolation_mode` (defaults `False` and
-  `"sequential"`).  When `audit_mode=True`, each task description is
-  extended with a structured `<<<AUDIT_FINDING_BEGIN>>> ... <<<END>>>`
-  block requirement; the Judge additionally receives a
-  `<<<GATE_VERDICT_BEGIN>>> ... <<<END>>>` block specification.  When
-  `isolation_mode="hybrid"`, an additional note instructs every agent to
-  treat prior agents' free-form chain-of-thought as untrusted and rely
-  on structured findings only — reduces sequential anchoring without
-  needing parallel execution.  Crew gains `_audit_mode_enabled` and
-  `_audit_isolation_mode` attributes for downstream introspection.
-- **`section_02:_run_single_direction_debate()`** reads
-  `CRUCIBLE_DEBATE_*` env vars on entry, passes them to the crew builder,
-  and after each attempt invokes a new helper
-  `_emit_audit_mode_ledger_events()` that parses `AUDIT_FINDING` blocks
-  from each task output, parses the Judge's `GATE_VERDICT` block, runs
-  consensus-risk computation, optionally invokes the External Critic,
-  and emits `record_debate_finding` (N) + `record_gate_verdict` (1)
-  ledger events.  v1.1.8 is **observation-only**: the legacy
-  `force_none` decision flow is unchanged, so audit mode can be enabled
-  in production without affecting which directions are selected.
-- **`recorder.py:record_direction_debate_rejection()`** extended its
-  known `rejection_reason` set with three new audit-mode values:
-  `judge_explicit_kill`, `judge_branch`, `needs_more_data`.  Recording
-  these from the new orchestration paths no longer triggers the one-shot
-  "unrecognised reason" debug log.
-- **`section_02_research_and_llm.py` import surface**: added
-  `_parse_audit_findings_from_text()`, `_parse_gate_verdict_from_text()`,
-  `_extract_json_from_block()`, `_coerce_audit_finding_to_payload()`,
-  and `_emit_audit_mode_ledger_events()` helpers.  All are swallow-safe
-  and never raise into the legacy decision flow.
+- **`section_04:build_direction_debate_crew()`** gained keyword-only
+  `audit_mode` + `isolation_mode` params.  When `audit_mode=True`, task
+  descriptions append a structured
+  `<<<AUDIT_FINDING_BEGIN>>>…<<<END>>>` block requirement plus a
+  Judge-only `<<<GATE_VERDICT_BEGIN>>>…<<<END>>>` block.  When
+  `isolation_mode="hybrid"`, agents are told to treat prior CoT as
+  untrusted and rely on structured findings only — reduces sequential
+  anchoring without parallel execution.
+- **`section_02:_run_single_direction_debate()`** parses audit blocks,
+  computes consensus risk, optionally invokes the External Critic, and
+  emits `record_debate_finding` (N) + `record_gate_verdict` (1) ledger
+  events per attempt.  v1.1.8 is **observation-only**: the legacy
+  `force_none` decision flow is unchanged, so audit mode can run in
+  production without changing which directions are selected.
+- **Evidence Auditor prompt rewritten (P2)** — auditor now explicitly
+  (a) reads `direction_key` / `field_name` tags when present, and
+  (b) falls back to semantic matching from claim text when tags are
+  absent.  Producer→consumer wiring pinned by
+  `tests/test_v118_extended_phase7.py`.
+- **Force-none warning UX cleanup (P4)** — the
+  `[Warn] Direction debate exhausted N iteration(s)` message no longer
+  prints misleading `grounded_claims_needed=0 citations_needed=0` when
+  the firing gate branch didn't set them.  When both are 0 the warning
+  now surfaces
+  `structural_failure=supported_fields_empty_across_directions` to
+  point operators at the real fix (per-direction anchoring) instead
+  of "add more citations".
+- **Degrade-not-die observability (P5)** — when force-none exhausts
+  refinement and `CRUCIBLE_DEBATE_TOLERATE_UNVERIFIABLE_EVIDENCE=1`,
+  the loop emits a `direction_debate_degraded_proceed` ledger event.
+  Observation-only in v1.1.8; the actual behavioural reroute is v1.1.9
+  work (non-trivial signature change to `_run_single_direction_debate`).
+- **`record_direction_debate_rejection()`** extended its known
+  `rejection_reason` set with three new audit-mode values:
+  `judge_explicit_kill`, `judge_branch`, `needs_more_data`.
+- **WebUI Settings page** surfaces all new env keys under bilingual
+  `KEY_META` entries; Direction Debate Audit group placed adjacent to
+  the existing Direction & Gate Control group.
 
 ### Fixed
-- N/A — v1.1.8 is purely additive.  Direction debate behaviour with
-  `CRUCIBLE_DEBATE_AUDIT_MODE=0` (default) is bit-for-bit identical to
-  v1.1.7.  No env-var default flipped; no public schema renamed; no
-  CLI flag removed.
+- **`_NullRecorder` interface parity** — pre-existing v1.1.8 audit
+  oversight where `record_debate_finding` / `record_gate_verdict` were
+  added to `InsightsRecorder` but NOT to `_NullRecorder`.  Same gap
+  reproduced for the three v1.1.8 extension ledger methods; now all
+  five exist on both classes so `CRUCIBLE_RUN_INSIGHTS_ENABLED=0` no
+  longer AttributeError's on the new calls.
 
 ### Validation
-- New test directory `tests/test_direction_debate_audit/` with seven
-  files covering pydantic invariants (`test_schema.py`), ledger emit +
-  swallow (`test_ledger_events.py`), consensus-risk metric correctness
-  (`test_consensus.py`), External Critic prompt + JSON extraction +
-  fallback (`test_critic.py`), audit-mode appendix + parser wiring
-  (`test_isolation.py`), producer→consumer structural pins
-  (`test_wiring.py`), and regression hard cases (KILL not downgraded,
-  evidence-gap is NEEDS_MORE_DATA not KILL, groupthink detection,
-  Critic dissent recording) in `test_regression_hard_cases.py`.
-- Producer→consumer wiring tests follow the CLAUDE.md § 9.6 pattern:
-  scan `.env.example` keys appear in `SETTINGS_SCHEMA`, scan mapping
-  RHS env names appear in actual `section_02` / `section_07` /
-  `recorder.py` read sites, and `inspect.getsource()`-style checks pin
-  the CLI → env translation block in `cmd_run`.
+- Full pytest suite: **3 104 passed, 2 skipped** (was 2 588 + 1 at
+  v1.1.7; +516 new tests across the v1.1.8 audit-mode tests and the
+  v1.1.8 extension tests).  Skipped are: `SyntheticGoldenRun` missing
+  optional `run_meta.json`, and HTTP/2 SSRF test gated on `h2` package
+  not installed in this environment.
+- New test files: `tests/test_direction_debate_audit/` (7 files) for
+  audit-mode Pydantic invariants, ledger emit + swallow, consensus-risk
+  metric correctness, External Critic prompt + JSON extraction +
+  fallback, audit-mode appendix + parser wiring, producer→consumer
+  structural pins, and regression hard cases.  Plus 16 root-level
+  `tests/test_v118_*` files for extension coverage (search cache,
+  cooldown, health, openalex / crossref / wikipedia / searxng
+  providers, domain pins, fallback chain, dedup, HTTP/2 + keepalive,
+  async runner, translate, Phase 7 producer→consumer wiring, 4-layer
+  Settings sync, Phase 2 ledger events).
+- Producer→consumer wiring tests follow CLAUDE.md § 9.6: scan
+  `.env.example` keys appear in `SETTINGS_SCHEMA`, scan mapping RHS
+  env names appear in actual section_02 / section_07 / recorder.py
+  read sites, and `inspect.getsource()`-style checks pin the CLI → env
+  translation block in `cmd_run`.
 - `pyproject.toml` and `crucible.__version__` bumped to `"1.1.8"` in
   lock-step so `test_pyproject_version_matches_package_version` stays
   green.
-- All existing v1.1.7 tests continue to pass — the
-  `audit_mode=False` short-circuit in `_append_audit_mode_instructions`
-  preserves the legacy task description bit-for-bit.
 
 ### Compatibility
 - Drop-in for v1.1.7.  When `CRUCIBLE_DEBATE_AUDIT_MODE=0` (default),
   direction-debate behaviour is identical to v1.1.7.  No env-var
   default flipped; no CLI flag removed; no public schema broken.
-- Audit-mode ledger events are additive — they share the existing
-  `debate.jsonl` stream so the `_STREAM_FILENAMES` / `_VALID_STREAMS`
-  invariants are unchanged.  Downstream readers should branch on
-  `kind` field (not stream name) to distinguish the three debate event
-  types: `direction_debate_rejection` (legacy, v1.1.0+),
-  `direction_debate_finding` (v1.1.8+, audit mode), and
+- All 23 web-research env vars have backward-compatible defaults.
+  `ClaimAttribution` schema migration is purely additive (Optional
+  fields with `default=None`).
+- `_STREAM_FILENAMES` stays at `{output, error, debate, params}` — no
+  new ledger file (CLAUDE.md § 11.9 invariant).
+- Downstream readers should branch on `kind` (not stream name) to
+  distinguish three debate event types: `direction_debate_rejection`
+  (legacy, v1.1.0+), `direction_debate_finding` (v1.1.8+, audit mode),
   `direction_debate_verdict` (v1.1.8+, audit mode).
-- The `critic_model_family` field on `AuditTrail` is reserved for
-  v1.3.0 cross-family Critics; in v1.1.8 it is always `None`.  v1.3.0
-  may populate it without a schema migration.
-- The `BRANCH` decision is **audit-only** in v1.1.8: the ledger event
-  preserves the branch info for v1.2.0 retrieval to surface as "this
-  hypothesis split before" hints, but the current run still picks
-  `branched_paths[0].direction_id` as its PROCEED direction.  Spawning
-  parallel sub-runs is a v1.3.0 capability gated on cost-control work.
-
----
-
-### v1.1.8 extension — Web Research Hardening + Direction Gate Tuning
-
-Same v1.1.8 release, separate theme.  Addresses the rate-limit / coverage
-issues operators reported with DuckDuckGo + GitHub anonymous search and
-the force-none gate's silent supported_fields-empty problem (root cause
-of the "3 iterations all force-none" diagnostic).  23 new env keys, 4
-new librarian providers, JSON-defined domain authoritative-source pins,
-and 306 new tests bring the suite to **3 092 passed, 2 skipped** (was
-2 786 + 1 skipped at start of this extension).
-
-### Added
-
-- **Disk-persistent search cache** (Q1).  New SQLite cache at
-  `saved_projects/.cache/search_cache.sqlite3` with per-provider TTL
-  (12-168 h).  Refinement iterations on the same topic now hit cache
-  instead of re-fetching — typical repeat-run HTTP cost drops 80 %+.
-  Module: `crucible/web_research/search_cache.py`.  Two-tier lookup
-  L1 (in-memory) + L2 (disk), wired into the existing `_qcache_get` /
-  `_qcache_set` helpers in section_04 so all providers benefit.
-- **Per-provider adaptive cooldown** (Q2).  When a provider returns
-  429 (rate limit) or 202 (DuckDuckGo bot-detection mode), it enters
-  a cooldown that doubles on consecutive triggers, capped at 30 min.
-  Module: `crucible/web_research/cooldown.py`.  Replaces the legacy
-  fixed-sleep approach with adaptive backoff that reacts to actual
-  rate-limit signals.
-- **Per-query-class fallback chain** (Q3).  Four query classes
-  (general / code / academic / docs) each get an ordered provider
-  list; fallback automatically routes to the next provider in the
-  class when the primary returns empty or is in cooldown.  Module:
-  `crucible/web_research/fallback.py`.  Heuristic `classify_query()`
-  inspects ``site:`` / ``filetype:`` / arxiv / github keywords.
-- **Four new zero-auth providers** (Q4): OpenAlex, Crossref, Wikipedia
-  (REST), SearXNG (via configured public instances).  All inherit the
-  unified provider interface (`search_<provider>(query, *, limit,
-  timeout_seconds) -> List[ResearchCitation]`).  Module:
-  `crucible/web_research/providers/`.  Default `LIBRARIAN_EXTRA_
-  PROVIDERS=openalex,crossref,wikipedia` — SearXNG is opt-in because
-  public instance reliability varies.  Dispatcher in section_04 gains
-  elif branches for each provider so they integrate with the existing
-  per-lane / per-query loop, cache, and dedup.
-- **Parallel multi-provider fan-out runner** (Q5).  Module:
-  `crucible/web_research/async_runner.py`.  Uses `ThreadPoolExecutor`
-  for true parallel HTTP (releases the GIL during socket I/O) with a
-  synchronous public API so crewAI tool wrappers don't need refactor.
-  Env-gated by `LIBRARIAN_ASYNC_FANOUT_ENABLED=1` (default ON) with a
-  sequential fallback for emergency rollback.  Provider wire-in to
-  the dispatcher loop is deliberately opt-in (env-controlled in
-  future) to avoid restructuring the existing nested loop in v1.1.8.
-- **Cross-provider query deduplication** (Q6).  Module:
-  `crucible/web_research/dedup.py`.  Tracks `(normalised_query,
-  query_class)` pairs and skips subsequent providers for the same
-  pair once any provider has returned non-empty results.  Wired into
-  section_04 dispatch so cache hits AND HTTP results both mark
-  coverage.  Saves ~30 % of HTTP calls in typical runs.
-- **Per-provider health observability** (Q7).  Module:
-  `crucible/web_research/health.py`.  Tracks per-provider request
-  count, 200 OK count, 429 / 202 / timeout / other-error count,
-  citation yield, and cache hits.  `record_provider_health_summary`
-  ledger event (new EventKind, routed to existing `output` stream)
-  emits at end-of-stage for v1.2.0 retrieval.
-- **Domain authoritative-source pinning** (Q8).  Module:
-  `crucible/web_research/domain_pins.py`.  Reads
-  `crucible/config/domain_pins.json` (JSON, not YAML — the repo does
-  not depend on PyYAML).  Matches operator-curated authoritative
-  URLs against the user problem (mode + keyword filter) and
-  pre-fetches them as Tier-1 anchors BEFORE search dispatch.  Initial
-  pin set covers 10 domains across crypto perpetuals, ethereum
-  on-chain, tradfi metrics, tradfi market structure, scientific
-  methods, SaaS payments, SaaS auth, SaaS cloud arch, and agent LLM
-  cookbooks.  Each pinned URL must use https for SSRF safety
-  (structurally enforced by `test_v118_extended_4layer_sync.py`).
-- **HTTP/2 + keep-alive** (Q9) for outbound librarian calls.
-  Modified `http_clients.py:_http_client()` to:
-  - Negotiate HTTP/2 when `h2` package is installed (graceful
-    degrade to HTTP/1.1 when not, no install requirement).
-  - Tune the keep-alive connection pool via
-    `LIBRARIAN_HTTP_KEEPALIVE_ENABLED`.
-  SSRF protection (`follow_redirects=False` + manual redirect
-  walker) preserved under HTTP/2.
-- **Bilingual query expansion** (Q10) for CJK queries.  Module:
-  `crucible/web_research/translate.py`.  Pure-Python CJK detection
-  via Unicode-range scan (no extra deps), then caller-supplied
-  translation function (typically a thin wrapper around the
-  librarian LLM) produces an English mirror when native results
-  fall below `LIBRARIAN_BILINGUAL_QUERY_THRESHOLD=3`.  Translation
-  cache is process-local; rejected outputs (translation that still
-  contains CJK = LLM echoed input) are not cached.
-- **Three new EventKind values + recorder methods** (Phase 2):
-  `PROVIDER_COOLDOWN_ENGAGED` (routed to existing `error` stream),
-  `PROVIDER_HEALTH_SUMMARY` (`output` stream), and
-  `DIRECTION_DEBATE_DEGRADED_PROCEED` (`debate` stream).  No new
-  stream file — the `_VALID_STREAMS = {output, error, debate,
-  params}` invariant from CLAUDE.md § 11.9 stays at 4.
-- **23 new env keys** in `.env.example`, all bilingual-described in
-  WebUI `KEY_META`.  Split across 5 Settings groups: Librarian
-  Search Cache, Librarian Provider Resilience, Librarian Extra
-  Providers, Librarian Query Quality, and Direction Gate Tuning.
-- **One new per-run flag** (`debate_tolerate_unverifiable_evidence`)
-  exposed in the Idea/Path mode flag panel + corresponding CLI flag
-  `--tolerate-unverifiable-evidence`.  Backend `_RUN_INSIGHTS_FLAG_
-  TO_ENV` mapping stays in lockstep with frontend `ENV_BACKED_FLAGS`
-  via `test_v118_extended_4layer_sync.py`.
-- **Per-direction claim attribution** in `ClaimAttribution` schema
-  (P2).  Two new Optional fields: `direction_key: Literal["A"..."G"]`
-  and `field_name: Literal["thesis","primary_metric","fastest_test",
-  "major_risk","data_sources"]`.  Both default to `None` for
-  backward compatibility — older ledger entries parse cleanly and
-  the auditor falls back to semantic matching from claim text.
-
-### Changed
-
-- **Evidence Auditor prompt rewritten** (P2).  The auditor is now
-  explicitly told to (a) prefer explicit `direction_key` / `field_
-  name` tags when present, (b) fall back to SEMANTIC matching from
-  claim text when tags are absent.  Without (b), legacy claim_
-  attributions (no tags) would leave every direction's `supported_
-  fields` empty — the v1.1.8 force-none diagnostic root cause.
-  Producer→consumer wiring pinned by
-  `tests/test_v118_extended_phase7.py`.
-- **Force-none warning UX cleanup** (P4).  The
-  `[Warn] Direction debate exhausted N iteration(s)` message no
-  longer prints misleading `grounded_claims_needed=0
-  citations_needed=0` when the firing gate branch didn't set them
-  (e.g. the `not scores` branch).  Counters are conditionally
-  included; when both are 0 the warning now surfaces
-  `structural_failure=supported_fields_empty_across_directions` —
-  pointing the operator at the real fix (per-direction anchoring)
-  instead of "add more citations".
-- **Degrade-not-die observability** (P5).  When force-none has
-  exhausted all refinement iterations AND
-  `CRUCIBLE_DEBATE_TOLERATE_UNVERIFIABLE_EVIDENCE=1`, the loop
-  emits a `direction_debate_degraded_proceed` ledger event marking
-  the run as a degrade candidate.  v1.1.8 is OBSERVATION-ONLY for
-  this path; the actual behavioural change (returning a low-
-  confidence direction instead of `None`) is deferred to v1.1.9
-  because it requires a non-trivial signature change to
-  `_run_single_direction_debate`.
-- **WebUI Settings adds 5 new groups** with their 23 env keys, plus
-  1 new Direction Gate Tuning group with the per-run flag.  All new
-  `KEY_META` entries are bilingual `{en, zh}`.
-
-### Fixed
-
-- **`_NullRecorder` interface parity**: pre-existing v1.1.8
-  oversight where the audit-mode `record_debate_finding` /
-  `record_gate_verdict` methods were added to `InsightsRecorder` but
-  NOT to `_NullRecorder`.  Same gap reproduced for the three new
-  v1.1.8 extended ledger methods; now all five new methods exist on
-  both classes so `CRUCIBLE_RUN_INSIGHTS_ENABLED=0` no longer
-  AttributeError's on the new method calls.
-
-### Validation
-
-- Full pytest suite: **3 092 passed, 2 skipped** (was 2 786 + 1
-  skipped at the start of this extension; +306 new tests).  Skipped
-  tests are: `SyntheticGoldenRun` missing optional `run_meta.json`,
-  and HTTP/2 SSRF test gated on `h2` package not installed in this
-  environment.
-- New test files: `test_v118_extended_4layer_sync.py`,
-  `test_v118_search_cache.py`, `test_v118_provider_cooldown.py`,
-  `test_v118_provider_health.py`,
-  `test_v118_ledger_phase2_events.py`,
-  `test_v118_provider_openalex.py`,
-  `test_v118_provider_crossref.py`,
-  `test_v118_provider_wikipedia.py`,
-  `test_v118_provider_searxng.py`, `test_v118_domain_pins.py`,
-  `test_v118_fallback_chain.py`, `test_v118_query_dedup.py`,
-  `test_v118_http2_keepalive.py`, `test_v118_async_runner.py`,
-  `test_v118_translate.py`, `test_v118_extended_phase7.py`.
-- Producer→consumer wiring tests per CLAUDE.md § 9.6 added for
-  every cross-module contract: 4-layer Settings sync (23 env keys
-  + 1 per-run flag), `_NullRecorder` interface parity, auditor
-  prompt direction_key + field_name + semantic-matching mentions,
-  P4 warning UX gating, P5 ledger emit env-toggle gating.
-
-### Compatibility
-
-- All 23 new env vars have backward-compatible defaults: when an
-  operator runs with no `.env` changes, behaviour matches the start-
-  of-extension baseline modulo the small Q1 cache footprint at
-  `saved_projects/.cache/search_cache.sqlite3`.
-- `ClaimAttribution` schema migration is purely additive (Optional
-  fields with `default=None`).  Existing ledger entries and crew
-  outputs continue to parse without errors.
-- Q5 async fan-out + Q3 fallback chain ordering are env-gated and
-  default to legacy v1.1.7 behaviour at the dispatcher loop level
-  (the modules and tests exist; full dispatcher integration is the
-  next iteration's work to avoid restructuring section_04's nested
-  loop in v1.1.8).
-- The 4 `_STREAM_FILENAMES` keys stay at `{output, error, debate,
-  params}` — no new ledger file (CLAUDE.md § 11.9 invariant).
+- The `BRANCH` decision is audit-only in v1.1.8: the ledger event
+  preserves branch info for v1.2.0 retrieval, but the current run still
+  picks `branched_paths[0].direction_id` as PROCEED.  Spawning parallel
+  sub-runs is a v1.3.0 capability gated on cost-control work.
+- `critic_model_family` on `AuditTrail` is reserved for v1.3.0
+  cross-family Critics; in v1.1.8 always `None`.  v1.3.0 may populate
+  without schema migration.
 
 ### Known limitations / deferred to follow-up
-
-- Q5 (async fan-out): module + tests in place; wire-in to
-  section_04's `(provider × lane × query)` loop deferred — full
-  restructure of the 5 000-line dispatcher is a focused PR of its
-  own.
-- Q2 cooldown + Q7 health hooks in section_04: similarly deferred.
-  HTTP-error detection (429 / 202 / timeout classification) requires
-  a wrapper around every `safe_http_*` call site.
-- P5 behavioural degrade (returning low-confidence direction instead
-  of `None`): observability emitted in v1.1.8; actual decision-
-  rerouting is v1.1.9 work.
-- P1 (comparator lenient pydantic coercion when LLM output has
-  unknown fields): deferred — the comparator typically succeeds; the
-  immediate issue was the auditor's `supported_fields` empty bug
-  which P2 already addresses.
-- P6 (richer targeted refinement queries from
-  `audit_report.summary_only_fields`): the existing
-  `_build_refinement_research_queries` already uses
-  `critical_unknowns` + `missing_evidence_areas` + `research_queries`;
-  deeper structural matching deferred.
+- Q5 (async fan-out) full wire-in to section_04's 5 000-line dispatcher
+  loop; Q2 cooldown + Q7 health hooks at every `safe_http_*` call site;
+  Q3 fallback chain replacement of `LIBRARIAN_SEARCH_PROVIDERS` order —
+  modules + tests are in; the dispatcher restructure is its own PR.
+- P5 actual behavioural degrade (returning low-confidence direction
+  instead of `None`) — observability in v1.1.8, decision reroute in
+  v1.1.9.
+- P1 comparator lenient pydantic coercion + P6 enhanced refinement
+  targeting from `audit_report.summary_only_fields` — deferred; current
+  comparator typically succeeds and existing
+  `_build_refinement_research_queries` already covers the high-impact
+  cases.
 
 ---
 
