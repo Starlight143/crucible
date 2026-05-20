@@ -185,20 +185,80 @@ def append_url_query(base_url: str, params: Dict[str, Any], *, doseq: bool = Fal
     return urlunparse(parsed._replace(query=urlencode(merged, doseq=False)))
 
 
+def _h2_available() -> bool:
+    """Return True iff the ``h2`` package (httpx HTTP/2 backend) is
+    importable.
+
+    httpx requires the optional ``h2`` dependency for HTTP/2.  If it is
+    not installed, ``http2=True`` raises ``ImportError`` at client
+    construction time.  This helper lets the caller make the request
+    conditional on availability so the dependency stays optional.
+    """
+    try:
+        import h2  # noqa: F401 — probe import
+        return True
+    except ImportError:
+        return False
+
+
+def _http2_enabled() -> bool:
+    """Whether to negotiate HTTP/2 for librarian outbound calls.
+
+    Honours ``LIBRARIAN_HTTP2_ENABLED`` (default 1) AND requires the
+    optional ``h2`` package.  When ``h2`` is missing we silently fall
+    back to HTTP/1.1 — avoids breaking installs that didn't opt into
+    the dependency.
+    """
+    # Lazy local import — env module is in the parent package and
+    # already covered by the tri-modal import block at the top of the
+    # web_research subpackage modules.
+    try:
+        from .._env import env_bool
+    except ImportError:  # pragma: no cover - flat-launcher fallback
+        from _env import env_bool  # type: ignore[no-redef]
+    if not env_bool("LIBRARIAN_HTTP2_ENABLED", True):
+        return False
+    return _h2_available()
+
+
+def _keepalive_enabled() -> bool:
+    """Whether to retain connections in the keep-alive pool."""
+    try:
+        from .._env import env_bool
+    except ImportError:  # pragma: no cover - flat-launcher fallback
+        from _env import env_bool  # type: ignore[no-redef]
+    return env_bool("LIBRARIAN_HTTP_KEEPALIVE_ENABLED", True)
+
+
 def _http_client(*, timeout_seconds: float, user_agent: str) -> httpx.Client:
     """Construct an httpx client with auto-redirect-following DISABLED.
 
     v1.1.2 (sixth-pass H-2): the prior ``follow_redirects=True`` setting
     bypassed ``_is_public_http_url`` on redirect — an attacker-controlled
     public URL could respond ``302 Location: http://169.254.169.254/...``
-    (AWS IMDS) and httpx would dutifully follow.  Redirects are now handled
-    manually by ``_request_with_safe_redirects`` which re-checks every hop.
+    (AWS IMDS) and httpx would dutifully follow.  Redirects are now
+    handled manually by ``_request_with_safe_redirects`` which re-checks
+    every hop.
+
+    v1.1.8 extended (Phase 4, Q9): HTTP/2 + keep-alive optional knobs.
+
+    * ``LIBRARIAN_HTTP2_ENABLED=1`` (default) + ``h2`` installed →
+      negotiates HTTP/2.  Reduces per-request connection setup ~10-20%
+      against compatible endpoints (most cloud APIs, modern CDNs).
+    * ``LIBRARIAN_HTTP_KEEPALIVE_ENABLED=1`` (default) → pools idle
+      connections for reuse across requests.  Setting to 0 forces a
+      fresh connection per request (debugging only).
     """
+    keepalive_max = 10 if _keepalive_enabled() else 0
     return httpx.Client(
         timeout=timeout_seconds,
         headers={"User-Agent": user_agent},
         follow_redirects=False,
-        limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+        http2=_http2_enabled(),
+        limits=httpx.Limits(
+            max_keepalive_connections=keepalive_max,
+            max_connections=20,
+        ),
     )
 
 

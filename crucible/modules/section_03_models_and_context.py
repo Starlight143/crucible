@@ -1152,6 +1152,36 @@ class ClaimAttribution(BaseModel):
         default_factory=list, description="Direct source URLs supporting the claim"
     )
     support_score: int = Field(default=0, ge=0, description="Deterministic support score")
+    # v1.1.8 extended (Phase 7, P2): per-direction-field anchoring.
+    # When set, the auditor uses the explicit tag instead of doing
+    # semantic matching from claim text against direction.thesis /
+    # direction.primary_metric / etc.  Both fields are Optional with
+    # default None for backward compatibility — older librarian
+    # outputs without these tags still parse cleanly, and the auditor
+    # falls back to semantic matching (see auditor prompt update in
+    # section_04 v1.1.8 extended Phase 7).
+    direction_key: Optional[Literal["A", "B", "C", "D", "E", "F", "G"]] = Field(
+        default=None,
+        description=(
+            "Direction this claim anchors to (A..G).  v1.1.8 extended; "
+            "None = unanchored, fall back to semantic matching."
+        ),
+    )
+    field_name: Optional[
+        Literal[
+            "thesis",
+            "primary_metric",
+            "fastest_test",
+            "major_risk",
+            "data_sources",
+        ]
+    ] = Field(
+        default=None,
+        description=(
+            "Direction option field this claim anchors to.  v1.1.8 extended; "
+            "None = unanchored, fall back to semantic matching from claim text."
+        ),
+    )
 
 
 class DataFieldCapability(BaseModel):

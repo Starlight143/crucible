@@ -1818,6 +1818,11 @@ _RUN_INSIGHTS_FLAG_TO_ENV: dict[str, str] = {
     # verified by test_wiring.py per CLAUDE.md § 9.6).
     "debate_audit_mode":          "CRUCIBLE_DEBATE_AUDIT_MODE",
     "debate_external_critic":     "CRUCIBLE_DEBATE_EXTERNAL_CRITIC",
+    # v1.1.8 extended — Direction Gate Tuning per-run toggle.  RHS env
+    # name matches the read site in
+    # ``crucible/features/direction_debate/degraded.py`` (Phase 7).
+    # Same producer→consumer wiring rule applies.
+    "debate_tolerate_unverifiable_evidence": "CRUCIBLE_DEBATE_TOLERATE_UNVERIFIABLE_EVIDENCE",
 }
 
 

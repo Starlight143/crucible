@@ -97,6 +97,17 @@ class EventKind(str, Enum):
     # contract — these events are the physical carrier of "disagreement log".
     DIRECTION_DEBATE_FINDING = "direction_debate_finding"
     DIRECTION_DEBATE_VERDICT = "direction_debate_verdict"
+    # v1.1.8 extended — Web Research Hardening (Phase 2 / Phase 7) introduces
+    # three more event kinds.  All three share existing streams so the
+    # ``_STREAM_FILENAMES`` and ``_VALID_STREAMS`` invariants (4 streams) hold.
+    # Routing rationale:
+    #   * PROVIDER_COOLDOWN_ENGAGED → ``error`` (transient librarian failure)
+    #   * PROVIDER_HEALTH_SUMMARY  → ``output`` (end-of-stage checkpoint)
+    #   * DIRECTION_DEBATE_DEGRADED_PROCEED → ``debate`` (gate-decision event)
+    # See ``CLAUDE.md § 11.9`` for the 4-stream contract.
+    PROVIDER_COOLDOWN_ENGAGED = "provider_cooldown_engaged"
+    PROVIDER_HEALTH_SUMMARY = "provider_health_summary"
+    DIRECTION_DEBATE_DEGRADED_PROCEED = "direction_debate_degraded_proceed"
 
 
 class OutcomeStatus(str, Enum):
@@ -692,6 +703,10 @@ class InsightEvent:
             EventKind.DIRECTION_DEBATE_FINDING: "debate",
             EventKind.DIRECTION_DEBATE_VERDICT: "debate",
             EventKind.RUNTIME_PARAMS: "params",
+            # v1.1.8 extended — all three reuse existing streams.
+            EventKind.PROVIDER_COOLDOWN_ENGAGED: "error",
+            EventKind.PROVIDER_HEALTH_SUMMARY: "output",
+            EventKind.DIRECTION_DEBATE_DEGRADED_PROCEED: "debate",
         }[self.kind]
 
     def to_dict(self) -> Dict[str, Any]:

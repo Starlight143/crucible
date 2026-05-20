@@ -29,6 +29,26 @@ if __package__ == "crucible.modules":
     from ..web_research.swarm_specs import (
         build_research_swarm_specs as _build_research_swarm_specs_from_module,
     )
+    # v1.1.8 extended (Phase 3) — Web Research Hardening modules.
+    from ..web_research.domain_pins import (
+        domain_pins_enabled as _v118_domain_pins_enabled,
+        load_pins as _v118_load_pins,
+        match_pins as _v118_match_pins,
+        prefetch_pinned_urls as _v118_prefetch_pinned_urls,
+    )
+    from ..web_research.providers import (
+        search_crossref as _v118_search_crossref,
+        search_openalex as _v118_search_openalex,
+        search_searxng as _v118_search_searxng,
+        search_wikipedia as _v118_search_wikipedia,
+    )
+    from ..web_research.search_cache import SearchCache as _V118_SearchCache
+    # v1.1.8 extended (Phase 4) — Cross-provider dedup + query classifier.
+    from ..web_research.dedup import (
+        QueryDedupRegistry as _V118_QueryDedupRegistry,
+        dedup_enabled as _v118_dedup_enabled,
+    )
+    from ..web_research.fallback import classify_query as _v118_classify_query
 else:  # pragma: no cover - direct script fallback
     from web_research.analysis_specs import (
         build_analysis_specs as _build_analysis_specs_from_module,
@@ -45,6 +65,26 @@ else:  # pragma: no cover - direct script fallback
     from web_research.swarm_specs import (
         build_research_swarm_specs as _build_research_swarm_specs_from_module,
     )
+    # v1.1.8 extended (Phase 3) — Web Research Hardening modules.
+    from web_research.domain_pins import (  # type: ignore[no-redef]
+        domain_pins_enabled as _v118_domain_pins_enabled,
+        load_pins as _v118_load_pins,
+        match_pins as _v118_match_pins,
+        prefetch_pinned_urls as _v118_prefetch_pinned_urls,
+    )
+    from web_research.providers import (  # type: ignore[no-redef]
+        search_crossref as _v118_search_crossref,
+        search_openalex as _v118_search_openalex,
+        search_searxng as _v118_search_searxng,
+        search_wikipedia as _v118_search_wikipedia,
+    )
+    from web_research.search_cache import SearchCache as _V118_SearchCache  # type: ignore[no-redef]
+    # v1.1.8 extended (Phase 4) — Cross-provider dedup + query classifier.
+    from web_research.dedup import (  # type: ignore[no-redef]
+        QueryDedupRegistry as _V118_QueryDedupRegistry,
+        dedup_enabled as _v118_dedup_enabled,
+    )
+    from web_research.fallback import classify_query as _v118_classify_query  # type: ignore[no-redef]
 
 def _get_mode_config(mode: Optional[str]) -> "ModeConfig":
     normalized = str(mode or "").strip()
@@ -2627,8 +2667,63 @@ def _qcache_key(provider: str, query: str) -> str:
     return hashlib.sha256(raw.encode("utf-8", errors="replace")).hexdigest()[:24]
 
 
+# v1.1.8 extended (Phase 3, Q1): two-tier cache — L1 in-memory (existing),
+# L2 disk SQLite (v1.1.8).  ``_qcache_get`` checks L1 then L2; ``_qcache_set``
+# writes both.  Disk-cache hits warm L1 so subsequent same-process queries
+# are O(dict-lookup) rather than O(sqlite-query).  The disk layer is None
+# when ``LIBRARIAN_SEARCH_DISK_CACHE_ENABLED=0`` (see search_cache.py).
+
+
+def _v118_disk_cache_get(
+    provider: str, query: str,
+) -> Optional[List["ResearchCitation"]]:
+    """L2 lookup: deserialise from sqlite and rebuild ResearchCitation list.
+
+    Returns None on miss / disabled / corruption.  Never raises.
+    """
+    cache = _V118_SearchCache.get_default()
+    if cache is None:
+        return None
+    raw = cache.get(provider, query)
+    if raw is None:
+        return None
+    out: List[ResearchCitation] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            out.append(ResearchCitation(**item))
+        except Exception:
+            # Corrupt entry — skip without crashing.
+            continue
+    return out or None
+
+
+def _v118_disk_cache_set(
+    provider: str,
+    query: str,
+    results: List["ResearchCitation"],
+) -> None:
+    """L2 write: serialise ResearchCitation list to JSON-friendly dicts."""
+    cache = _V118_SearchCache.get_default()
+    if cache is None:
+        return
+    try:
+        payload = [c.model_dump() for c in results]
+    except Exception:
+        return
+    cache.set(provider, query, payload)
+
+
 def _qcache_get(provider: str, query: str) -> Optional[List["ResearchCitation"]]:
     """Return cached results for *(provider, query)* if still within TTL, else None.
+
+    Two-tier lookup (v1.1.8 extended, Phase 3, Q1):
+    1. L1 in-memory dict (existing) — fast same-process hit.
+    2. L2 sqlite disk cache (new) — survives process restart.
+
+    L2 hits warm L1 so subsequent same-process queries are O(dict) and
+    don't re-pay the sqlite-query cost.
 
     The TTL check and eviction are performed inside the same lock acquisition
     as the dict read so that no other thread can refresh or evict the entry
@@ -2638,25 +2733,46 @@ def _qcache_get(provider: str, query: str) -> Optional[List["ResearchCitation"]]
     key = _qcache_key(provider, query)
     with _SEARCH_QUERY_CACHE_LOCK:
         entry = _SEARCH_QUERY_CACHE.get(key)
-        if entry is None:
-            return None
-        ts, results = entry
-        if time.time() - ts > _SEARCH_QUERY_CACHE_TTL_SECONDS:
-            # Expired — evict atomically while the lock is still held
-            _SEARCH_QUERY_CACHE.pop(key, None)
-            return None
-        # Capture a copy while the lock is held so the caller gets a
-        # consistent snapshot even if _qcache_set is called concurrently.
-        return list(results)
+        if entry is not None:
+            ts, results = entry
+            if time.time() - ts > _SEARCH_QUERY_CACHE_TTL_SECONDS:
+                # Expired — evict atomically while the lock is still held
+                _SEARCH_QUERY_CACHE.pop(key, None)
+            else:
+                # Capture a copy while the lock is held so the caller gets
+                # a consistent snapshot even if _qcache_set is called
+                # concurrently.
+                return list(results)
+    # L1 miss / expired — check L2 (disk).  L2 lookup is outside the
+    # L1 lock to avoid holding the in-memory mutex during a sqlite
+    # round-trip.
+    disk_hit = _v118_disk_cache_get(provider, query)
+    if disk_hit is not None:
+        # Warm L1 so subsequent L1 hits are fast.  TTL on the L1 entry
+        # reflects the disk_hit's relative freshness (we don't know its
+        # original timestamp, so use ``now`` — at worst this re-uses an
+        # entry for an extra ``_SEARCH_QUERY_CACHE_TTL_SECONDS`` window,
+        # which is bounded by the L2 TTL anyway).
+        with _SEARCH_QUERY_CACHE_LOCK:
+            _SEARCH_QUERY_CACHE[key] = (time.time(), list(disk_hit))
+        return list(disk_hit)
+    return None
 
 
 def _qcache_set(provider: str, query: str, results: List["ResearchCitation"]) -> None:
-    """Store *results* in the per-query cache for *(provider, query)*."""
+    """Store *results* in the per-query cache for *(provider, query)*.
+
+    Writes both L1 (memory) and L2 (disk; v1.1.8 extended Phase 3 Q1).
+    Disk write is best-effort and never raises.
+    """
     if not results:
         return   # do not cache empty result sets — provider may have been unavailable
     key = _qcache_key(provider, query)
     with _SEARCH_QUERY_CACHE_LOCK:
         _SEARCH_QUERY_CACHE[key] = (time.time(), list(results))
+    # L2 disk write outside the L1 lock.  Best-effort; failures are
+    # swallowed inside _v118_disk_cache_set.
+    _v118_disk_cache_set(provider, query, results)
 
 
 def clear_search_query_cache() -> None:
@@ -3175,9 +3291,62 @@ def _collect_librarian_search_materials(
         "arxiv": {"technical"},
         "github": {"technical", "competitor"},
         "paperswithcode": {"technical", "competitor"},
+        # v1.1.8 extended (Phase 3, Q4): new academic providers
+        # restricted to the technical lane (mirror arxiv's allowlist).
+        # SearXNG / Wikipedia stay open across all lanes.
+        "openalex": {"technical"},
+        "crossref": {"technical"},
     }
 
-    for provider_name in LIBRARIAN_SEARCH_PROVIDERS:
+    # v1.1.8 extended (Phase 3, Q8): domain pins prefetch.  Match
+    # operator-curated authoritative URLs against the user problem and
+    # pre-fetch them as Tier-1 anchors BEFORE the regular provider loop.
+    # Closes the gap where DDG returns Tier-2/3 transcriptions but
+    # misses the authoritative docs.  Always best-effort; failures are
+    # logged but never raise.
+    try:
+        if _v118_domain_pins_enabled():
+            _matched_pins = _v118_match_pins(user_problem, mode)
+            if _matched_pins:
+                _pinned_citations = _v118_prefetch_pinned_urls(_matched_pins)
+                # Distribute across every lane so dedupe later collapses
+                # duplicates and the pinned material is available no matter
+                # which lane the auditor scores against.
+                for _lane in list(lane_citations.keys()):
+                    lane_citations[_lane].extend(_pinned_citations)
+                if _pinned_citations and "domain_pin" not in providers_used:
+                    providers_used.append("domain_pin")
+    except Exception as _pin_exc:  # pragma: no cover - defensive only
+        provider_errors["domain_pin"] = f"prefetch failed: {_pin_exc!r}"[:600]
+
+    # v1.1.8 extended (Phase 3, Q4): merge LIBRARIAN_SEARCH_PROVIDERS
+    # (core, env-controlled) with LIBRARIAN_EXTRA_PROVIDERS (extras,
+    # default openalex,crossref,wikipedia).  Extras append; the core
+    # ordering is preserved.  Empty LIBRARIAN_EXTRA_PROVIDERS disables
+    # all extras (operator override).
+    _effective_providers = list(LIBRARIAN_SEARCH_PROVIDERS)
+    try:
+        _v118_extras_raw = os.environ.get(
+            "LIBRARIAN_EXTRA_PROVIDERS",
+            "openalex,crossref,wikipedia",
+        )
+        if _v118_extras_raw is not None:
+            for _chunk in _v118_extras_raw.replace(";", ",").split(","):
+                _extra = _chunk.strip().lower()
+                if _extra and _extra not in _effective_providers:
+                    _effective_providers.append(_extra)
+    except Exception:  # pragma: no cover - defensive only
+        pass
+
+    # v1.1.8 extended (Phase 4, Q6): per-run dedup registry.  Subsequent
+    # providers asked the same normalised (query, class) pair are
+    # skipped silently — saves ~30% of HTTP calls when lanes share
+    # queries.  Registry lifetime is this librarian-stage invocation.
+    _v118_dedup = (
+        _V118_QueryDedupRegistry() if _v118_dedup_enabled() else None
+    )
+
+    for provider_name in _effective_providers:
         provider_had_success = False
         staged_lane_citations: Dict[str, List[ResearchCitation]] = {
             lane: [] for lane in query_map
@@ -3201,6 +3370,23 @@ def _collect_librarian_search_materials(
                 # incorrectly wait for LIBRARIAN_INTER_QUERY_DELAY_SECONDS.
                 _is_first_http_in_lane = True
                 for query in lane_queries[:query_budget_per_lane]:
+                    # v1.1.8 extended (Phase 4, Q6): cross-provider dedup
+                    # skip.  If an earlier provider already covered the
+                    # same normalised (query, class) pair, drop this one
+                    # entirely — saves the HTTP call and the rate-limit
+                    # delay.  context7 is excluded from dedup because its
+                    # results depend on the caller's contextual args.
+                    _query_class_v118 = _v118_classify_query(query)
+                    if (
+                        _v118_dedup is not None
+                        and provider_name != "context7"
+                        and _v118_dedup.is_covered(query, _query_class_v118)
+                    ):
+                        last_query = query
+                        # Same rationale as cache hit: no HTTP made, so
+                        # don't consume the first-in-lane delay token.
+                        continue
+
                     # Per-query cache hit: skip HTTP fetch and rate-limit delay
                     # entirely — the cache serves a copy of the prior result.
                     # context7 queries depend on extra contextual arguments that
@@ -3213,6 +3399,17 @@ def _collect_librarian_search_materials(
                     if _cached_qresult is not None:
                         lane_results.extend(_cached_qresult)
                         last_query = query
+                        # v1.1.8 extended (Phase 4, Q6): cache hits also
+                        # mark the pair as covered so future providers in
+                        # the same class can dedup against this.
+                        if (
+                            _v118_dedup is not None
+                            and provider_name != "context7"
+                            and _cached_qresult
+                        ):
+                            _v118_dedup.mark_covered(
+                                query, _query_class_v118, provider_name,
+                            )
                         # Do NOT clear _is_first_http_in_lane: this was a
                         # cache hit, no HTTP request was made, so the next
                         # real request is still the first and must not be
@@ -3246,9 +3443,50 @@ def _collect_librarian_search_materials(
                         _query_results = _search_arxiv(query)
                     elif provider_name == "paperswithcode":
                         _query_results = _search_paperswithcode(query)
+                    # v1.1.8 extended (Phase 3, Q4): new zero-auth
+                    # providers dispatched via the registry.  Each
+                    # gracefully returns [] on error (no need to wrap
+                    # in try/except here).
+                    elif provider_name == "openalex":
+                        _query_results = _v118_search_openalex(
+                            query,
+                            limit=LIBRARIAN_MAX_RESULTS_PER_QUERY,
+                            timeout_seconds=float(LIBRARIAN_HTTP_TIMEOUT_SECONDS),
+                        )
+                    elif provider_name == "crossref":
+                        _query_results = _v118_search_crossref(
+                            query,
+                            limit=LIBRARIAN_MAX_RESULTS_PER_QUERY,
+                            timeout_seconds=float(LIBRARIAN_HTTP_TIMEOUT_SECONDS),
+                        )
+                    elif provider_name == "wikipedia":
+                        _query_results = _v118_search_wikipedia(
+                            query,
+                            limit=LIBRARIAN_MAX_RESULTS_PER_QUERY,
+                            timeout_seconds=float(LIBRARIAN_HTTP_TIMEOUT_SECONDS),
+                        )
+                    elif provider_name == "searxng":
+                        _query_results = _v118_search_searxng(
+                            query,
+                            limit=LIBRARIAN_MAX_RESULTS_PER_QUERY,
+                            timeout_seconds=float(LIBRARIAN_HTTP_TIMEOUT_SECONDS),
+                        )
                     # Store successful result in the per-query cache
+                    # (L1 mem + L2 disk for non-context7 providers).
                     if provider_name != "context7":
                         _qcache_set(provider_name, query, _query_results)
+                    # v1.1.8 extended (Phase 4, Q6): mark covered after
+                    # successful non-empty result.  Empty results do NOT
+                    # mark covered — that would prevent fallback providers
+                    # from trying when the primary returned nothing.
+                    if (
+                        _v118_dedup is not None
+                        and provider_name != "context7"
+                        and _query_results
+                    ):
+                        _v118_dedup.mark_covered(
+                            query, _query_class_v118, provider_name,
+                        )
                     lane_results.extend(_query_results)
                 staged_lane_citations[lane].extend(lane_results)
                 provider_had_success = True
@@ -5211,6 +5449,7 @@ Rules:
 - Score each option on evidence quality, not on your product preference.
 - Treat comparator top_keys as the funnel input and verify whether the short-list is actually defensible.
 - Mark fields as supported_fields only if they are backed by explicit claim_attributions/citations.
+- v1.1.8 extended (P2): when a claim_attribution has direction_key and field_name tags (Optional fields), USE the explicit tag — that claim supports the named field of the named direction.  When tags are absent (older runs / general claim_attributions), do SEMANTIC matching: scan claim text against the candidate direction's thesis / primary_metric / fastest_test / major_risk / data_sources, and mark a field as supported when the claim refers to the same concept (e.g. a claim about "funding rate mean reversion in PANews 2024 sample" supports direction B's thesis "資金費率均值回歸").  A claim with category=market_examples/technical_patterns/key_risks is STILL eligible to support a direction's field via semantic matching — do NOT require category==field_name.
 - Mark fields as summary_only_fields if they seem plausible only from compressed narrative.
 - Mark fields as unsupported_fields if there is no clear evidence.
 - decision_critical_unknowns must include only unknowns that would materially change comparison between options.

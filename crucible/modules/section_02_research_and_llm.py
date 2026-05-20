@@ -2306,17 +2306,93 @@ def run_direction_debate(
     # debate failed so the caller (and a human reading the run output) can act
     # on it.  Without this line the failure is invisible when the JSON-parse
     # path was never hit and only the force-none gate fired.
+    # v1.1.8 extended (Phase 7, P5): degrade-not-die observability emit.
+    # When force-none has fired the full DIRECTION_REFINEMENT_MAX_ITERATIONS+1
+    # times AND the operator has opted into the toggle, emit a
+    # ``direction_debate_degraded_proceed`` ledger event so v1.2.0
+    # retrieval can identify which runs would have benefited.
+    # v1.1.8 is OBSERVATION-ONLY for the degrade path — the actual
+    # behavioural change (returning a low-confidence direction instead
+    # of None) is deferred to v1.1.9 because it requires a non-trivial
+    # signature change to ``_run_single_direction_debate``.  The env
+    # toggle ``CRUCIBLE_DEBATE_TOLERATE_UNVERIFIABLE_EVIDENCE`` therefore
+    # currently controls only whether the event is emitted (and is
+    # primed for the future behavioural change).
     if last_gap_info is not None:
-        print(
+        try:
+            _tolerate = _env_bool(
+                "CRUCIBLE_DEBATE_TOLERATE_UNVERIFIABLE_EVIDENCE", False,
+            )
+            _n_threshold = _env_int(
+                "CRUCIBLE_DEBATE_DEGRADE_AFTER_N_ITERATIONS", 3,
+            ) or 3
+            _total_iter = DIRECTION_REFINEMENT_MAX_ITERATIONS + 1
+            if _tolerate and _total_iter >= _n_threshold:
+                _candidate_dir = ""
+                _weak = list(last_gap_info.get("weak_directions") or [])
+                if _weak:
+                    _candidate_dir = str(_weak[0])
+                _get_insights_recorder().record_direction_debate_degraded_proceed(
+                    run_id=_resolve_run_id_for_ledger_emit(),
+                    project_name="stage0_pending",
+                    mode=str(mode or "mode_unknown"),
+                    selected_direction=_candidate_dir or "unknown",
+                    original_decision="force_none",
+                    consecutive_force_none_count=int(_total_iter),
+                    final_score=0,
+                    gate_reason=(
+                        "consecutive force-none iterations exhausted "
+                        "with structural failure (supported_fields empty)"
+                    ),
+                    attempt=int(_total_iter),
+                    user_problem=user_problem,
+                )
+        except Exception:
+            # Never let degrade telemetry break the warning print below.
+            pass
+
+    if last_gap_info is not None:
+        # v1.1.8 extended (Phase 7, P4): warning UX cleanup.
+        # Only print quantity counters when the firing gate actually
+        # populated them.  Previously every warning printed
+        # ``grounded_claims_needed=0 citations_needed=0`` even when the
+        # gate that fired was ``not scores`` (which doesn't set those
+        # fields), misleading the operator into thinking "I have enough
+        # citations".  See v1.1.8 diagnostic for the full root cause.
+        _gci_needed = int(last_gap_info.get("grounded_claims_needed") or 0)
+        _cit_needed = int(last_gap_info.get("citations_needed") or 0)
+        _weak_dirs = list(last_gap_info.get("weak_directions") or [])[:3]
+        _missing = list(
+            last_gap_info.get("missing_evidence_areas") or []
+        )[:3]
+        _critical = list(last_gap_info.get("critical_unknowns") or [])[:3]
+        _msg_parts: List[str] = [
             "[Warn] Direction debate exhausted "
-            f"{DIRECTION_REFINEMENT_MAX_ITERATIONS + 1} iteration(s) without a "
-            "defendable decision. Likely cause: insufficient grounded evidence "
-            "(see preceding force-none diagnostic line). "
-            f"weak_directions={list(last_gap_info.get('weak_directions') or [])[:3]} "
-            f"missing_evidence={list(last_gap_info.get('missing_evidence_areas') or [])[:3]} "
-            f"grounded_claims_needed={int(last_gap_info.get('grounded_claims_needed') or 0)} "
-            f"citations_needed={int(last_gap_info.get('citations_needed') or 0)}"
-        )
+            f"{DIRECTION_REFINEMENT_MAX_ITERATIONS + 1} iteration(s) without "
+            "a defendable decision. Likely cause: insufficient grounded "
+            "evidence (see preceding force-none diagnostic line).",
+            f"weak_directions={_weak_dirs}",
+            f"missing_evidence={_missing}",
+        ]
+        # Quantity counters only printed when non-zero — match the
+        # gate-branch shape (``near_zero_evidence`` and
+        # ``weakly_supported`` set these; ``not scores`` and
+        # ``high_critical_unknowns`` do NOT).
+        if _gci_needed > 0:
+            _msg_parts.append(f"grounded_claims_needed={_gci_needed}")
+        if _cit_needed > 0:
+            _msg_parts.append(f"citations_needed={_cit_needed}")
+        # When neither counter was set, surface the structural hint
+        # instead — tells the operator "every direction's supported_
+        # fields ended up empty, so increase per-direction claim
+        # anchoring rather than total citation count".
+        if _gci_needed == 0 and _cit_needed == 0:
+            _msg_parts.append(
+                "structural_failure=supported_fields_empty_across_directions"
+            )
+        if _critical:
+            _msg_parts.append(f"critical_unknowns={_critical}")
+        print(" ".join(_msg_parts))
     else:
         print(
             "[Warn] Direction debate produced no parseable decision after all "

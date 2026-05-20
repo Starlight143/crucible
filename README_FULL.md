@@ -109,6 +109,22 @@ An optional **External Critic** (`CRUCIBLE_DEBATE_EXTERNAL_CRITIC=1`) acts as a 
 
 The audit-mode pipeline is **observation-only**: it captures the disagreement trace but does not change which directions are selected, so it can be enabled in production without affecting run outcomes.  See `.env.example` for the full env-var surface and the `Direction Debate Audit` group in the Settings page for per-toggle descriptions.
 
+#### Optional: Librarian Web Research Hardening
+
+The librarian research stage gains five resilience and quality layers that work transparently when enabled (defaults are production-safe — operators typically leave them alone):
+
+- **Disk-persistent search cache** at `saved_projects/.cache/search_cache.sqlite3`.  Per-provider TTL reflects how fast each source drifts (12 h for DuckDuckGo, 24 h for GitHub, 168 h for arXiv).  Refinement iterations on the same topic hit cache instead of re-fetching — typical repeat-run HTTP cost drops 80 %+.
+- **Adaptive per-provider cooldown** on 429 / 202 responses.  When DuckDuckGo enters bot-detection mode or any provider rate-limits, the dispatcher backs off with exponential growth (60 s → 120 s → ... up to 30 min) and silently routes around the cooled provider instead of retrying into the wall.
+- **Four new zero-auth providers**: OpenAlex (100 k req/day, academic), Crossref (DOI metadata, cross-discipline), Wikipedia REST (definitional Tier-1 baseline), SearXNG (opt-in federated meta-search).  Configured via `LIBRARIAN_EXTRA_PROVIDERS` (default `openalex,crossref,wikipedia`).  All inherit the same cache / cooldown / dedup / SSRF infrastructure.
+- **Cross-provider query deduplication**: same normalised query against multiple providers in the same query class fires only the first one — saves ~30 % of HTTP calls when lanes share queries.  Toggle via `LIBRARIAN_CROSS_PROVIDER_DEDUP_ENABLED`.
+- **Domain authoritative-source pinning** in `crucible/config/domain_pins.json`.  When a user problem matches an operator-curated pin (e.g. crypto perpetuals → Binance docs, tradfi metrics → Wikipedia Sharpe-ratio page), the librarian pre-fetches those URLs as Tier-1 anchors *before* search dispatch.  Closes the gap where DuckDuckGo returns Tier-2/3 transcriptions but misses the authoritative API docs.
+- **Bilingual query expansion** for CJK queries: when the native-language result count falls below `LIBRARIAN_BILINGUAL_QUERY_THRESHOLD=3`, the librarian auto-issues an English mirror of the query (via the librarian LLM by default).  Cross-language results are deduped so the same paper found via Chinese title + English title only counts once.
+- **HTTP/2 + connection keep-alive** for outbound calls (optional `h2` dependency; graceful degrade to HTTP/1.1 when not installed).
+
+These all integrate with the SSRF protection from prior v1.1.x audits (no `follow_redirects=True`, every redirect re-checks via `_is_public_http_url`, no IPv6 scope-id smuggling, no IPv4-embedded-IPv6 bypass).  See the `.env.example` and the four new Settings groups (`Librarian Search Cache`, `Librarian Provider Resilience`, `Librarian Extra Providers`, `Librarian Query Quality`) for the per-key knobs.
+
+A complementary control (`CRUCIBLE_DEBATE_TOLERATE_UNVERIFIABLE_EVIDENCE`) lets the operator opt into "degrade-not-die" semantics when the direction-debate gate exhausts its refinement iterations.  Currently observation-only — the corresponding ledger event identifies which runs would have benefited; the behavioural change (returning a low-confidence direction instead of `None`) ships in a follow-up.
+
 ### Stage 3: Analysis Crew
 
 Five specialist analysts evaluate the research independently:

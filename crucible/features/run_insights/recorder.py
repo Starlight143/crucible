@@ -615,6 +615,205 @@ class InsightsRecorder:
             extra_signals=extra_signals,
         )
 
+    # -- v1.1.8 extended — librarian observability + gate degrade ---------
+
+    def record_provider_cooldown(
+        self,
+        *,
+        run_id: str,
+        project_name: str,
+        mode: str,
+        provider: str,
+        cooldown_seconds: int,
+        trigger_reason: str,
+        trigger_count: int,
+        user_problem: Optional[str] = None,
+        run_meta: Optional[Mapping[str, Any]] = None,
+        extra_signals: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        """Emit a ``provider_cooldown_engaged`` event (v1.1.8 Phase 2, Q2).
+
+        Records that a librarian provider hit a rate limit (429) or bot
+        detection (202) and entered cooldown.  Routes to the ``error``
+        stream because cooldowns are transient librarian failures.
+
+        Gated by ``CRUCIBLE_RUN_INSIGHTS_RECORD_ERRORS`` (per-stream).
+        Best-effort; never raises.
+        """
+        if not env_bool("CRUCIBLE_RUN_INSIGHTS_RECORD_ERRORS", True):
+            return None
+        if not self._enabled():
+            return None
+        payload: Dict[str, Any] = {
+            "provider": str(provider or "unknown"),
+            "cooldown_seconds": max(0, int(cooldown_seconds)),
+            "trigger_reason": str(trigger_reason or "")[:200],
+            "trigger_count": max(0, int(trigger_count)),
+        }
+        return self._emit(
+            kind=EventKind.PROVIDER_COOLDOWN_ENGAGED,
+            stage="librarian_research",
+            run_id=run_id,
+            project_name=project_name,
+            mode=mode,
+            user_problem=user_problem,
+            run_meta=run_meta,
+            payload=payload,
+            outcome=_outcome_dict(
+                OutcomeStatus.PARTIAL,
+                note=f"provider_cooldown:{provider}:{cooldown_seconds}s",
+            ),
+            extra_signals=extra_signals,
+        )
+
+    def record_provider_health_summary(
+        self,
+        *,
+        run_id: str,
+        project_name: str,
+        mode: str,
+        counters: Mapping[str, Mapping[str, int]],
+        cooldown_snapshot: Optional[Mapping[str, Mapping[str, Any]]] = None,
+        user_problem: Optional[str] = None,
+        run_meta: Optional[Mapping[str, Any]] = None,
+        extra_signals: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        """Emit a ``provider_health_summary`` event at end of librarian
+        stage (v1.1.8 Phase 2, Q7).
+
+        Aggregates per-provider counter snapshot + cooldown snapshot.
+        Routes to ``output`` stream because the summary is an
+        end-of-stage observability checkpoint, not a failure.
+
+        Gated by ``CRUCIBLE_RUN_INSIGHTS_RECORD_OUTPUT`` (per-stream).
+        Best-effort; never raises.
+        """
+        if not env_bool("CRUCIBLE_RUN_INSIGHTS_RECORD_OUTPUT", True):
+            return None
+        if not self._enabled():
+            return None
+        # Aggregate totals across providers — useful for v1.2.0
+        # retrieval to spot under-yielding runs at a glance.
+        total_requests = 0
+        total_ok = 0
+        total_citations = 0
+        for c in (counters or {}).values():
+            if not c:
+                continue
+            total_requests += int(c.get("requests", 0))
+            total_ok += int(c.get("ok_200", 0))
+            total_citations += int(c.get("citations_yielded", 0))
+        # _outcome_dict clamps score to [0, 1] (see CLAUDE.md numerical
+        # correctness rule).  Use success rate as the score; absolute
+        # counts live in payload.totals where they belong.
+        success_rate = (
+            float(total_ok) / float(total_requests)
+            if total_requests > 0
+            else 0.0
+        )
+        # Clamp defensively (success_rate should already be [0, 1] but
+        # any counter drift could push it out).
+        success_rate = max(0.0, min(1.0, success_rate))
+
+        payload: Dict[str, Any] = {
+            "counters": {
+                str(p): dict(c) for p, c in (counters or {}).items()
+            },
+            "cooldown_snapshot": (
+                {str(p): dict(c) for p, c in (cooldown_snapshot or {}).items()}
+                if cooldown_snapshot
+                else None
+            ),
+            "totals": {
+                "providers": len(counters or {}),
+                "requests": total_requests,
+                "ok_200": total_ok,
+                "citations_yielded": total_citations,
+            },
+        }
+        return self._emit(
+            kind=EventKind.PROVIDER_HEALTH_SUMMARY,
+            stage="librarian_research",
+            run_id=run_id,
+            project_name=project_name,
+            mode=mode,
+            user_problem=user_problem,
+            run_meta=run_meta,
+            payload=payload,
+            outcome=_outcome_dict(
+                OutcomeStatus.SUCCESS,
+                score=success_rate,
+                note=(
+                    f"providers={len(counters or {})} "
+                    f"citations={total_citations}"
+                ),
+            ),
+            extra_signals=extra_signals,
+        )
+
+    def record_direction_debate_degraded_proceed(
+        self,
+        *,
+        run_id: str,
+        project_name: str,
+        mode: str,
+        selected_direction: str,
+        original_decision: str,
+        consecutive_force_none_count: int,
+        final_score: int,
+        gate_reason: str,
+        attempt: int = 1,
+        user_problem: Optional[str] = None,
+        run_meta: Optional[Mapping[str, Any]] = None,
+        extra_signals: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        """Emit a ``direction_debate_degraded_proceed`` event (v1.1.8
+        Phase 7, P5).
+
+        Records that the gate degraded from force-none to low-confidence
+        proceed after N consecutive same-reason force-none iterations.
+        Routes to ``debate`` stream alongside other gate events.
+
+        Gated by ``CRUCIBLE_RUN_INSIGHTS_RECORD_DEBATE`` (per-stream).
+        Best-effort; never raises.
+
+        Note: emit happens REGARDLESS of whether
+        ``CRUCIBLE_DEBATE_TOLERATE_UNVERIFIABLE_EVIDENCE`` is on — the
+        event captures the OBSERVED degrade-candidate situation so
+        v1.2.0 retrieval can identify which runs would have triggered.
+        The actual decision change is controlled by the env toggle in
+        Phase 7 (``crucible/features/direction_debate/degraded.py``).
+        """
+        if not env_bool("CRUCIBLE_RUN_INSIGHTS_RECORD_DEBATE", True):
+            return None
+        if not self._enabled():
+            return None
+        payload: Dict[str, Any] = {
+            "selected_direction": str(selected_direction or "unknown"),
+            "original_decision": str(original_decision or "force_none"),
+            "consecutive_force_none_count": max(
+                0, int(consecutive_force_none_count)
+            ),
+            "final_score": int(final_score),
+            "gate_reason": str(gate_reason or "")[:500],
+            "attempt": max(1, int(attempt)),
+        }
+        return self._emit(
+            kind=EventKind.DIRECTION_DEBATE_DEGRADED_PROCEED,
+            stage="stage0_direction",
+            run_id=run_id,
+            project_name=project_name,
+            mode=mode,
+            user_problem=user_problem,
+            run_meta=run_meta,
+            payload=payload,
+            outcome=_outcome_dict(
+                OutcomeStatus.PARTIAL,
+                note=f"degraded_proceed:{selected_direction}",
+            ),
+            extra_signals=extra_signals,
+        )
+
     # -- core emit -------------------------------------------------------------
 
     def _emit(
@@ -772,6 +971,16 @@ class _NullRecorder:
     def record_error(self, **_kw: Any) -> None: return None
     def record_direction_debate_rejection(self, **_kw: Any) -> None: return None
     def record_runtime_params(self, **_kw: Any) -> None: return None
+    # v1.1.8 audit mode methods (pre-existing — these were added to
+    # InsightsRecorder but the NullRecorder interface parity was missed).
+    def record_debate_finding(self, **_kw: Any) -> None: return None
+    def record_gate_verdict(self, **_kw: Any) -> None: return None
+    # v1.1.8 extended (Phase 2 + Phase 7) — librarian observability and
+    # degrade-not-die events.  Interface parity prevents AttributeError
+    # when callers run with CRUCIBLE_RUN_INSIGHTS_ENABLED=0.
+    def record_provider_cooldown(self, **_kw: Any) -> None: return None
+    def record_provider_health_summary(self, **_kw: Any) -> None: return None
+    def record_direction_debate_degraded_proceed(self, **_kw: Any) -> None: return None
     def flush(self) -> None: return None
     def close(self) -> None: return None
 

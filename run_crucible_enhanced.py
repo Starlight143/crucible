@@ -1157,6 +1157,12 @@ def cmd_run(args: argparse.Namespace) -> None:
         os.environ["CRUCIBLE_DEBATE_CRITIC_OVERRIDE_PROCEED"] = (
             _b2e(_critic_override_arg) or "0"
         )
+    # v1.1.8 extended — Direction Gate Tuning per-run flag.
+    _tolerate_arg = getattr(args, "tolerate_unverifiable_evidence", None)
+    if _tolerate_arg is not None:
+        os.environ["CRUCIBLE_DEBATE_TOLERATE_UNVERIFIABLE_EVIDENCE"] = (
+            _b2e(_tolerate_arg) or "0"
+        )
 
     # Pre-run: interactive context-gathering session
     _interactive_context_path: Optional[str] = None
@@ -1749,6 +1755,25 @@ def _build_parser() -> argparse.ArgumentParser:
             "PROCEED.  When off (default), Critic dissent is recorded in "
             "the audit trail but the Judge verdict stands.  Recommended to "
             "keep off until the Critic has been calibrated on real loads."
+        ),
+    )
+    # v1.1.8 extended — Direction Gate Tuning per-run flag.  Allows the
+    # direction-debate gate to degrade to low-confidence proceed instead
+    # of force-none after N consecutive refinement iterations with the
+    # same gate reason.  Orthogonal to --audit-mode (that one is
+    # observation-only; this one changes the actual gate decision path).
+    # Hard feasibility failures are NEVER downgraded.
+    run_p.add_argument(
+        "--tolerate-unverifiable-evidence",
+        dest="tolerate_unverifiable_evidence",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("CRUCIBLE_DEBATE_TOLERATE_UNVERIFIABLE_EVIDENCE", False),
+        help=(
+            "Allow the direction-debate gate to degrade to low-confidence "
+            "proceed instead of force-none after N consecutive refinement "
+            "iterations with the same gate reason.  Hard feasibility "
+            "failures are NEVER downgraded.  Useful for niche topics where "
+            "Tier-1 cross-validated sources do not exist (default: off)."
         ),
     )
     run_p.add_argument(

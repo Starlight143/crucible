@@ -243,6 +243,12 @@ const FLAG_META = {
   // operator's Settings choice on every page load.
   debate_audit_mode:     { label:'Audit Mode',          modes:'i', types:[1,2,3,4], desc:{en:'Enable Direction Debate Audit Mode for this run. Every specialist emits a structured AUDIT_FINDING; the Judge emits a GATE_VERDICT (PROCEED/BRANCH/KILL/NEEDS_MORE_DATA). v1.1.8 is observation-only — the audit ledger captures the disagreement trace but the legacy force-none flow is preserved.\nUse case: capture an auditable disagreement log for v1.2.0 retrieval, or to spot premature consensus on contentious ideas.', zh:'本次執行啟用 Direction Debate Audit Mode。每位 specialist 輸出結構化的 AUDIT_FINDING；Judge 額外輸出 GATE_VERDICT (PROCEED / BRANCH / KILL / NEEDS_MORE_DATA)。v1.1.8 只觀察不覆寫 —— audit ledger 記錄分歧軌跡，但保留 force-none 既有行為。\n用途：為 v1.2.0 retrieval 準備可審計的分歧紀錄，或在有爭議的 idea 上偵測過早共識。'} },
   debate_external_critic:{ label:'External Critic',     modes:'i', types:[1,2,3,4], desc:{en:'Enable the External Critic — a sixth agent that re-judges Judge’s verdict using ONLY raw evidence + Judge’s decision token. Critic does NOT see prior agents’ chain-of-thought. v1.1.8 same-family Critic; cross-family ships in v1.3.0. Critic dissent is recorded in audit_trail but does NOT override Judge unless CRUCIBLE_DEBATE_CRITIC_OVERRIDE_PROCEED=1.\nUse case: get a second independent opinion on directions that look too easy or too risky.', zh:'啟用 External Critic —— 第六位 agent，僅使用「原始證據 + Judge 的決策 token」重新審判 Judge 的結論。Critic 看不到其他 agent 的推理過程。v1.1.8 採同模型族 Critic；跨模型族留待 v1.3.0。Critic 反對意見會寫入 audit_trail，但除非 CRUCIBLE_DEBATE_CRITIC_OVERRIDE_PROCEED=1 否則不會覆寫 Judge。\n用途：為看起來太容易或太冒險的方向取得獨立的第二意見。'} },
+  // v1.1.8 extended — Direction Gate Tuning per-run toggle (degrade-not-die).
+  // Backend mirror lives in webui/app.py:_RUN_INSIGHTS_FLAG_TO_ENV; the CLI
+  // form is --tolerate-unverifiable-evidence in run_crucible_enhanced.py.
+  // Orthogonal to debate_audit_mode — Audit Mode is observation-only, this
+  // toggle changes the actual gate decision path.
+  debate_tolerate_unverifiable_evidence: { label:'Tolerate Unverifiable Evidence', modes:'i', types:[1,2,3,4], desc:{en:'Allow the direction-debate gate to degrade to low-confidence proceed (instead of force-none) after N consecutive refinement iterations with the same gate reason. ORTHOGONAL to Audit Mode — that one is observation-only; this one changes the actual decision path. Hard feasibility failures are NEVER downgraded.\nUse case: niche topics where Tier-1 cross-validated sources do not exist (e.g. specific crypto market-structure questions). Lets you get a low-confidence direction + actionable critical_unknowns list instead of zero output.', zh:'允許 direction-debate gate 在連續 N 次同原因 force-none 後降為 low-confidence proceed（而非 force-none）。與 Audit Mode 正交 —— Audit Mode 只觀察不覆寫，這個選項會真的改變決策路徑。Hard feasibility 失敗永遠不會降級。\n用途：Tier-1 交叉驗證來源不存在的 niche 主題（例如特定加密貨幣市場結構問題）。用這個拿到 low-confidence 方向 + critical_unknowns 清單，不至於完全沒輸出。'} },
   strict_json:           { label:'Strict JSON',         modes:'b', types:[1,2,3,4], desc:{en:'Force every LLM call to emit schema-conformant strict JSON, with auto-retry on failure.\nUse case: stable output structure for cases where analysis results are consumed by machines.', zh:'強制所有 LLM 呼叫輸出符合 schema 的嚴格 JSON，失敗時自動重試。\n用途：確保輸出結構穩定，適合需要機器讀取分析結果的場合。'} },
   cost_trace:            { label:'Cost Trace',          modes:'b', types:[1,2,3,4], desc:{en:'Emit a cost marker to stderr after every LLM call completes.\nUse case: debug cost anomalies and trace which stage consumes the most.', zh:'每個 LLM 呼叫完成後即時將成本標記輸出到 stderr。\n用途：Debug 成本異常，追蹤哪個階段消耗最多費用。'} },
   cache:                 { label:'Local Cache',         modes:'b', types:[1,2,3,4], desc:{en:'Enable a local SQLite cache so identical LLM calls return cached results instantly.\nUse case: avoid duplicate LLM cost across repeated runs or flag tweaks; iterate much faster.', zh:'啟用 SQLite 本地快取，相同輸入的 LLM 步驟直接讀取快取結果。\n用途：重複執行或微調旗標時避免重複 LLM 費用，大幅加速迭代。'} },
@@ -389,6 +395,10 @@ const FLAG_GROUPS = [
   // FLAG_META only supports boolean checkboxes.
   { id:'debate_audit', title:'Direction Debate Audit', icon:'⚖️', open:false,
     flags:['debate_audit_mode','debate_external_critic'] },
+  // v1.1.8 extended — Direction Gate Tuning per-run flag panel group.
+  // Single env-backed boolean controlling degrade-not-die behaviour.
+  { id:'debate_resilience', title:'Direction Gate Tuning', icon:'🛡️', open:false,
+    flags:['debate_tolerate_unverifiable_evidence'] },
   { id:'quant',      title:'Quant Analytics Suite',   icon:'📊', open:false,
     flags:['quant_analytics','walk_forward','significance_test','regime_detection',
            'factor_analysis','transaction_cost','monte_carlo','tearsheet',
@@ -460,6 +470,9 @@ const ENV_BACKED_FLAGS = {
   // lockstep (test_wiring.py verifies the lockstep structurally).
   debate_audit_mode:          'CRUCIBLE_DEBATE_AUDIT_MODE',
   debate_external_critic:     'CRUCIBLE_DEBATE_EXTERNAL_CRITIC',
+  // v1.1.8 extended — Direction Gate Tuning (degrade-not-die toggle).
+  // Same lockstep rule as the audit-mode mappings above.
+  debate_tolerate_unverifiable_evidence: 'CRUCIBLE_DEBATE_TOLERATE_UNVERIFIABLE_EVIDENCE',
   // Analysis flags
   strict_json:                'STRICT_JSON',
   cost_trace:                 'COST_TRACE',
@@ -2784,6 +2797,34 @@ const SETTINGS_SCHEMA = [
           'CRUCIBLE_DEBATE_CRITIC_OVERRIDE_PROCEED','CRUCIBLE_DEBATE_CONSENSUS_RISK_THRESHOLD',
           'CRUCIBLE_DEBATE_CRITIC_MAX_ATTEMPTS',
           'CRUCIBLE_RUN_INSIGHTS_RECORD_DEBATE_FINDING','CRUCIBLE_RUN_INSIGHTS_RECORD_GATE_VERDICT'] },
+  // v1.1.8 extended — Direction Gate Tuning.  Single env-backed per-run
+  // toggle (CRUCIBLE_DEBATE_TOLERATE_UNVERIFIABLE_EVIDENCE) controls
+  // whether the gate is allowed to degrade to low-confidence proceed
+  // after N exhausted refinement iterations instead of force-none.
+  // Orthogonal to debate_audit group — that one is observation-only,
+  // this one changes the actual decision path.
+  { id:'debate_resilience', title:'Direction Gate Tuning', icon:'🛡️', open:false,
+    keys:['CRUCIBLE_DEBATE_TOLERATE_UNVERIFIABLE_EVIDENCE',
+          'CRUCIBLE_DEBATE_DEGRADE_AFTER_N_ITERATIONS'] },
+  // v1.1.8 extended — Web Research Hardening.  Five sub-groups covering
+  // disk cache (Q1), provider resilience (Q2/Q3/Q5/Q7/Q9), extra zero-auth
+  // providers (Q4), and query quality (Q6/Q8/Q10/P2).  All defaults are
+  // production-safe.  Operators rarely need to touch these once set.
+  { id:'librarian_cache', title:'Librarian Search Cache', icon:'💾', open:false,
+    keys:['LIBRARIAN_SEARCH_DISK_CACHE_ENABLED','LIBRARIAN_SEARCH_CACHE_PATH',
+          'LIBRARIAN_SEARCH_CACHE_TTL_DDG_HOURS','LIBRARIAN_SEARCH_CACHE_TTL_GITHUB_HOURS',
+          'LIBRARIAN_SEARCH_CACHE_TTL_ARXIV_HOURS','LIBRARIAN_SEARCH_CACHE_TTL_CONTEXT7_HOURS'] },
+  { id:'librarian_resilience', title:'Librarian Provider Resilience', icon:'🌐', open:false,
+    keys:['LIBRARIAN_PROVIDER_COOLDOWN_INITIAL_SECONDS','LIBRARIAN_PROVIDER_COOLDOWN_MAX_SECONDS',
+          'LIBRARIAN_PROVIDER_FALLBACK_ENABLED','LIBRARIAN_ASYNC_FANOUT_ENABLED',
+          'LIBRARIAN_CROSS_PROVIDER_DEDUP_ENABLED','LIBRARIAN_PROVIDER_HEALTH_SUMMARY',
+          'LIBRARIAN_HTTP2_ENABLED','LIBRARIAN_HTTP_KEEPALIVE_ENABLED'] },
+  { id:'librarian_providers', title:'Librarian Extra Providers', icon:'🔌', open:false,
+    keys:['LIBRARIAN_EXTRA_PROVIDERS'] },
+  { id:'librarian_query_quality', title:'Librarian Query Quality', icon:'🎯', open:false,
+    keys:['LIBRARIAN_DOMAIN_PINS_ENABLED','LIBRARIAN_DOMAIN_PINS_PATH',
+          'LIBRARIAN_BILINGUAL_QUERY_EXPANSION','LIBRARIAN_BILINGUAL_QUERY_THRESHOLD',
+          'LIBRARIAN_QUERY_TRANSLATE_MODEL','LIBRARIAN_CLAIM_ATTRIBUTION_DIRECTION_KEY'] },
   { id:'budget', title:'Budget & Cost Limits', icon:'💰', open:false,
     keys:['BUDGET_SOFT_COST_LIMIT','BUDGET_HARD_COST_LIMIT','BUDGET_MAX_TOTAL_TOKENS'] },
   { id:'convergence', title:'Convergence Guard', icon:'🔄', open:false,
@@ -3063,6 +3104,40 @@ const KEY_META = {
   CRUCIBLE_DEBATE_CRITIC_MAX_ATTEMPTS: { label:'Critic Max Attempts', desc:{en:'Maximum retry attempts for the External Critic LLM call. Range 1-5; default 2. Hitting the limit returns a NEEDS_MORE_DATA fallback (never KILL) so a flaky LLM cannot silently destroy viable directions.', zh:'External Critic LLM 呼叫的最大重試次數。範圍 1-5，預設 2。耗盡重試後回傳 NEEDS_MORE_DATA 的安全 fallback (絕對不 KILL)，確保 LLM 不穩定時不會誤殺可行方向。'}, type:'number' },
   CRUCIBLE_RUN_INSIGHTS_RECORD_DEBATE_FINDING: { label:'Record Debate Findings', desc:{en:'auto = follow CRUCIBLE_DEBATE_AUDIT_MODE (record only in audit mode; default). 1 = always record findings (even when audit_mode is off). 0 = never record. Typos fall back to auto, never truthy-coerce.', zh:'auto = 跟隨 CRUCIBLE_DEBATE_AUDIT_MODE (只在 audit mode 開啟時記錄;預設)。1 = 永遠記錄 findings (即使 audit_mode 關閉)。0 = 永遠不記錄。拼錯的值 fallback 回 auto,不會被 truthy-coerce。'}, type:'select', opts:[{v:'auto',l:'auto (follow audit_mode)'},{v:'1',l:'1 (always record)'},{v:'0',l:'0 (never record)'}] },
   CRUCIBLE_RUN_INSIGHTS_RECORD_GATE_VERDICT: { label:'Record Gate Verdicts', desc:{en:'When enabled (default), every direction-debate attempt emits a debate_verdict ledger event with the Judge’s terminal decision (PROCEED / BRANCH / KILL / NEEDS_MORE_DATA). Gate verdicts are cheap to record and the single most-valuable signal for v1.2.0 retrieval — recommended to keep enabled.', zh:'開啟時 (預設)，每次 direction-debate 嘗試都會輸出一筆 debate_verdict ledger 事件，記錄 Judge 的終態決策 (PROCEED / BRANCH / KILL / NEEDS_MORE_DATA)。Gate verdicts 寫入成本低且對 v1.2.0 retrieval 是最有價值的訊號，建議保持開啟。'}, type:'boolean' },
+
+  // v1.1.8 extended — Web Research Hardening: Search Cache (Q1).  All
+  // descriptions bilingual {en, zh} per the v1.1.0 KEY_META contract.
+  LIBRARIAN_SEARCH_DISK_CACHE_ENABLED: { label:'Disk Cache', desc:{en:'Disk-persistent cache for search-provider responses. When enabled, refinement iterations hit cache instead of re-fetching from the provider — typical repeat-run HTTP cost drops 80%+. Cache lives at LIBRARIAN_SEARCH_CACHE_PATH and is separate from the LLM cache. Disable only for cache debugging.', zh:'搜索 provider 回應的 disk 持久化 cache。開啟時 refinement 迭代命中 cache，不再重新打 provider — 重複跑同主題的 HTTP cost 降 80%+。Cache 檔位於 LIBRARIAN_SEARCH_CACHE_PATH，與 LLM cache 分離。除非要 debug cache 否則不要關。'}, type:'boolean' },
+  LIBRARIAN_SEARCH_CACHE_PATH: { label:'Cache Path', desc:{en:'Repo-relative or absolute path for the SQLite search-cache file. Parent directory is auto-created. Override to share cache across multiple Crucible installations.', zh:'SQLite 搜索 cache 檔的 repo 相對或絕對路徑。父目錄自動建立。需要在多個 Crucible 安裝間共用 cache 時改這裡。'}, type:'text' },
+  LIBRARIAN_SEARCH_CACHE_TTL_DDG_HOURS: { label:'DDG TTL (hours)', desc:{en:'DuckDuckGo cache TTL in hours. News drifts fast; 12 is a safe default. Tune down for breaking-news topics, up to reuse cache aggressively.', zh:'DuckDuckGo cache TTL（小時）。新聞 drift 快，預設 12 已偏保守。突發新聞主題調低，靜態主題可調高加大 cache 重用。'}, type:'number' },
+  LIBRARIAN_SEARCH_CACHE_TTL_GITHUB_HOURS: { label:'GitHub TTL (hours)', desc:{en:'GitHub search cache TTL. Repo metadata changes slowly; 24h default. Increase for less-active repos.', zh:'GitHub 搜索 cache TTL。Repo metadata 變動慢，預設 24 小時。不活躍 repo 可調更長。'}, type:'number' },
+  LIBRARIAN_SEARCH_CACHE_TTL_ARXIV_HOURS: { label:'arXiv TTL (hours)', desc:{en:'arXiv API cache TTL. Papers essentially never change once published; 168 hours (1 week) default.', zh:'arXiv API cache TTL。論文發表後幾乎不會改，預設 168 小時（1 週）。'}, type:'number' },
+  LIBRARIAN_SEARCH_CACHE_TTL_CONTEXT7_HOURS: { label:'Context7 TTL (hours)', desc:{en:'Context7 cache TTL. context7 results depend on lane / user_problem context, so TTL is shorter than other providers; default 6 hours.', zh:'Context7 cache TTL。Context7 結果隨 lane / user_problem context 變動，TTL 較短，預設 6 小時。'}, type:'number' },
+
+  // v1.1.8 extended — Web Research Hardening: Provider Resilience (Q2/Q3/Q5/Q6/Q7/Q9).
+  LIBRARIAN_PROVIDER_COOLDOWN_INITIAL_SECONDS: { label:'Cooldown Initial (s)', desc:{en:'Initial cooldown when a provider returns 429 / 202. Doubles on each subsequent trigger up to Cooldown Max. During cooldown the provider is skipped; the fallback chain routes to the next-priority provider.', zh:'provider 收到 429 / 202 時的初始 cooldown 秒數。每次再觸發雙倍，上限 Cooldown Max。Cooldown 期間該 provider 直接跳過，fallback chain 自動路由到下一順位 provider。'}, type:'number' },
+  LIBRARIAN_PROVIDER_COOLDOWN_MAX_SECONDS: { label:'Cooldown Max (s)', desc:{en:'Maximum cooldown duration per provider (doubling cap). Default 1800 = 30 minutes — beyond this the provider is presumed broken for the remainder of the run.', zh:'每個 provider 的 cooldown 上限。預設 1800 = 30 分鐘 — 超過代表該 provider 本次 run 基本壞掉，直接放棄。'}, type:'number' },
+  LIBRARIAN_PROVIDER_FALLBACK_ENABLED: { label:'Fallback Chain', desc:{en:'Enable per-query-class fallback chain. When a primary provider returns empty or enters cooldown, the dispatcher auto-routes to the next provider in the same class (general web / code / academic / docs). Disable to revert to v1.1.7 silo behaviour.', zh:'啟用 per-query-class fallback chain。Primary provider 回空或進 cooldown 時，dispatcher 自動路由到同 class（general web / code / academic / docs）的下一順位 provider。關閉退回 v1.1.7 silo 行為。'}, type:'boolean' },
+  LIBRARIAN_ASYNC_FANOUT_ENABLED: { label:'Async Fan-out', desc:{en:'Async provider fan-out using asyncio + per-provider Semaphore. Largest single librarian wall-clock win — typical 60%+ reduction. Disable to fall back to sequential dispatch (legacy v1.1.7) for emergency rollback.', zh:'用 asyncio + per-provider Semaphore 做 provider 並行 fan-out。Librarian wall-clock 單一最大優化（典型降 60%+）。緊急 rollback 可關閉退回 sequential（v1.1.7 行為）。'}, type:'boolean' },
+  LIBRARIAN_CROSS_PROVIDER_DEDUP_ENABLED: { label:'Cross-Provider Dedup', desc:{en:'Cross-provider query deduplication. Same normalised query sent to multiple providers in the same query class is sent only once, followed by fallback if first returns empty. Saves ~30% of HTTP calls in typical runs.', zh:'跨 provider 的 query 去重。同一 normalized query 對同 class 內多 provider 只打第一個，回空才走 fallback。典型省 30% HTTP call。'}, type:'boolean' },
+  LIBRARIAN_PROVIDER_HEALTH_SUMMARY: { label:'Health Summary', desc:{en:'Emit per-provider health summary at end of librarian stage: request count, 200 OK count, 429/202 count, timeout count, citation yield. Also written to .crucible_insights/output.jsonl for v1.2.0 retrieval.', zh:'librarian 階段結束時印出 per-provider 健康摘要：請求數、200 OK 數、429/202 數、timeout 數、citation 命中數。同時寫入 .crucible_insights/output.jsonl 供 v1.2.0 retrieval 使用。'}, type:'boolean' },
+  LIBRARIAN_HTTP2_ENABLED: { label:'HTTP/2', desc:{en:'Enable HTTP/2 for outbound provider calls. Reduces per-request connection-setup cost by 10-20%. Disable only if a self-hosted SearXNG instance throws TLS handshake errors.', zh:'對 outbound provider 呼叫啟用 HTTP/2。Per-request 連線建立成本降 10-20%。只有自架 SearXNG 出 TLS handshake 錯誤時才需要關。'}, type:'boolean' },
+  LIBRARIAN_HTTP_KEEPALIVE_ENABLED: { label:'HTTP Keep-Alive', desc:{en:'Enable connection-pool reuse across provider calls. Mostly a free win — disable only for HTTP debugging.', zh:'啟用 connection pool 跨 provider 呼叫重用。基本是免費效能優化 — 只有要 debug HTTP 才關。'}, type:'boolean' },
+
+  // v1.1.8 extended — Web Research Hardening: Extra Providers (Q4).
+  LIBRARIAN_EXTRA_PROVIDERS: { label:'Extra Providers', desc:{en:'Comma-separated list of zero-auth providers added to the core list (websearch, context7, grep_app, github, arxiv, paperswithcode). Default: openalex,crossref,wikipedia. Add ``searxng`` only after confirming a public instance you trust. Empty string disables extras.', zh:'用逗號分隔的免認證額外 provider 清單，加在 core list（websearch, context7, grep_app, github, arxiv, paperswithcode）之上。預設 openalex,crossref,wikipedia。確認過信任的公開 instance 才加 searxng。空字串表示停用 extras。'}, type:'text' },
+
+  // v1.1.8 extended — Web Research Hardening: Query Quality (Q8/Q10/P2).
+  LIBRARIAN_DOMAIN_PINS_ENABLED: { label:'Domain Pins', desc:{en:'Enable domain authoritative-source pinning. When user_problem matches a pin in LIBRARIAN_DOMAIN_PINS_PATH, the listed URLs are pre-fetched as Tier-1 anchors BEFORE search dispatch. Closes the gap where DDG returns Tier-2/3 transcriptions of an event but misses the authoritative docs.', zh:'啟用領域權威來源 pinning。user_problem 命中 LIBRARIAN_DOMAIN_PINS_PATH 內的 pin 時，列表 URL 會在 search dispatch 前被預先抓取作為 Tier-1 錨點。修補 DDG 只回 Tier-2/3 媒體轉述、漏掉官方 docs 的盲點。'}, type:'boolean' },
+  LIBRARIAN_DOMAIN_PINS_PATH: { label:'Domain Pins Path', desc:{en:'Repo-relative or absolute path to the JSON pin file. Format: see crucible/config/domain_pins.json (the repo does not use PyYAML so JSON only).', zh:'JSON pin 設定檔的 repo 相對或絕對路徑。格式參見 crucible/config/domain_pins.json（repo 不裝 PyYAML，所以用 JSON）。'}, type:'text' },
+  LIBRARIAN_BILINGUAL_QUERY_EXPANSION: { label:'Bilingual Query', desc:{en:'Auto-issue an English mirror for CJK queries when native-language result count falls below LIBRARIAN_BILINGUAL_QUERY_THRESHOLD. Cross-language results are deduped so the same paper found via Chinese title + English title counts only once. Disable for English-only workloads.', zh:'CJK 查詢的原文結果數低於 LIBRARIAN_BILINGUAL_QUERY_THRESHOLD 時，自動加打英文鏡像。跨語言結果會 dedup — 同論文被中英文標題各命中一次只算一條 citation。純英文工作量可關。'}, type:'boolean' },
+  LIBRARIAN_BILINGUAL_QUERY_THRESHOLD: { label:'Bilingual Threshold', desc:{en:'Native-language result count below which the English mirror is issued. Range 1-10; default 3 — only translate when the native search is clearly under-yielding.', zh:'原文結果數低於這個門檻才加打英文鏡像。範圍 1-10，預設 3 — 原文搜索結果明顯不足才翻譯。'}, type:'number' },
+  LIBRARIAN_QUERY_TRANSLATE_MODEL: { label:'Translate Model', desc:{en:'LLM model handling CJK to English query translation. Empty = reuse the librarian model. Override with a smaller / cheaper model for translation-only workload.', zh:'處理 CJK 到英文查詢翻譯的 LLM model。空值 = 重用 librarian model。需要用更小 / 更便宜的模型只跑翻譯時改這裡。'}, type:'text' },
+  LIBRARIAN_CLAIM_ATTRIBUTION_DIRECTION_KEY: { label:'Per-Direction Attribution', desc:{en:'Per-direction claim attribution. When enabled, the librarian tags each claim with direction key (A..G) and decision field (thesis / primary_metric / fastest_test / major_risk / data_sources) it anchors to. The evidence auditor reads these tags to populate supported_fields — without this, supported_fields is empty for every direction and the force-none gate always triggers (see v1.1.8 diagnostic). Disable only for librarian-prompt regression debugging.', zh:'每個方向的 claim attribution。開啟時 librarian 替每條 claim 標記它支持哪個方向（A..G）的哪個欄位（thesis / primary_metric / fastest_test / major_risk / data_sources）。Evidence auditor 讀這些標記填 supported_fields — 不開的話每個方向 supported_fields 都是空，force-none gate 必然觸發（見 v1.1.8 診斷）。除非 debug librarian prompt 回歸否則不要關。'}, type:'boolean' },
+
+  // v1.1.8 extended — Direction Gate Tuning (P5).
+  CRUCIBLE_DEBATE_TOLERATE_UNVERIFIABLE_EVIDENCE: { label:'Tolerate Unverifiable Evidence', desc:{en:'Master switch for degrade-not-die. 0 (default) = legacy v1.1.7 force-none behaviour: gate kills pipeline if no direction can be defended. 1 = after N consecutive force-none iterations with the same reason, gate picks the highest-scoring direction (even if clamped to 0) and marks it low-confidence instead. Hard feasibility failures are NEVER downgraded.', zh:'degrade-not-die 主開關。0（預設）= v1.1.7 既有 force-none 行為，沒有方向可辯護時 gate 直接中止 pipeline。1 = N 次連續同原因 force-none 後，gate 選 final_score 最高的方向（即使被 clamp 到 0）標 low-confidence 繼續。hard feasibility 失敗永不降級。'}, type:'boolean' },
+  CRUCIBLE_DEBATE_DEGRADE_AFTER_N_ITERATIONS: { label:'Degrade After N Iterations', desc:{en:'Number of consecutive force-none iterations with the same gate reason that trigger the degrade path. Range 1-5; default 3 matches DIRECTION_REFINEMENT_MAX_ITERATIONS+1 so degrade only fires when refinement is fully exhausted.', zh:'觸發 degrade path 所需的連續同原因 force-none 次數。範圍 1-5，預設 3 對齊 DIRECTION_REFINEMENT_MAX_ITERATIONS+1，確保 refinement 完全用盡才 degrade。'}, type:'number' },
 };
 
 function _toggleSection(hdr) {

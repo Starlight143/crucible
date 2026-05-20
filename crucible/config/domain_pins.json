@@ -1,0 +1,343 @@
+{
+  "version": 1,
+  "description": "Domain authoritative-source pinning for the v1.1.8 librarian. When a user_problem matches one of these pins, the listed URLs are pre-fetched as Tier-1 anchors BEFORE search-provider dispatch. This guarantees the auditor has authoritative material to anchor direction-specific claims to (thesis / primary_metric / fastest_test / data_sources).\n\nMatch semantics:\n- ``mode`` is matched case-insensitively against the run mode (quant / saas / agent / scientist).\n- ``any_keyword`` is a list; the pin fires when ANY keyword appears as a case-insensitive substring of the lower-cased user_problem.\n- ``all_keywords`` (optional) is a list; the pin fires only when ALL listed keywords appear.\n- A pin with no keywords matches every problem in the given mode (use sparingly).\n\nLoader: ``crucible/web_research/domain_pins.py`` (added in v1.1.8 Phase 3). Format is JSON because the repo does not depend on PyYAML.",
+  "pins": [
+    {
+      "id": "crypto_perpetuals",
+      "label": "Crypto perpetual futures (Binance / Hyperliquid / general)",
+      "match": {
+        "mode": "quant",
+        "any_keyword": [
+          "binance",
+          "hyperliquid",
+          "perpetual",
+          "perp futures",
+          "funding rate",
+          "資金費率",
+          "永續合約",
+          "永续合约"
+        ]
+      },
+      "pre_fetch": [
+        {
+          "url": "https://binance-docs.github.io/apidocs/futures/en/",
+          "tier": "Tier-1",
+          "label": "Binance USDS-M Futures API reference",
+          "subject_hint": "funding rate mechanism, mark-price klines, paged-history limits"
+        },
+        {
+          "url": "https://www.binance.com/en/support/faq/introduction-to-binance-futures-funding-rates-360033525031",
+          "tier": "Tier-1",
+          "label": "Binance Funding Rate FAQ",
+          "subject_hint": "interval, formula, premium index"
+        },
+        {
+          "url": "https://hyperliquid.gitbook.io/hyperliquid-docs/trading/funding",
+          "tier": "Tier-1",
+          "label": "Hyperliquid funding-rate documentation",
+          "subject_hint": "funding interval, oracle-vs-mid premium"
+        },
+        {
+          "url": "https://www.coingecko.com/en/api/documentation",
+          "tier": "Tier-1",
+          "label": "CoinGecko Free API",
+          "subject_hint": "price history, volume, market cap"
+        }
+      ]
+    },
+    {
+      "id": "ethereum_onchain",
+      "label": "Ethereum on-chain metrics",
+      "match": {
+        "mode": "quant",
+        "any_keyword": [
+          "ethereum",
+          "eth ",
+          " eth",
+          "on-chain",
+          "鏈上",
+          "链上",
+          "active addresses",
+          "活躍地址",
+          "活跃地址",
+          "gas fee",
+          "gwei"
+        ]
+      },
+      "pre_fetch": [
+        {
+          "url": "https://ethereum.org/en/developers/docs/blocks/",
+          "tier": "Tier-1",
+          "label": "Ethereum.org developer docs",
+          "subject_hint": "block structure, gas, mempool"
+        },
+        {
+          "url": "https://etherscan.io/charts",
+          "tier": "Tier-1",
+          "label": "Etherscan public charts",
+          "subject_hint": "active addresses, gas price, contract calls"
+        }
+      ]
+    },
+    {
+      "id": "tradfi_metrics",
+      "label": "Traditional finance metrics (Sharpe, Sortino, drawdown, etc.)",
+      "match": {
+        "mode": "quant",
+        "any_keyword": [
+          "sharpe",
+          "sortino",
+          "drawdown",
+          "max drawdown",
+          "var",
+          "cvar",
+          "calmar",
+          "kelly",
+          "回撤",
+          "夏普"
+        ]
+      },
+      "pre_fetch": [
+        {
+          "url": "https://en.wikipedia.org/wiki/Sharpe_ratio",
+          "tier": "Tier-1",
+          "label": "Wikipedia: Sharpe ratio",
+          "subject_hint": "definition, formula, criticism"
+        },
+        {
+          "url": "https://en.wikipedia.org/wiki/Sortino_ratio",
+          "tier": "Tier-1",
+          "label": "Wikipedia: Sortino ratio",
+          "subject_hint": "downside deviation, target return"
+        },
+        {
+          "url": "https://en.wikipedia.org/wiki/Drawdown_(economics)",
+          "tier": "Tier-1",
+          "label": "Wikipedia: Drawdown",
+          "subject_hint": "max drawdown, recovery time, Calmar"
+        },
+        {
+          "url": "https://en.wikipedia.org/wiki/Kelly_criterion",
+          "tier": "Tier-1",
+          "label": "Wikipedia: Kelly criterion",
+          "subject_hint": "sizing formula, half-Kelly, common misuse"
+        }
+      ]
+    },
+    {
+      "id": "tradfi_market_structure",
+      "label": "Traditional finance market structure (CME, options, futures)",
+      "match": {
+        "mode": "quant",
+        "any_keyword": [
+          "futures",
+          "options",
+          "cme",
+          "vix",
+          "treasury",
+          "yield curve",
+          "期貨",
+          "期货",
+          "選擇權",
+          "期权"
+        ]
+      },
+      "pre_fetch": [
+        {
+          "url": "https://www.cmegroup.com/education.html",
+          "tier": "Tier-1",
+          "label": "CME Group Education",
+          "subject_hint": "contract specs, margin, settlement"
+        },
+        {
+          "url": "https://en.wikipedia.org/wiki/Black%E2%80%93Scholes_model",
+          "tier": "Tier-1",
+          "label": "Wikipedia: Black-Scholes model",
+          "subject_hint": "pricing PDE, Greeks, assumptions"
+        }
+      ]
+    },
+    {
+      "id": "scientific_methods",
+      "label": "Scientific research methodology (statistics, ML)",
+      "match": {
+        "mode": "scientist",
+        "any_keyword": [
+          "permutation",
+          "bootstrap",
+          "p-value",
+          "confidence interval",
+          "hmm",
+          "kalman",
+          "monte carlo",
+          "假設檢定",
+          "假设检定",
+          "蒙地卡羅",
+          "蒙特卡洛"
+        ]
+      },
+      "pre_fetch": [
+        {
+          "url": "https://en.wikipedia.org/wiki/Permutation_test",
+          "tier": "Tier-1",
+          "label": "Wikipedia: Permutation test",
+          "subject_hint": "two-sided test, null hypothesis"
+        },
+        {
+          "url": "https://en.wikipedia.org/wiki/Bootstrapping_(statistics)",
+          "tier": "Tier-1",
+          "label": "Wikipedia: Bootstrap (statistics)",
+          "subject_hint": "resampling, BCa CI"
+        },
+        {
+          "url": "https://en.wikipedia.org/wiki/Hidden_Markov_model",
+          "tier": "Tier-1",
+          "label": "Wikipedia: Hidden Markov model",
+          "subject_hint": "Baum-Welch, Viterbi, regime"
+        }
+      ]
+    },
+    {
+      "id": "saas_payments",
+      "label": "SaaS payment and subscription infrastructure",
+      "match": {
+        "mode": "saas",
+        "any_keyword": [
+          "stripe",
+          "billing",
+          "subscription",
+          "payment",
+          "webhook signature",
+          "idempotency",
+          "金流",
+          "訂閱",
+          "订阅"
+        ]
+      },
+      "pre_fetch": [
+        {
+          "url": "https://docs.stripe.com/api",
+          "tier": "Tier-1",
+          "label": "Stripe API documentation",
+          "subject_hint": "charges, customers, subscriptions, webhooks"
+        },
+        {
+          "url": "https://docs.stripe.com/webhooks/signatures",
+          "tier": "Tier-1",
+          "label": "Stripe webhook signature verification",
+          "subject_hint": "Stripe-Signature header, replay protection"
+        }
+      ]
+    },
+    {
+      "id": "saas_auth",
+      "label": "SaaS authentication and authorisation",
+      "match": {
+        "mode": "saas",
+        "any_keyword": [
+          "auth0",
+          "oauth",
+          "openid",
+          "saml",
+          "jwt",
+          "session",
+          "認證",
+          "认证",
+          "授權",
+          "授权"
+        ]
+      },
+      "pre_fetch": [
+        {
+          "url": "https://auth0.com/docs",
+          "tier": "Tier-1",
+          "label": "Auth0 documentation hub",
+          "subject_hint": "OAuth/OIDC flows, tokens, RBAC"
+        },
+        {
+          "url": "https://datatracker.ietf.org/doc/html/rfc6749",
+          "tier": "Tier-1",
+          "label": "RFC 6749 — The OAuth 2.0 Authorization Framework",
+          "subject_hint": "grant types, refresh tokens"
+        }
+      ]
+    },
+    {
+      "id": "saas_cloud_arch",
+      "label": "SaaS cloud architecture (AWS / general)",
+      "match": {
+        "mode": "saas",
+        "any_keyword": [
+          "aws",
+          "lambda",
+          "dynamodb",
+          "s3",
+          "ecs",
+          "rds",
+          "kubernetes",
+          "k8s",
+          "雲端架構",
+          "云端架构"
+        ]
+      },
+      "pre_fetch": [
+        {
+          "url": "https://docs.aws.amazon.com/wellarchitected/latest/framework/welcome.html",
+          "tier": "Tier-1",
+          "label": "AWS Well-Architected Framework",
+          "subject_hint": "five pillars, design principles"
+        },
+        {
+          "url": "https://kubernetes.io/docs/concepts/",
+          "tier": "Tier-1",
+          "label": "Kubernetes core concepts",
+          "subject_hint": "pods, services, deployments, ingress"
+        }
+      ]
+    },
+    {
+      "id": "agent_llm_cookbook",
+      "label": "LLM agent design (OpenAI / Anthropic / LangChain)",
+      "match": {
+        "mode": "agent",
+        "any_keyword": [
+          "openai",
+          "anthropic",
+          "claude",
+          "tool use",
+          "function calling",
+          "langchain",
+          "langgraph",
+          "rag",
+          "代理人",
+          "智能体"
+        ]
+      },
+      "pre_fetch": [
+        {
+          "url": "https://cookbook.openai.com/",
+          "tier": "Tier-1",
+          "label": "OpenAI Cookbook",
+          "subject_hint": "tool use, function calling, structured outputs"
+        },
+        {
+          "url": "https://docs.anthropic.com/en/docs/intro",
+          "tier": "Tier-1",
+          "label": "Anthropic Claude documentation",
+          "subject_hint": "tool use, prompt caching, vision"
+        },
+        {
+          "url": "https://python.langchain.com/docs/introduction/",
+          "tier": "Tier-1",
+          "label": "LangChain Python documentation",
+          "subject_hint": "chains, agents, retrievers, tools"
+        }
+      ]
+    }
+  ],
+  "searxng_instances": [
+    "https://searx.be",
+    "https://searx.tiekoetter.com",
+    "https://search.brave4u.com"
+  ]
+}

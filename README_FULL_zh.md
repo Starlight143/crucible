@@ -109,6 +109,22 @@ Direction Debate Audit Mode 是可選的擴充能力,專門擷取每位 speciali
 
 整個 audit-mode 流程是**只觀察不覆寫**:它擷取分歧軌跡但不會改變實際被選用的方向,因此可以在生產環境直接啟用,不會影響執行結果。完整 env 參數列表見 `.env.example`,Settings 頁面的「Direction Debate Audit」群組提供每個旗標的詳細說明。
 
+#### 選用功能:Librarian Web Research Hardening
+
+librarian 研究階段新增五項韌性與品質強化,預設值都安全(操作員通常不必動):
+
+- **磁碟持久化 search cache**(`saved_projects/.cache/search_cache.sqlite3`)。每個 provider 各自 TTL(DuckDuckGo 12h、GitHub 24h、arXiv 168h)。同主題重跑時,refinement 命中 cache,典型重複 run 的 HTTP cost 降 80% 以上。
+- **Per-provider adaptive cooldown**:provider 回 429 / 202 時自動 backoff(60s → 120s → ... 最高 30min),期間 dispatcher 直接 route 過該 provider,不再撞牆。
+- **四個免認證新 provider**:OpenAlex(100k req/天的學術)、Crossref(DOI metadata 跨領域)、Wikipedia REST(定義性 Tier-1 baseline)、SearXNG(opt-in 聯合搜索)。透過 `LIBRARIAN_EXTRA_PROVIDERS` 設定(預設 `openalex,crossref,wikipedia`)。全部共用同一套 cache / cooldown / dedup / SSRF 基建。
+- **跨 provider query 去重**:同一 normalised query 對同 class 內多個 provider 只打第一個,典型省 30% HTTP call。透過 `LIBRARIAN_CROSS_PROVIDER_DEDUP_ENABLED` 切換。
+- **領域權威來源 pinning**(`crucible/config/domain_pins.json`):user_problem 命中 operator 定義的 pin(例如 crypto 永續 → Binance docs;tradfi 指標 → Wikipedia Sharpe 頁面)時,librarian 在 search dispatch 前先抓這些 URL 作為 Tier-1 錨點。修補 DDG 只回媒體轉述、漏掉官方 docs 的盲點。
+- **CJK 查詢雙語擴增**:原文結果數低於 `LIBRARIAN_BILINGUAL_QUERY_THRESHOLD=3` 時自動加打英文 mirror(預設用 librarian 自身的 LLM 翻譯)。跨語言結果會 dedup,同論文中英文標題各命中一次只算一條 citation。
+- **HTTP/2 + connection keep-alive**:outbound 呼叫(`h2` 套件選裝;沒裝就 graceful degrade 回 HTTP/1.1)。
+
+以上全部繼承 v1.1.x 既有的 SSRF 防護(不 follow_redirects=True、每跳重 check `_is_public_http_url`、不接受 IPv6 scope-id smuggling、不接受 IPv4-embedded-IPv6 繞過)。詳細 env 參數見 `.env.example`,Settings 頁新增四個群組(`Librarian Search Cache`、`Librarian Provider Resilience`、`Librarian Extra Providers`、`Librarian Query Quality`)涵蓋所有旋鈕。
+
+互補的 `CRUCIBLE_DEBATE_TOLERATE_UNVERIFIABLE_EVIDENCE` 旗標可讓操作員為 direction-debate gate 開啟「degrade-not-die」語意,當 refinement 用盡仍 force-none 時不再回 `None`。目前為觀察模式 —— ledger event 標出哪些 run 會受益,實際行為改寫留待後續更新。
+
 ### Stage 3: Analysis Crew
 
 五位專業分析師獨立評估:
