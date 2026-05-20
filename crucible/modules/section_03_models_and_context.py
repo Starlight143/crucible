@@ -12,6 +12,13 @@ from . import section_02_research_and_llm as _prev_02
 
 globals().update({k: v for k, v in _prev_02.__dict__.items() if not k.startswith("__")})
 
+# v1.1.8: Direction Debate Audit Mode introduces enum-style decision spaces
+# (PROCEED / BRANCH / KILL / NEEDS_MORE_DATA) and a closed set of agent roles
+# (explorer / comparator / skeptic / evidence_auditor / judge / critic).
+# ``Literal`` is not re-exported from section_00 so we pull it in directly
+# here; the import is cheap and only used by the new schemas below.
+from typing import Literal
+
 
 class Experiment(BaseModel):
     goal: str = Field(..., description="驗證目標")
@@ -464,6 +471,377 @@ class DirectionDebateArtifacts(BaseModel):
         default=None,
         description="Structured evidence audit report for the debate run",
     )
+
+
+# =============================================================================
+# v1.1.8 — Direction Debate Audit Mode pydantic schemas
+# =============================================================================
+# These models structure the per-agent findings emitted during Stage 0
+# direction debate when ``CRUCIBLE_DEBATE_AUDIT_MODE=1``.  They are additive:
+# the legacy ``DirectionDecision`` flow still works untouched; the audit-mode
+# orchestration in ``section_02:_run_single_direction_debate`` populates a
+# ``GateVerdict`` *in parallel* and translates it back to ``force_none`` /
+# ``selected_direction`` for downstream consumers (section_04 / section_05 /
+# section_07) so back-compat is preserved.
+#
+# Schema invariants are enforced by pydantic ``model_validator`` instead of
+# split branches in business logic — the goal is "the model must KILL with
+# failed_invariants OR NEEDS_MORE_DATA with blocking_evidence_queries, no
+# silent downgrade between the two".  See ``CLAUDE.md § 11`` for the v1.1.8
+# rationale.
+
+
+class EvidenceRef(BaseModel):
+    """A single piece of evidence supporting a specialist's claim.
+
+    The ``claim`` + ``source_url`` pair is the minimum we need to let v1.2.0
+    retrieval cross-reference identical evidence across runs.  ``confidence``
+    is in [0, 1] and uses ``ge=`` / ``le=`` floor/ceil so pydantic enforces
+    bounds at construction (no silent saturation).
+    """
+
+    claim: str = Field(..., min_length=1, description="The claim being supported")
+    source_url: str = Field(default="", description="Canonical URL of the source")
+    source_title: str = Field(default="", description="Human-readable source title")
+    confidence: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="0..1 confidence in this evidence (saturated, not silently clamped)",
+    )
+
+
+class Concern(BaseModel):
+    """A concern raised by a specialist about a direction or claim.
+
+    ``severity`` is enum-typed so downstream aggregators can count
+    blocking-severity concerns deterministically (e.g. ``groupthink_score``
+    weights ``blocking`` 10x ``minor``).  ``blocks_directions`` lists the
+    direction keys this concern explicitly blocks; an empty list means the
+    concern is general (applies to all directions or to a meta point).
+    """
+
+    severity: Literal["minor", "material", "blocking"] = Field(
+        ..., description="How critical the concern is for the gate decision"
+    )
+    description: str = Field(..., min_length=1, description="The concern in plain text")
+    blocks_directions: List[str] = Field(
+        default_factory=list,
+        description='Direction keys (e.g. ["A","C"]) blocked by this concern',
+    )
+
+
+class Disagreement(BaseModel):
+    """A specialist's explicit disagreement with another specialist's conclusion.
+
+    The ``with_role`` field must reference one of the canonical agent roles
+    (validated at the parent ``SpecialistFinding`` level).  Recording
+    disagreement explicitly is the v1.1.8 audit-mode payoff: groupthink is
+    detected by ``sum(len(role.disagreement_with) for role in findings) == 0``.
+    """
+
+    with_role: str = Field(
+        ..., min_length=1, description="The role being disagreed with (e.g. 'skeptic')"
+    )
+    point: str = Field(..., min_length=1, description="The substantive point of disagreement")
+    severity: Literal["minor", "material", "blocking"] = Field(
+        default="material",
+        description="How material the disagreement is to the gate decision",
+    )
+
+
+class SpecialistFinding(BaseModel):
+    """Structured output from one specialist in the Stage 0 direction debate.
+
+    Every specialist (Explorer, Comparator, Skeptic, Evidence Auditor, Judge,
+    optional Critic) emits one of these.  v1.2.0 retrieval will index across
+    them by ``role`` + ``concerns[*].description`` to surface "this same
+    concern was raised on past similar runs" hints into future Stage 0 prompts.
+
+    Why these fields specifically:
+
+    * ``assumptions`` — the most-actionable groupthink signal.  Five agents
+      sharing 80% of their assumption set means we have one agent voting five
+      times, not five independent views.
+    * ``supporting_evidence`` vs ``missing_information`` — splits "what I
+      know" from "what I need to know".  Mira Chen's original point about
+      Critic being able to ``KILL`` instead of always ``NEEDS_MORE_DATA``
+      depends on this split being explicit.
+    * ``disagreement_with`` — the audit trail's core.  If empty across all
+      five agents, ``ConsensusRiskReport`` flags ``zero_disagreement_recorded``.
+    * ``failed_invariants`` — only populated by ``judge`` / ``critic`` roles
+      when they want a hard KILL.  Other roles must leave it empty.
+    """
+
+    role: Literal[
+        "explorer", "comparator", "skeptic", "evidence_auditor", "judge", "critic"
+    ] = Field(..., description="The agent role producing this finding")
+    conclusion: str = Field(..., min_length=1, description="The agent's main conclusion")
+    confidence: float = Field(
+        ...,
+        ge=0.0,
+        le=1.0,
+        description="0..1 confidence in the conclusion (saturated, not silently clamped)",
+    )
+    assumptions: List[str] = Field(
+        default_factory=list,
+        description="Explicit assumptions underlying the conclusion",
+    )
+    supporting_evidence: List[EvidenceRef] = Field(
+        default_factory=list,
+        description="Evidence backing the conclusion (with confidence)",
+    )
+    concerns: List[Concern] = Field(
+        default_factory=list,
+        description="Concerns the agent has about the conclusion or its inputs",
+    )
+    disagreement_with: List[Disagreement] = Field(
+        default_factory=list,
+        description="Explicit disagreements with other specialists",
+    )
+    missing_information: List[str] = Field(
+        default_factory=list,
+        description="Information the agent would need to raise confidence",
+    )
+    failed_invariants: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Hard invariants violated by the current direction; only ``judge`` / "
+            "``critic`` roles populate this when they want a hard KILL.  Other "
+            "roles must leave it empty."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _check_role_invariant_scope(self) -> "SpecialistFinding":
+        if self.failed_invariants and self.role not in ("judge", "critic"):
+            raise ValueError(
+                f"SpecialistFinding.failed_invariants is only valid for "
+                f"role=judge|critic, got role={self.role!r}"
+            )
+        return self
+
+
+class BranchSpec(BaseModel):
+    """One branch when ``GateVerdict.decision == 'BRANCH'``.
+
+    BRANCH semantics in v1.1.8 are **audit-only + retrieval-fed**: the
+    current run still picks ``branched_paths[0].direction_id`` as its
+    PROCEED direction, but the ledger event ``direction_debate_verdict``
+    preserves the full branch list for v1.2.0 retrieval to surface as
+    "this hypothesis split before; consider these alternatives" hints on
+    future similar runs.  We do NOT spawn sub-runs in v1.1.8 — that is a
+    v1.2.0 / v1.3.0 capability gated on cost-control work.
+    """
+
+    direction_id: str = Field(
+        ..., min_length=1, description="Direction key (A-G) for this branch"
+    )
+    rationale: str = Field(..., min_length=1, description="Why this is a separate branch")
+    blocking_questions: List[str] = Field(
+        default_factory=list,
+        description="Questions whose answers determine whether this branch converges",
+    )
+
+
+class AuditTrail(BaseModel):
+    """Audit trail metadata attached to a ``GateVerdict``.
+
+    Designed so a future reviewer can reconstruct: what mode was the
+    orchestrator in, did the external critic run, did it override the
+    Judge, and (v1.3.0-reserved) what model family did the critic use.
+    """
+
+    audit_mode_enabled: bool = Field(default=False)
+    isolation_mode: Literal["sequential", "hybrid"] = Field(default="sequential")
+    external_critic_used: bool = Field(default=False)
+    critic_overrode_judge: bool = Field(default=False)
+    critic_dissent_recorded: bool = Field(
+        default=False,
+        description=(
+            "True when the external critic disagreed with Judge but "
+            "CRITIC_OVERRIDE_PROCEED=0 (Judge verdict kept; dissent logged)."
+        ),
+    )
+    critic_model_family: Optional[str] = Field(
+        default=None,
+        description=(
+            "Reserved for v1.3.0.  In v1.1.8 the external critic uses the same "
+            "model family as the Judge so this field is always ``None``; "
+            "v1.3.0 will populate it once cross-family critics ship."
+        ),
+    )
+    consensus_risk_threshold: float = Field(default=0.3, ge=0.0, le=1.0)
+    judge_initial_decision: Optional[str] = Field(
+        default=None,
+        description=(
+            "Original Judge decision before any critic override.  Populated "
+            "when ``critic_overrode_judge`` is True so the audit trail does "
+            "not lose what the Judge originally said."
+        ),
+    )
+
+
+class ConsensusRiskReport(BaseModel):
+    """Risk analysis of how unified the specialists were.
+
+    The five metrics below are deterministic (no embedding model required)
+    so they can be recomputed verbatim by v1.2.0 retrieval from the stored
+    ledger event without re-running any LLM.
+
+    Heuristic thresholds (see ``crucible/features/direction_debate/consensus.py``):
+
+    * ``concern_diversity < CONSENSUS_RISK_THRESHOLD`` (default 0.3) flags
+      ``low_diversity_high_confidence`` when all confidences > 0.85.
+    * ``confidence_variance < 0.05`` AND mean confidence > 0.85 flags
+      ``all_high_confidence_low_variance``.
+    * Any role with ``len(concerns) < 2`` AND ``confidence > 0.85`` flags
+      ``agent_too_confident_no_concerns`` — Mira Chen's "全員一致時反而最可疑"
+      sensor.
+    * ``sum(len(role.disagreement_with) for role in findings) == 0`` flags
+      ``zero_disagreement_recorded`` — the most-direct groupthink signal.
+
+    ``groupthink_score`` is a weighted combination of the above in [0, 1].
+    """
+
+    groupthink_score: float = Field(
+        ..., ge=0.0, le=1.0, description="0..1 score; higher = more groupthink-like"
+    )
+    concern_diversity: float = Field(
+        ..., ge=0.0, le=1.0, description="Jaccard-style diversity of concerns; lower = more uniform"
+    )
+    assumption_overlap: float = Field(
+        ..., ge=0.0, le=1.0, description="Overlap of assumptions; higher = more shared"
+    )
+    confidence_variance: float = Field(
+        ..., ge=0.0, description="Stddev of confidence across specialists"
+    )
+    flags: List[str] = Field(
+        default_factory=list, description="Triggered risk flag strings"
+    )
+    raw_metrics: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Underlying metrics for debugging; not written to ledger",
+    )
+
+
+class GateVerdict(BaseModel):
+    """Final gate decision with full audit context.
+
+    The decision space is closed: ``PROCEED | BRANCH | KILL | NEEDS_MORE_DATA``.
+    Pydantic model_validator enforces that each decision has the right
+    *structural shape*:
+
+    * PROCEED → must have ``selected_direction`` in A..G
+    * KILL → must have ≥1 ``failed_invariants``; ``selected_direction`` MUST be None
+    * NEEDS_MORE_DATA → must have ≥1 ``blocking_evidence_queries``
+    * BRANCH → must have ≥2 ``branched_paths``
+
+    This structural enforcement is the v1.1.8 contract: the model cannot
+    silently downgrade a KILL into a NEEDS_MORE_DATA (or vice-versa) by
+    choosing the easier-to-fill field, because each decision has a *different*
+    required-field shape.  Same goal as Mira Chen's "let Critic actually
+    output hard KILL instead of always 'needs more data'".
+    """
+
+    decision: Literal["PROCEED", "BRANCH", "KILL", "NEEDS_MORE_DATA"] = Field(
+        ..., description="The gate's terminal decision"
+    )
+    selected_direction: Optional[str] = Field(
+        default=None,
+        description='Direction key "A".."G" when decision==PROCEED; None otherwise',
+    )
+    branched_paths: List[BranchSpec] = Field(
+        default_factory=list,
+        description="≥2 branches when decision==BRANCH; empty otherwise",
+    )
+    failed_invariants: List[str] = Field(
+        default_factory=list,
+        description="≥1 hard invariants when decision==KILL; empty otherwise",
+    )
+    blocking_evidence_queries: List[str] = Field(
+        default_factory=list,
+        description="≥1 specific queries when decision==NEEDS_MORE_DATA; empty otherwise",
+    )
+    reason: str = Field(
+        ...,
+        min_length=20,
+        description="≥20 chars explaining the decision",
+    )
+    consensus_risk: Optional[ConsensusRiskReport] = Field(
+        default=None,
+        description="Risk analysis across specialists; populated when audit_mode=on",
+    )
+    findings: List[SpecialistFinding] = Field(
+        default_factory=list,
+        description="All specialists' structured outputs (audit mode only)",
+    )
+    audit_trail: AuditTrail = Field(default_factory=AuditTrail)
+
+    @model_validator(mode="after")
+    def _check_decision_invariants(self) -> "GateVerdict":
+        d = self.decision
+
+        # Pydantic ``Literal`` already validates the enum value; the checks
+        # below enforce the *structural shape* requirement per decision.
+        if d == "PROCEED":
+            sd = self.selected_direction
+            if not sd or sd == "none":
+                raise ValueError(
+                    "GateVerdict.decision=PROCEED requires selected_direction in A..G"
+                )
+            if sd not in {"A", "B", "C", "D", "E", "F", "G"}:
+                raise ValueError(
+                    f"GateVerdict.selected_direction must be one of A..G when "
+                    f"decision=PROCEED, got {sd!r}"
+                )
+            if self.failed_invariants:
+                raise ValueError(
+                    "GateVerdict.decision=PROCEED must not have failed_invariants"
+                )
+            if self.blocking_evidence_queries:
+                raise ValueError(
+                    "GateVerdict.decision=PROCEED must not have "
+                    "blocking_evidence_queries (use NEEDS_MORE_DATA for that)"
+                )
+        elif d == "KILL":
+            if not self.failed_invariants:
+                raise ValueError(
+                    "GateVerdict.decision=KILL requires at least 1 "
+                    "failed_invariants entry (hard kill must cite an invariant)"
+                )
+            if self.selected_direction not in (None, "", "none"):
+                raise ValueError(
+                    "GateVerdict.decision=KILL must not have selected_direction"
+                )
+            if self.blocking_evidence_queries:
+                raise ValueError(
+                    "GateVerdict.decision=KILL must not have "
+                    "blocking_evidence_queries (use NEEDS_MORE_DATA for that)"
+                )
+        elif d == "NEEDS_MORE_DATA":
+            if not self.blocking_evidence_queries:
+                raise ValueError(
+                    "GateVerdict.decision=NEEDS_MORE_DATA requires at least 1 "
+                    "blocking_evidence_queries entry (must cite what evidence is missing)"
+                )
+            if self.failed_invariants:
+                raise ValueError(
+                    "GateVerdict.decision=NEEDS_MORE_DATA must not have "
+                    "failed_invariants (use KILL for hard violations)"
+                )
+        elif d == "BRANCH":
+            if len(self.branched_paths) < 2:
+                raise ValueError(
+                    "GateVerdict.decision=BRANCH requires at least 2 "
+                    "branched_paths entries (a single branch is not a branch)"
+                )
+            if self.failed_invariants:
+                raise ValueError(
+                    "GateVerdict.decision=BRANCH must not have failed_invariants"
+                )
+
+        return self
 
 
 class ResearchCitation(BaseModel):

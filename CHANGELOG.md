@@ -5,6 +5,162 @@ Versioning follows [Semantic Versioning](https://semver.org/). The first public 
 
 ---
 
+## [v1.1.8] — 2026-05-20
+
+### Added
+- **Direction Debate Audit Mode** — captures the per-specialist disagreement
+  log Mira Chen's feedback on v1.1.7 design identified as the gate's most-
+  valuable output.  Eight new env keys (`CRUCIBLE_DEBATE_AUDIT_MODE`,
+  `CRUCIBLE_DEBATE_REQUIRE_STRUCTURED_FINDINGS`,
+  `CRUCIBLE_DEBATE_ISOLATION_MODE`, `CRUCIBLE_DEBATE_EXTERNAL_CRITIC`,
+  `CRUCIBLE_DEBATE_CRITIC_OVERRIDE_PROCEED`,
+  `CRUCIBLE_DEBATE_CONSENSUS_RISK_THRESHOLD`,
+  `CRUCIBLE_DEBATE_CRITIC_MAX_ATTEMPTS`,
+  `CRUCIBLE_RUN_INSIGHTS_RECORD_DEBATE_FINDING`,
+  `CRUCIBLE_RUN_INSIGHTS_RECORD_GATE_VERDICT`) gate every facet.  Default
+  is OFF — pre-v1.1.7 sequential debate flow is preserved bit-for-bit
+  when audit mode is disabled.
+- **Eight new pydantic models** in `section_03_models_and_context.py`:
+  `SpecialistFinding`, `GateVerdict`, `ConsensusRiskReport`, `Disagreement`,
+  `Concern`, `EvidenceRef`, `BranchSpec`, `AuditTrail`.  Each carries
+  pydantic `model_validator` invariants — for example `GateVerdict` enforces
+  that `KILL` requires ≥1 `failed_invariants`, `NEEDS_MORE_DATA` requires
+  ≥1 `blocking_evidence_queries`, `BRANCH` requires ≥2 `branched_paths`,
+  and `PROCEED` requires `selected_direction ∈ {A..G}`.  Because each
+  decision shape has a structurally different required-field set, the
+  model cannot silently downgrade a hard `KILL` into a vague
+  `NEEDS_MORE_DATA` by choosing the easier-to-fill field.
+- **Two new EventKind values** — `DIRECTION_DEBATE_FINDING` and
+  `DIRECTION_DEBATE_VERDICT` — share the existing `debate.jsonl` stream
+  (no new stream file).  The finding event is written once per specialist
+  (5+ per run in audit mode); the verdict event is written once per
+  direction-debate attempt with the gate's terminal decision.  Together
+  they form the v1.1.8 audit trail.
+- **`record_debate_finding()` and `record_gate_verdict()`** in
+  `crucible/features/run_insights/recorder.py`.  Both swallow backend
+  failures, use the tri-modal import pattern, route through
+  `_V8FloatJSONEncoder` for canonical_json / content_id, and respect the
+  three-tier `run_id` fallback chain.
+- **`crucible/features/direction_debate/` package** (new) with:
+  - `consensus.py` — deterministic, embedding-free
+    `compute_consensus_risk()` that computes Jaccard-based concern
+    diversity, assumption overlap, confidence variance, and a weighted
+    `groupthink_score` ∈ [0, 1].  Flags `zero_disagreement_recorded` (the
+    canonical groupthink tell), `low_diversity_high_confidence`,
+    `all_high_confidence_low_variance`,
+    `<role>_too_confident_no_concerns`, and `high_assumption_overlap`.
+  - `critic.py` — External Critic (Stage 0 sixth agent) that re-judges
+    the Judge's verdict using ONLY the raw research evidence and the
+    Judge's terminal decision token.  Critic does NOT see prior agents'
+    chain-of-thought, so it is isolated from sequential anchoring bias.
+    v1.1.8 uses the same model family as the Judge (`critic_model_family`
+    field is reserved for v1.3.0 cross-family Critics).  Parse failures
+    return `NEEDS_MORE_DATA` (never `KILL`) so a flaky LLM cannot
+    silently destroy viable directions.
+- **Five new CLI flags** in `run_crucible_enhanced.py`: `--audit-mode`,
+  `--debate-isolation {sequential,hybrid}`,
+  `--external-critic` / `--no-external-critic`, and
+  `--critic-can-override` / `--no-critic-override`.  Each translates to
+  an env override at the top of `cmd_run` before any section module
+  reads env at runtime.
+- **WebUI Settings page surfaces all eight new env keys** under a new
+  "Direction Debate Audit" group (icon ⚖️) placed adjacent to the
+  existing "Direction & Gate Control" group.  Two per-run toggles
+  (`debate_audit_mode` and `debate_external_critic`) also appear in the
+  Idea / Path mode flag panel.  Every new `KEY_META` entry is bilingual
+  `{en, zh}` per the v1.1.0 invariant; every new `FLAG_META` entry is
+  bilingual; `ENV_BACKED_FLAGS` (frontend) and
+  `_RUN_INSIGHTS_FLAG_TO_ENV` (backend) declare the same two flag → env
+  mappings in lockstep.
+- **Stage 0 contradiction detection** in
+  `section_07_selfcheck_output_main.py:main()` — when the operator sets
+  `CRUCIBLE_DEBATE_AUDIT_MODE=1` but `CRUCIBLE_RUN_INSIGHTS_ENABLED=0`,
+  the audit trail has nowhere to land; we now warn and silently force-
+  disable audit mode for this process.
+
+### Changed
+- **`section_04:build_direction_debate_crew()`** gained two keyword-only
+  parameters `audit_mode` and `isolation_mode` (defaults `False` and
+  `"sequential"`).  When `audit_mode=True`, each task description is
+  extended with a structured `<<<AUDIT_FINDING_BEGIN>>> ... <<<END>>>`
+  block requirement; the Judge additionally receives a
+  `<<<GATE_VERDICT_BEGIN>>> ... <<<END>>>` block specification.  When
+  `isolation_mode="hybrid"`, an additional note instructs every agent to
+  treat prior agents' free-form chain-of-thought as untrusted and rely
+  on structured findings only — reduces sequential anchoring without
+  needing parallel execution.  Crew gains `_audit_mode_enabled` and
+  `_audit_isolation_mode` attributes for downstream introspection.
+- **`section_02:_run_single_direction_debate()`** reads
+  `CRUCIBLE_DEBATE_*` env vars on entry, passes them to the crew builder,
+  and after each attempt invokes a new helper
+  `_emit_audit_mode_ledger_events()` that parses `AUDIT_FINDING` blocks
+  from each task output, parses the Judge's `GATE_VERDICT` block, runs
+  consensus-risk computation, optionally invokes the External Critic,
+  and emits `record_debate_finding` (N) + `record_gate_verdict` (1)
+  ledger events.  v1.1.8 is **observation-only**: the legacy
+  `force_none` decision flow is unchanged, so audit mode can be enabled
+  in production without affecting which directions are selected.
+- **`recorder.py:record_direction_debate_rejection()`** extended its
+  known `rejection_reason` set with three new audit-mode values:
+  `judge_explicit_kill`, `judge_branch`, `needs_more_data`.  Recording
+  these from the new orchestration paths no longer triggers the one-shot
+  "unrecognised reason" debug log.
+- **`section_02_research_and_llm.py` import surface**: added
+  `_parse_audit_findings_from_text()`, `_parse_gate_verdict_from_text()`,
+  `_extract_json_from_block()`, `_coerce_audit_finding_to_payload()`,
+  and `_emit_audit_mode_ledger_events()` helpers.  All are swallow-safe
+  and never raise into the legacy decision flow.
+
+### Fixed
+- N/A — v1.1.8 is purely additive.  Direction debate behaviour with
+  `CRUCIBLE_DEBATE_AUDIT_MODE=0` (default) is bit-for-bit identical to
+  v1.1.7.  No env-var default flipped; no public schema renamed; no
+  CLI flag removed.
+
+### Validation
+- New test directory `tests/test_direction_debate_audit/` with seven
+  files covering pydantic invariants (`test_schema.py`), ledger emit +
+  swallow (`test_ledger_events.py`), consensus-risk metric correctness
+  (`test_consensus.py`), External Critic prompt + JSON extraction +
+  fallback (`test_critic.py`), audit-mode appendix + parser wiring
+  (`test_isolation.py`), producer→consumer structural pins
+  (`test_wiring.py`), and regression hard cases (KILL not downgraded,
+  evidence-gap is NEEDS_MORE_DATA not KILL, groupthink detection,
+  Critic dissent recording) in `test_regression_hard_cases.py`.
+- Producer→consumer wiring tests follow the CLAUDE.md § 9.6 pattern:
+  scan `.env.example` keys appear in `SETTINGS_SCHEMA`, scan mapping
+  RHS env names appear in actual `section_02` / `section_07` /
+  `recorder.py` read sites, and `inspect.getsource()`-style checks pin
+  the CLI → env translation block in `cmd_run`.
+- `pyproject.toml` and `crucible.__version__` bumped to `"1.1.8"` in
+  lock-step so `test_pyproject_version_matches_package_version` stays
+  green.
+- All existing v1.1.7 tests continue to pass — the
+  `audit_mode=False` short-circuit in `_append_audit_mode_instructions`
+  preserves the legacy task description bit-for-bit.
+
+### Compatibility
+- Drop-in for v1.1.7.  When `CRUCIBLE_DEBATE_AUDIT_MODE=0` (default),
+  direction-debate behaviour is identical to v1.1.7.  No env-var
+  default flipped; no CLI flag removed; no public schema broken.
+- Audit-mode ledger events are additive — they share the existing
+  `debate.jsonl` stream so the `_STREAM_FILENAMES` / `_VALID_STREAMS`
+  invariants are unchanged.  Downstream readers should branch on
+  `kind` field (not stream name) to distinguish the three debate event
+  types: `direction_debate_rejection` (legacy, v1.1.0+),
+  `direction_debate_finding` (v1.1.8+, audit mode), and
+  `direction_debate_verdict` (v1.1.8+, audit mode).
+- The `critic_model_family` field on `AuditTrail` is reserved for
+  v1.3.0 cross-family Critics; in v1.1.8 it is always `None`.  v1.3.0
+  may populate it without a schema migration.
+- The `BRANCH` decision is **audit-only** in v1.1.8: the ledger event
+  preserves the branch info for v1.2.0 retrieval to surface as "this
+  hypothesis split before" hints, but the current run still picks
+  `branched_paths[0].direction_id` as its PROCEED direction.  Spawning
+  parallel sub-runs is a v1.3.0 capability gated on cost-control work.
+
+---
+
 ## [v1.1.7] — 2026-05-19
 
 ### Changed

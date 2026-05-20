@@ -93,6 +93,32 @@ def _resolve_record_params(mode: str) -> bool:
     return str(mode or "").strip().lower() == _QUANT_MODE
 
 
+def _resolve_record_debate_finding() -> bool:
+    """Decide whether to record per-specialist ``debate_finding`` events.
+
+    Honours ``CRUCIBLE_RUN_INSIGHTS_RECORD_DEBATE_FINDING``:
+
+    * ``auto`` (default, also fallback for typos): record only when
+      ``CRUCIBLE_DEBATE_AUDIT_MODE=1`` is set.  Findings are useless
+      without audit_mode populating the structured-finding fields, so
+      ``auto`` follows audit_mode by design.
+    * ``1`` / ``true`` / ``yes`` / ``on``: always record (even outside
+      audit_mode; the orchestrator may emit minimal-payload findings).
+    * ``0`` / ``false`` / ``no`` / ``off``: never record.
+
+    Typos return ``auto`` per the project env-bool whitelist rule.  The
+    "auto follows audit_mode" semantic matches ``runtime_params``'s
+    "auto means Quant only" — keep the precedent consistent.
+    """
+    raw = env_str("CRUCIBLE_RUN_INSIGHTS_RECORD_DEBATE_FINDING", "auto").lower()
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    # auto / typo → follow CRUCIBLE_DEBATE_AUDIT_MODE
+    return env_bool("CRUCIBLE_DEBATE_AUDIT_MODE", False)
+
+
 def _outcome_dict(
     status: OutcomeStatus,
     score: Optional[float] = None,
@@ -325,9 +351,15 @@ class InsightsRecorder:
 
         # Validate rejection_reason against a known enum-like set; unknown
         # values are kept verbatim but logged once (helps future-proofing).
+        # v1.1.8: extended with audit-mode reasons (``judge_explicit_kill``,
+        # ``judge_branch``, ``needs_more_data``) so the new orchestration
+        # paths in section_02 (which translate GateVerdict.decision back to
+        # the legacy rejection event for back-compat) do not trip the
+        # one-shot ``unrecognised reason`` log noise.
         known = {
             "force_none", "insufficient_evidence", "skeptic_rejected",
             "auditor_blocked", "judge_no_winner",
+            "judge_explicit_kill", "judge_branch", "needs_more_data",
         }
         reason = str(rejection_reason or "").strip().lower() or "judge_no_winner"
         if reason not in known and not self._warned_unknown_reason:
@@ -354,6 +386,190 @@ class InsightsRecorder:
             run_meta=run_meta,
             payload=payload,
             outcome=_outcome_dict(OutcomeStatus.FAILURE, note=reason),
+            extra_signals=extra_signals,
+        )
+
+    # ------------------------------------------------------------------------
+    # v1.1.8 — Direction Debate Audit Mode emitters
+    # ------------------------------------------------------------------------
+    # These two methods together capture the "disagreement log" Mira Chen's
+    # feedback identified as the most-valuable gate output.  Both share the
+    # existing ``debate`` JSONL stream (see ``schema.EventKind.stream_name``).
+    # Both are swallow-only: a failing backend MUST NOT break the main
+    # pipeline, since the audit ledger is an observer not a critical path.
+
+    def record_debate_finding(
+        self,
+        *,
+        run_id: str,
+        project_name: str,
+        mode: str,
+        role: str,
+        conclusion: str,
+        confidence: Optional[float] = None,
+        assumptions: Optional[List[str]] = None,
+        supporting_evidence: Optional[List[Mapping[str, Any]]] = None,
+        concerns: Optional[List[Mapping[str, Any]]] = None,
+        disagreement_with: Optional[List[Mapping[str, Any]]] = None,
+        missing_information: Optional[List[str]] = None,
+        failed_invariants: Optional[List[str]] = None,
+        attempt: int = 1,
+        user_problem: Optional[str] = None,
+        run_meta: Optional[Mapping[str, Any]] = None,
+        extra_signals: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        """Emit a ``direction_debate_finding`` event for one specialist.
+
+        Gated by:
+
+        1. ``CRUCIBLE_RUN_INSIGHTS_ENABLED`` master switch
+        2. ``CRUCIBLE_RUN_INSIGHTS_RECORD_DEBATE`` (existing per-stream)
+        3. ``_resolve_record_debate_finding()`` which honours
+           ``CRUCIBLE_RUN_INSIGHTS_RECORD_DEBATE_FINDING`` and falls back
+           to following ``CRUCIBLE_DEBATE_AUDIT_MODE`` on ``auto``.
+
+        Best-effort; never raises.
+        """
+        if not env_bool("CRUCIBLE_RUN_INSIGHTS_RECORD_DEBATE", True):
+            return None
+        if not _resolve_record_debate_finding():
+            return None
+        if not self._enabled():
+            return None
+
+        # Coerce confidence into [0, 1] without silent saturation — bound
+        # checks happen at SpecialistFinding construction time, but call sites
+        # that hand-roll the dict (e.g. test fixtures) shouldn't be able to
+        # poison the ledger with NaN / out-of-range.  ``None`` is OK.
+        conf_clean: Optional[float] = None
+        if confidence is not None:
+            try:
+                conf_f = float(confidence)
+                # Per CLAUDE.md (global) numerical-correctness rule: NaN /
+                # Inf MUST be rejected, not silently clamped.
+                import math as _math
+                if _math.isfinite(conf_f) and 0.0 <= conf_f <= 1.0:
+                    conf_clean = conf_f
+            except (TypeError, ValueError):
+                conf_clean = None
+
+        payload: Dict[str, Any] = {
+            "role": str(role or "unknown"),
+            "conclusion_excerpt": truncate_text(conclusion, 1000),
+            "confidence": conf_clean,
+            "assumptions": [str(s) for s in (assumptions or [])][:20],
+            "supporting_evidence": [dict(e) for e in (supporting_evidence or [])][:20],
+            "concerns": [dict(c) for c in (concerns or [])][:20],
+            "disagreement_with": [dict(d) for d in (disagreement_with or [])][:20],
+            "missing_information": [str(s) for s in (missing_information or [])][:20],
+            "failed_invariants": [str(s) for s in (failed_invariants or [])][:20],
+            "attempt": max(1, int(attempt)),
+        }
+
+        # Successful finding emit when conclusion is non-empty.  We don't have
+        # a binary "this finding succeeded" notion — every finding contributes
+        # to the audit trail regardless of the agent's confidence.  Use
+        # SKIPPED status so retrieval doesn't confuse it with success/failure
+        # outcomes; the conclusion text is what matters.
+        return self._emit(
+            kind=EventKind.DIRECTION_DEBATE_FINDING,
+            stage="stage0_direction",
+            run_id=run_id,
+            project_name=project_name,
+            mode=mode,
+            user_problem=user_problem,
+            run_meta=run_meta,
+            payload=payload,
+            outcome=_outcome_dict(OutcomeStatus.SKIPPED, score=conf_clean),
+            extra_signals=extra_signals,
+        )
+
+    def record_gate_verdict(
+        self,
+        *,
+        run_id: str,
+        project_name: str,
+        mode: str,
+        decision: str,
+        reason: str,
+        selected_direction: Optional[str] = None,
+        branched_paths: Optional[List[Mapping[str, Any]]] = None,
+        failed_invariants: Optional[List[str]] = None,
+        blocking_evidence_queries: Optional[List[str]] = None,
+        consensus_risk: Optional[Mapping[str, Any]] = None,
+        audit_trail: Optional[Mapping[str, Any]] = None,
+        attempt: int = 1,
+        user_problem: Optional[str] = None,
+        run_meta: Optional[Mapping[str, Any]] = None,
+        extra_signals: Optional[List[str]] = None,
+    ) -> Optional[str]:
+        """Emit a ``direction_debate_verdict`` event with the gate's terminal
+        decision (PROCEED / BRANCH / KILL / NEEDS_MORE_DATA).
+
+        Gated by:
+
+        1. ``CRUCIBLE_RUN_INSIGHTS_ENABLED`` master switch
+        2. ``CRUCIBLE_RUN_INSIGHTS_RECORD_DEBATE`` (existing per-stream)
+        3. ``CRUCIBLE_RUN_INSIGHTS_RECORD_GATE_VERDICT`` (defaults to ``1``;
+           verdicts are cheap to record and the single most-valuable signal
+           for future retrieval).
+
+        Best-effort; never raises.
+        """
+        if not env_bool("CRUCIBLE_RUN_INSIGHTS_RECORD_DEBATE", True):
+            return None
+        if not env_bool("CRUCIBLE_RUN_INSIGHTS_RECORD_GATE_VERDICT", True):
+            return None
+        if not self._enabled():
+            return None
+
+        decision_clean = str(decision or "").strip().upper()
+        known_decisions = {"PROCEED", "BRANCH", "KILL", "NEEDS_MORE_DATA"}
+        if decision_clean not in known_decisions:
+            # Unknown decision token gets recorded verbatim with a structural
+            # warning — same one-shot log discipline as rejection_reason.
+            if not self._warned_unknown_reason:
+                LOGGER.debug(
+                    "run_insights: unrecognised gate decision=%r (recording verbatim)",
+                    decision,
+                )
+                self._warned_unknown_reason = True
+
+        # Status mapping: PROCEED is SUCCESS; KILL is FAILURE; NEEDS_MORE_DATA
+        # is PARTIAL (not failure — the gate is awaiting input); BRANCH is
+        # SUCCESS (we picked branched_paths[0] as the current PROCEED).
+        status_map = {
+            "PROCEED": OutcomeStatus.SUCCESS,
+            "BRANCH": OutcomeStatus.SUCCESS,
+            "KILL": OutcomeStatus.FAILURE,
+            "NEEDS_MORE_DATA": OutcomeStatus.PARTIAL,
+        }
+        outcome_status = status_map.get(decision_clean, OutcomeStatus.PARTIAL)
+
+        payload: Dict[str, Any] = {
+            "decision": decision_clean or str(decision or ""),
+            "reason_excerpt": truncate_text(reason, 1000),
+            "selected_direction": str(selected_direction) if selected_direction else None,
+            "branched_paths": [dict(b) for b in (branched_paths or [])][:8],
+            "failed_invariants": [str(s) for s in (failed_invariants or [])][:20],
+            "blocking_evidence_queries": [
+                str(s) for s in (blocking_evidence_queries or [])
+            ][:20],
+            "consensus_risk": dict(consensus_risk) if consensus_risk else None,
+            "audit_trail": dict(audit_trail) if audit_trail else None,
+            "attempt": max(1, int(attempt)),
+        }
+
+        return self._emit(
+            kind=EventKind.DIRECTION_DEBATE_VERDICT,
+            stage="stage0_direction",
+            run_id=run_id,
+            project_name=project_name,
+            mode=mode,
+            user_problem=user_problem,
+            run_meta=run_meta,
+            payload=payload,
+            outcome=_outcome_dict(outcome_status, note=decision_clean),
             extra_signals=extra_signals,
         )
 

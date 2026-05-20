@@ -97,6 +97,18 @@ When a research question has multiple viable paths, the system generates **seven
 3. **Direction Comparator** — multi-axis ranking (feasibility, reversibility, validation speed, evidence strength, downside severity, unresolved unknowns)
 4. **Direction Judge** — selects the winner with go-conditions, kill-criteria, and a validation plan
 
+#### Optional: Direction Debate Audit Mode
+
+Direction Debate Audit Mode is an opt-in capability that captures the per-specialist **disagreement log** — the structural payoff over a vanilla PROCEED/KILL verdict.  Same-model-family crews share blind spots, so unanimous high-confidence verdicts are often the cases where a reviewer should be most suspicious.  Audit mode surfaces this structurally.
+
+When enabled (`CRUCIBLE_DEBATE_AUDIT_MODE=1`), every specialist (Explorer, Comparator, Skeptic, Evidence Auditor, Judge) emits a structured `AUDIT_FINDING` block containing its assumptions, supporting evidence, concerns, explicit disagreements with prior agents, and what information would change its mind.  The Judge additionally emits a `GATE_VERDICT` block in an expanded decision space — `PROCEED` / `BRANCH` / `KILL` / `NEEDS_MORE_DATA` — instead of the legacy binary force-none signal.
+
+Two ledger event kinds (`direction_debate_finding`, `direction_debate_verdict`) capture the audit trail in the existing `.crucible_insights/debate.jsonl` stream.  A deterministic, embedding-free consensus-risk computation flags `zero_disagreement_recorded`, `low_diversity_high_confidence`, per-agent over-confidence (`<role>_too_confident_no_concerns`), and shared-assumption groupthink — all without invoking an LLM.
+
+An optional **External Critic** (`CRUCIBLE_DEBATE_EXTERNAL_CRITIC=1`) acts as a sixth agent that re-judges the Judge's verdict using *only* the raw research evidence and the Judge's terminal decision token.  The Critic does not see the prior agents' chain-of-thought, so it is isolated from sequential anchoring bias.  By default Critic dissent is recorded in the audit trail but the Judge verdict stands; set `CRUCIBLE_DEBATE_CRITIC_OVERRIDE_PROCEED=1` to let a Critic `KILL` override Judge `PROCEED`.
+
+The audit-mode pipeline is **observation-only**: it captures the disagreement trace but does not change which directions are selected, so it can be enabled in production without affecting run outcomes.  See `.env.example` for the full env-var surface and the `Direction Debate Audit` group in the Settings page for per-toggle descriptions.
+
 ### Stage 3: Analysis Crew
 
 Five specialist analysts evaluate the research independently:

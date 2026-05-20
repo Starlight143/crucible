@@ -74,6 +74,445 @@ def _resolve_run_id_for_ledger_emit() -> str:
 
 
 # ---------------------------------------------------------------------------
+# v1.1.8 — Direction Debate Audit Mode parsers + emit pipeline
+# ---------------------------------------------------------------------------
+# These helpers parse the AUDIT_FINDING and GATE_VERDICT blocks that the
+# audit-mode crew (see ``section_04:build_direction_debate_crew``) appends
+# to each task's output, and emit corresponding ledger events.  All of this
+# is best-effort: a failure to parse or emit MUST NOT break the main
+# direction-debate pipeline, matching the existing swallow-on-failure
+# pattern around ``record_direction_debate_rejection``.
+
+import json as _json_audit  # local alias to avoid clashing with any later import
+import re as _re_audit
+
+
+_AUDIT_FINDING_BLOCK_RE = _re_audit.compile(
+    r'<<<\s*AUDIT_FINDING_BEGIN\s+role\s*=\s*"([^"]+)"\s*>>>'
+    r'(.*?)'
+    r'<<<\s*AUDIT_FINDING_END\s*>>>',
+    _re_audit.DOTALL,
+)
+
+_GATE_VERDICT_BLOCK_RE = _re_audit.compile(
+    r'<<<\s*GATE_VERDICT_BEGIN\s*>>>'
+    r'(.*?)'
+    r'<<<\s*GATE_VERDICT_END\s*>>>',
+    _re_audit.DOTALL,
+)
+
+
+def _extract_json_from_block(block_text: str) -> Optional[Dict[str, Any]]:
+    """Pull a single JSON object from a noisy LLM block text.
+
+    Strips markdown fences if present, tries a direct parse, then falls back
+    to the first ``{...}`` substring.  Returns ``None`` on any failure.
+    """
+    if not block_text:
+        return None
+    raw = str(block_text).strip()
+    raw = _re_audit.sub(r"^```(?:json)?\s*", "", raw, flags=_re_audit.IGNORECASE)
+    raw = _re_audit.sub(r"\s*```$", "", raw)
+    try:
+        obj = _json_audit.loads(raw)
+        if isinstance(obj, dict):
+            return obj
+    except (ValueError, TypeError):
+        pass
+    m = _re_audit.search(r"\{.*\}", raw, _re_audit.DOTALL)
+    if not m:
+        return None
+    try:
+        obj = _json_audit.loads(m.group(0))
+        if isinstance(obj, dict):
+            return obj
+    except (ValueError, TypeError):
+        return None
+    return None
+
+
+def _parse_audit_findings_from_text(text: str) -> List[Dict[str, Any]]:
+    """Extract every ``AUDIT_FINDING`` block from an arbitrary text blob.
+
+    Returns a list of dicts, one per successfully parsed block.  Each dict
+    has the SpecialistFinding-shape fields plus an injected ``role`` from
+    the block header — the role in the header takes precedence over any
+    ``role`` field inside the JSON body, which guards against an LLM that
+    sets the wrong role in its own JSON.
+    """
+    out: List[Dict[str, Any]] = []
+    if not text:
+        return out
+    for match in _AUDIT_FINDING_BLOCK_RE.finditer(str(text)):
+        header_role = (match.group(1) or "").strip()
+        body = match.group(2) or ""
+        parsed = _extract_json_from_block(body)
+        if not parsed:
+            continue
+        if header_role:
+            parsed["role"] = header_role  # header wins
+        out.append(parsed)
+    return out
+
+
+def _parse_gate_verdict_from_text(text: str) -> Optional[Dict[str, Any]]:
+    """Extract the single ``GATE_VERDICT`` block from a text blob, if any.
+
+    Returns the parsed dict on success; ``None`` if the block is missing
+    or the JSON inside is malformed.  Only the first block is returned —
+    a Judge that emits multiple GATE_VERDICT blocks is malformed and we
+    take the first as authoritative.
+    """
+    if not text:
+        return None
+    match = _GATE_VERDICT_BLOCK_RE.search(str(text))
+    if not match:
+        return None
+    return _extract_json_from_block(match.group(1) or "")
+
+
+def _coerce_audit_finding_to_payload(raw: Mapping[str, Any]) -> Dict[str, Any]:
+    """Normalise a parsed AUDIT_FINDING dict into recorder-payload shape.
+
+    Defensive against missing/null keys — the recorder method's signature
+    accepts ``None`` / empty list defaults so a partially-malformed LLM
+    output still produces a valid (if sparse) ledger row rather than
+    raising and getting swallowed silently.
+    """
+    role = str(raw.get("role") or "unknown").strip()
+    conclusion = str(raw.get("conclusion") or "").strip()
+
+    confidence_raw = raw.get("confidence")
+    confidence_clean: Optional[float] = None
+    if confidence_raw is not None:
+        try:
+            cv = float(confidence_raw)
+            import math as _math
+            if _math.isfinite(cv) and 0.0 <= cv <= 1.0:
+                confidence_clean = cv
+        except (TypeError, ValueError):
+            confidence_clean = None
+
+    def _str_list(value: Any) -> List[str]:
+        if not isinstance(value, list):
+            return []
+        return [str(item).strip() for item in value if str(item or "").strip()]
+
+    def _dict_list(value: Any) -> List[Dict[str, Any]]:
+        if not isinstance(value, list):
+            return []
+        out: List[Dict[str, Any]] = []
+        for item in value:
+            if isinstance(item, dict):
+                out.append(dict(item))
+        return out
+
+    return {
+        "role": role,
+        "conclusion": conclusion,
+        "confidence": confidence_clean,
+        "assumptions": _str_list(raw.get("assumptions")),
+        "supporting_evidence": _dict_list(raw.get("supporting_evidence")),
+        "concerns": _dict_list(raw.get("concerns")),
+        "disagreement_with": _dict_list(raw.get("disagreement_with")),
+        "missing_information": _str_list(raw.get("missing_information")),
+        "failed_invariants": _str_list(raw.get("failed_invariants")),
+    }
+
+
+def _emit_audit_mode_ledger_events(
+    *,
+    direction_result: Any,
+    judge_decision: Any,
+    judge_summary: str,
+    mode: str,
+    user_problem: str,
+    attempt: int,
+    audit_mode_enabled: bool,
+    isolation_mode: str,
+    external_critic_enabled: bool,
+    critic_can_override: bool,
+    direction_judge_llm: Any,
+    research_context: Optional["ResearchContext"],
+    language_hint: str,
+) -> Tuple[Optional[Dict[str, Any]], Optional[Dict[str, Any]]]:
+    """Parse AUDIT_FINDING + GATE_VERDICT blocks from the crew result,
+    optionally invoke the External Critic, run consensus-risk computation,
+    and emit ``debate_finding`` + ``gate_verdict`` ledger events.
+
+    Returns ``(gate_verdict_dict, consensus_risk_dict)`` — both ``None`` if
+    audit_mode is disabled or if all parsing failed.  Returning structured
+    data lets the caller include the verdict in error dumps or status
+    output if it wants to.
+
+    100 % swallow on any failure — never raises.
+    """
+    if not audit_mode_enabled:
+        return None, None
+
+    try:
+        # Collect every text candidate from the crew result and concatenate.
+        # AUDIT_FINDING blocks may live in any task's output; concatenating
+        # gives us a single string to scan that covers all five tasks.
+        raw_candidates: List[str] = []
+        try:
+            raw_candidates = _collect_text_candidates_from_result(direction_result) or []
+        except Exception:
+            raw_candidates = []
+        combined_text = "\n\n".join(str(c or "") for c in raw_candidates)
+
+        # Parse AUDIT_FINDING blocks.
+        finding_dicts = _parse_audit_findings_from_text(combined_text)
+
+        # Try to build typed SpecialistFinding objects for consensus_risk.
+        # Any individual coercion failure is logged and skipped — consensus
+        # works fine with a partial set.
+        try:
+            from .section_03_models_and_context import SpecialistFinding as _SF
+        except ImportError:  # pragma: no cover - flat-launcher fallback
+            try:
+                from modules.section_03_models_and_context import SpecialistFinding as _SF  # type: ignore[no-redef]
+            except ImportError:
+                _SF = None  # type: ignore[assignment]
+
+        typed_findings: List[Any] = []
+        if _SF is not None:
+            for fd in finding_dicts:
+                try:
+                    payload = _coerce_audit_finding_to_payload(fd)
+                    # Strip None confidence so the required field falls
+                    # back to a sensible default (we set ge=0.0,le=1.0;
+                    # a missing value is treated as 0.5 neutral).
+                    if payload.get("confidence") is None:
+                        payload["confidence"] = 0.5
+                    # SpecialistFinding requires non-empty ``conclusion``;
+                    # supply a placeholder when missing so the pydantic
+                    # build still succeeds and the audit row isn't dropped.
+                    if not payload.get("conclusion"):
+                        payload["conclusion"] = "(no conclusion text emitted)"
+                    typed_findings.append(_SF(**payload))
+                except Exception:
+                    continue
+
+        # Compute ConsensusRiskReport (deterministic, no LLM).
+        consensus_risk_dict: Optional[Dict[str, Any]] = None
+        if typed_findings:
+            try:
+                if __package__ == "crucible.modules":
+                    from ..features.direction_debate.consensus import (
+                        compute_consensus_risk as _ccr,
+                    )
+                else:
+                    from features.direction_debate.consensus import (  # type: ignore[no-redef]
+                        compute_consensus_risk as _ccr,
+                    )
+                consensus_report = _ccr(typed_findings)
+                consensus_risk_dict = consensus_report.model_dump(exclude_none=False)
+                # Strip raw_metrics from the ledger payload — it's purely
+                # for debugging and inflates row size.
+                consensus_risk_dict.pop("raw_metrics", None)
+            except Exception:
+                consensus_risk_dict = None
+
+        # Parse GATE_VERDICT block from Judge's output.  Judge's task output
+        # is typically the last task in the crew, so prefer the LAST
+        # candidate that contains a GATE_VERDICT marker.
+        gate_verdict_dict: Optional[Dict[str, Any]] = None
+        for raw in reversed(raw_candidates):
+            verdict_parsed = _parse_gate_verdict_from_text(str(raw or ""))
+            if verdict_parsed:
+                gate_verdict_dict = verdict_parsed
+                break
+
+        # Normalise gate_verdict_dict; if missing entirely, synthesise a
+        # PROCEED/none-style placeholder from the legacy DirectionDecision
+        # so the ledger always has at least ONE gate_verdict event per run.
+        if not gate_verdict_dict:
+            legacy_dir = (
+                str(getattr(judge_decision, "selected_direction", "") or "").strip().upper()
+            )
+            if legacy_dir == "NONE" or not legacy_dir:
+                gate_verdict_dict = {
+                    "decision": "NEEDS_MORE_DATA",
+                    "selected_direction": None,
+                    "reason": (
+                        "Audit-mode GATE_VERDICT block missing from Judge output; "
+                        "inferring NEEDS_MORE_DATA from legacy force-none signal."
+                    ),
+                    "blocking_evidence_queries": [
+                        "rerun direction debate with audit mode and verify Judge emits GATE_VERDICT block",
+                    ],
+                }
+            elif legacy_dir in {"A", "B", "C", "D", "E", "F", "G"}:
+                gate_verdict_dict = {
+                    "decision": "PROCEED",
+                    "selected_direction": legacy_dir,
+                    "reason": (
+                        f"Audit-mode GATE_VERDICT block missing from Judge output; "
+                        f"inferring PROCEED with direction {legacy_dir} from legacy DirectionDecision."
+                    ),
+                }
+            else:
+                gate_verdict_dict = None  # truly unparseable; skip emit
+
+        # Optionally invoke the External Critic.
+        critic_overrode = False
+        critic_dissent_recorded = False
+        judge_initial_decision: Optional[str] = None
+        if (
+            external_critic_enabled
+            and gate_verdict_dict
+            and direction_judge_llm is not None
+        ):
+            try:
+                if __package__ == "crucible.modules":
+                    from ..features.direction_debate.critic import (
+                        CriticUnavailableError as _CritErr,
+                        validate_direction_verdict as _critic_validate,
+                    )
+                else:
+                    from features.direction_debate.critic import (  # type: ignore[no-redef]
+                        CriticUnavailableError as _CritErr,
+                        validate_direction_verdict as _critic_validate,
+                    )
+                evidence_block = ""
+                if research_context is not None:
+                    try:
+                        # Lazy import to avoid the section_02 ↔ section_04
+                        # circular at module-load time.  By the time this
+                        # function executes, section_04 has been fully
+                        # loaded via the section_03 → section_02 globals
+                        # propagation chain in production runs.
+                        try:
+                            if __package__ == "crucible.modules":
+                                from .section_04_web_research_and_direction import (
+                                    _render_research_context_for_prompt as _rrc,
+                                )
+                            else:
+                                from section_04_web_research_and_direction import (  # type: ignore[no-redef]
+                                    _render_research_context_for_prompt as _rrc,
+                                )
+                            evidence_block = _rrc(research_context) or ""
+                        except ImportError:
+                            # Fall back to a minimal stringification — the
+                            # Critic still gets *something* even if the
+                            # canonical renderer is unavailable.
+                            evidence_block = str(research_context)[:8000]
+                    except Exception:
+                        evidence_block = ""
+                judge_initial_decision = str(gate_verdict_dict.get("decision") or "")
+                critic_verdict = _critic_validate(
+                    raw_research_evidence=evidence_block,
+                    judge_decision=str(gate_verdict_dict.get("decision") or ""),
+                    judge_reason=str(gate_verdict_dict.get("reason") or ""),
+                    judge_selected_direction=gate_verdict_dict.get("selected_direction"),
+                    llm=direction_judge_llm,
+                    language_hint=language_hint,
+                )
+                critic_decision = str(critic_verdict.decision)
+                if critic_decision != judge_initial_decision:
+                    # Critic disagrees.
+                    if (
+                        critic_can_override
+                        and judge_initial_decision == "PROCEED"
+                        and critic_decision == "KILL"
+                    ):
+                        # Critic wins (the only allowed override case in v1.1.8).
+                        gate_verdict_dict = {
+                            "decision": critic_decision,
+                            "selected_direction": None,
+                            "reason": (
+                                f"External Critic overrode Judge PROCEED with KILL: "
+                                f"{critic_verdict.reason}"
+                            )[:2000],
+                            "failed_invariants": list(
+                                critic_verdict.failed_invariants or []
+                            ),
+                        }
+                        critic_overrode = True
+                    else:
+                        # Critic dissents but Judge stands (default in v1.1.8).
+                        critic_dissent_recorded = True
+            except _CritErr:
+                pass
+            except Exception:
+                pass
+
+        # Attach audit_trail metadata to the verdict dict (always present
+        # in audit_mode, even when the LLM did not emit one).
+        if gate_verdict_dict is not None:
+            gate_verdict_dict.setdefault("audit_trail", {})
+            at = dict(gate_verdict_dict.get("audit_trail") or {})
+            at["audit_mode_enabled"] = True
+            at["isolation_mode"] = isolation_mode
+            at["external_critic_used"] = bool(external_critic_enabled)
+            at["critic_overrode_judge"] = bool(critic_overrode)
+            at["critic_dissent_recorded"] = bool(critic_dissent_recorded)
+            at["critic_model_family"] = None  # v1.1.8: same family as Judge
+            if judge_initial_decision and critic_overrode:
+                at["judge_initial_decision"] = judge_initial_decision
+            gate_verdict_dict["audit_trail"] = at
+
+        # Emit ledger events — one debate_finding per parsed finding +
+        # one gate_verdict for the final verdict.  Best-effort; recorder
+        # already swallows backend failures.
+        recorder = _get_insights_recorder()
+        run_id = _resolve_run_id_for_ledger_emit()
+        project_name = "stage0_pending"
+        normalised_mode = str(mode or "mode_unknown")
+
+        for finding_dict in finding_dicts:
+            try:
+                payload = _coerce_audit_finding_to_payload(finding_dict)
+                recorder.record_debate_finding(
+                    run_id=run_id,
+                    project_name=project_name,
+                    mode=normalised_mode,
+                    role=payload.get("role", "unknown"),
+                    conclusion=payload.get("conclusion", ""),
+                    confidence=payload.get("confidence"),
+                    assumptions=payload.get("assumptions"),
+                    supporting_evidence=payload.get("supporting_evidence"),
+                    concerns=payload.get("concerns"),
+                    disagreement_with=payload.get("disagreement_with"),
+                    missing_information=payload.get("missing_information"),
+                    failed_invariants=payload.get("failed_invariants"),
+                    attempt=attempt,
+                    user_problem=user_problem,
+                )
+            except Exception:
+                continue
+
+        if gate_verdict_dict is not None:
+            try:
+                recorder.record_gate_verdict(
+                    run_id=run_id,
+                    project_name=project_name,
+                    mode=normalised_mode,
+                    decision=str(gate_verdict_dict.get("decision") or ""),
+                    reason=str(gate_verdict_dict.get("reason") or ""),
+                    selected_direction=gate_verdict_dict.get("selected_direction"),
+                    branched_paths=gate_verdict_dict.get("branched_paths"),
+                    failed_invariants=gate_verdict_dict.get("failed_invariants"),
+                    blocking_evidence_queries=gate_verdict_dict.get(
+                        "blocking_evidence_queries"
+                    ),
+                    consensus_risk=consensus_risk_dict,
+                    audit_trail=gate_verdict_dict.get("audit_trail"),
+                    attempt=attempt,
+                    user_problem=user_problem,
+                )
+            except Exception:
+                pass
+
+        return gate_verdict_dict, consensus_risk_dict
+
+    except Exception:
+        # Total swallow: audit mode failures NEVER break the main pipeline.
+        return None, None
+
+
+# ---------------------------------------------------------------------------
 # Provider URL helpers
 # ---------------------------------------------------------------------------
 
@@ -855,6 +1294,23 @@ def _run_single_direction_debate(
     Optional["EvidenceAuditReport"],
     Optional[Dict[str, Any]],
 ]:
+    # v1.1.8 — Direction Debate Audit Mode env reads.  These flow into the
+    # crew builder so each task description gets the structured-finding
+    # appendix, and into the post-result emit pipeline so debate_finding /
+    # gate_verdict ledger events are written.  Defaults preserve pre-v1.1.8
+    # behaviour bit-for-bit (audit_mode off, sequential isolation).
+    #
+    # Uses ``_env_bool`` (section_00's wrapper that delegates to ``_env.env_bool``
+    # with ``extended=True``) — matches the project's env-bool whitelist rule;
+    # raw ``os.environ.get`` is used for the string ``ISOLATION_MODE`` read.
+    audit_mode_enabled = _env_bool("CRUCIBLE_DEBATE_AUDIT_MODE", False)
+    isolation_mode = (
+        os.environ.get("CRUCIBLE_DEBATE_ISOLATION_MODE", "sequential") or "sequential"
+    ).strip().lower()
+    if isolation_mode not in ("sequential", "hybrid"):
+        isolation_mode = "sequential"
+    external_critic_enabled = _env_bool("CRUCIBLE_DEBATE_EXTERNAL_CRITIC", False)
+    critic_can_override = _env_bool("CRUCIBLE_DEBATE_CRITIC_OVERRIDE_PROCEED", False)
     last_error: Optional[Exception] = None
     for attempt in range(QUALITY_JSON_RETRY_ATTEMPTS):
         attempt_started_at = time.perf_counter()
@@ -868,6 +1324,8 @@ def _run_single_direction_debate(
                 llm=llm,
                 direction_judge_llm=direction_judge_llm,
                 research_context=research_context,
+                audit_mode=audit_mode_enabled,
+                isolation_mode=isolation_mode,
             )
             direction_prompt_chars = _prompt_chars_for_runtime_crew(
                 direction_crew,
@@ -992,6 +1450,33 @@ def _run_single_direction_debate(
                 comparator_report=comparator_report,
                 audit_report=audit_report,
             )
+
+        # v1.1.8 — Direction Debate Audit Mode emit pipeline.
+        # Runs unconditionally on every attempt when audit_mode is enabled.
+        # Parses AUDIT_FINDING + GATE_VERDICT blocks from the crew result,
+        # runs deterministic consensus-risk computation, optionally invokes
+        # the External Critic, and emits ``debate_finding`` + ``gate_verdict``
+        # ledger events.  Completely swallow-safe; never breaks the legacy
+        # path below.  Returns the parsed verdict + risk dicts but those
+        # are not used to override the legacy ``force_none`` flow — v1.1.8
+        # audit mode is observation-only by design (back-compat).  v1.2.0
+        # may introduce true override behaviour with a separate env gate.
+        _audit_verdict_dict, _audit_consensus_risk = _emit_audit_mode_ledger_events(
+            direction_result=direction_result,
+            judge_decision=decision,
+            judge_summary=str(getattr(decision, "summary", "") or "") if decision is not None else "",
+            mode=mode,
+            user_problem=user_problem,
+            attempt=attempt + 1,
+            audit_mode_enabled=audit_mode_enabled,
+            isolation_mode=isolation_mode,
+            external_critic_enabled=external_critic_enabled,
+            critic_can_override=critic_can_override,
+            direction_judge_llm=direction_judge_llm,
+            research_context=research_context,
+            language_hint=language_hint,
+        )
+
         if decision is not None:
             ranking = (
                 _build_deterministic_direction_ranking(decision, research_context)

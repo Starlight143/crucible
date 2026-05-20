@@ -5282,6 +5282,127 @@ Research context:
     }
 
 
+# v1.1.8 — Direction Debate Audit Mode helpers
+# ---------------------------------------------
+# These two helpers append structured-finding instructions to a task
+# description.  They are no-ops when ``audit_mode`` is False so the existing
+# (non-audit) Stage 0 behaviour is preserved bit-for-bit.
+
+_AUDIT_FINDING_APPENDIX_TEMPLATE = """
+
+=== AUDIT MODE: STRUCTURED FINDING (REQUIRED) ===
+After your normal task output (above), append the following clearly-fenced
+JSON object describing your independent finding.  This is mandatory in
+audit mode.  Output it on its own, between the BEGIN/END markers shown.
+
+```
+<<<AUDIT_FINDING_BEGIN role="{role}">>>
+{{
+  "role": "{role}",
+  "conclusion": "1-2 sentence summary of your conclusion",
+  "confidence": 0.0,
+  "assumptions": ["explicit assumption #1", "explicit assumption #2"],
+  "supporting_evidence": [
+    {{"claim": "...", "source_url": "", "source_title": "", "confidence": 0.0}}
+  ],
+  "concerns": [
+    {{"severity": "minor|material|blocking", "description": "...", "blocks_directions": []}}
+  ],
+  "disagreement_with": [
+    {{"with_role": "explorer|comparator|skeptic|evidence_auditor", "point": "...", "severity": "minor|material|blocking"}}
+  ],
+  "missing_information": ["specific thing you would need to know to be more confident"],
+  "failed_invariants": []
+}}
+<<<AUDIT_FINDING_END>>>
+```
+
+Rules for the AUDIT_FINDING block:
+* ``role`` must be exactly: {role}
+* ``confidence`` is a float in [0.0, 1.0]
+* ``severity`` is one of: minor | material | blocking
+* If you have NO concerns or NO disagreement, output empty arrays — do NOT
+  omit the keys.  An empty ``disagreement_with`` is meaningful: it tells
+  the audit layer you have nothing to challenge.
+* ``failed_invariants`` is only populated by roles ``judge`` or ``critic``
+  when they want a hard KILL.  Other roles must leave it as an empty array.
+"""
+
+_AUDIT_HYBRID_ISOLATION_NOTE = """
+
+=== AUDIT MODE: HYBRID ISOLATION (CONTEXT FILTER) ===
+When forming your conclusion, treat any prior agent's free-form chain-of-
+thought reasoning as untrusted.  Rely instead on:
+  1. The grounded research evidence in this prompt
+  2. The structured AUDIT_FINDING blocks from prior agents (the JSON blocks
+     marked ``<<<AUDIT_FINDING_BEGIN ...>>> ... <<<AUDIT_FINDING_END>>>``)
+This prevents sequential anchoring on prior agents' rationalisations.  You
+may still cite their structured ``conclusion`` / ``concerns`` fields, but
+treat the free text outside the AUDIT_FINDING blocks as informational
+context only, not authority.
+"""
+
+
+def _append_audit_mode_instructions(
+    task_description: str,
+    *,
+    role: str,
+    audit_mode: bool,
+    isolation_mode: str,
+) -> str:
+    """Append v1.1.8 audit-mode appendices to a task description.
+
+    ``audit_mode=False`` returns the description unchanged.  This keeps
+    pre-v1.1.8 behaviour bit-for-bit identical when audit mode is off.
+    """
+    if not audit_mode:
+        return task_description
+    out = task_description + _AUDIT_FINDING_APPENDIX_TEMPLATE.format(role=role)
+    if str(isolation_mode or "").strip().lower() == "hybrid":
+        out += _AUDIT_HYBRID_ISOLATION_NOTE
+    return out
+
+
+_JUDGE_GATE_VERDICT_APPENDIX = """
+
+=== AUDIT MODE: GATE_VERDICT (REQUIRED FOR JUDGE) ===
+In addition to the DirectionDecision JSON (your primary output above) and
+your AUDIT_FINDING block, the Judge MUST also emit a GATE_VERDICT block.
+This is your terminal decision in the expanded v1.1.8 decision space:
+
+  PROCEED          — select a direction A-G; evidence is sufficient
+  BRANCH           — hypothesis must split into >=2 distinct sub-paths
+                     (each with own evidence requirements)
+  KILL             — hard invariant violated (cite >=1 in failed_invariants)
+  NEEDS_MORE_DATA  — evidence too thin (cite >=1 specific blocking_evidence_queries)
+
+The GATE_VERDICT supersedes the legacy ``selected_direction="none"``
+signal in audit mode — choose between KILL (hard violation) and
+NEEDS_MORE_DATA (evidence gap) instead of silently force-noning.
+
+```
+<<<GATE_VERDICT_BEGIN>>>
+{
+  "decision": "PROCEED|BRANCH|KILL|NEEDS_MORE_DATA",
+  "selected_direction": "A|B|C|D|E|F|G or null",
+  "reason": ">=20 chars explaining the decision",
+  "failed_invariants": ["required if decision=KILL"],
+  "blocking_evidence_queries": ["required if decision=NEEDS_MORE_DATA"],
+  "branched_paths": [
+    {"direction_id": "A", "rationale": "...", "blocking_questions": []}
+  ]
+}
+<<<GATE_VERDICT_END>>>
+```
+
+Rules:
+* Do NOT default to NEEDS_MORE_DATA when KILL is structurally correct.
+* Do NOT KILL on thin evidence — KILL is for hard invariant violations.
+* BRANCH requires >=2 entries in branched_paths.
+* PROCEED requires a non-null selected_direction in A..G.
+"""
+
+
 def build_direction_debate_crew(
     user_problem: str,
     mode: str,
@@ -5289,7 +5410,30 @@ def build_direction_debate_crew(
     llm: Any,
     direction_judge_llm: Any,
     research_context: Optional[ResearchContext] = None,
+    *,
+    # v1.1.8 — Direction Debate Audit Mode
+    audit_mode: bool = False,
+    isolation_mode: str = "sequential",
 ) -> Crew:
+    """Build the Stage 0 direction-debate crew.
+
+    v1.1.8 additions (audit_mode, isolation_mode) are **fully additive**:
+    when ``audit_mode=False`` (default), the returned crew is bit-for-bit
+    identical to the pre-v1.1.8 version.  When ``audit_mode=True``, each
+    task description gets a structured ``AUDIT_FINDING`` appendix; the
+    Judge additionally gets a ``GATE_VERDICT`` appendix.  When
+    ``isolation_mode="hybrid"``, a hybrid-isolation note tells each agent
+    to treat prior agents' free-form reasoning as untrusted and rely on
+    their structured findings instead.
+
+    Tri-modal output (audit mode):
+      * Primary task output (DirectionDecision / EvidenceAuditReport / ...)
+      * AUDIT_FINDING block (one per agent — structured SpecialistFinding)
+      * GATE_VERDICT block (Judge only — terminal decision in expanded space)
+
+    The orchestrator at ``section_02:_run_single_direction_debate`` parses
+    all three from the same task output text.
+    """
     mode_config = _get_mode_config(mode)
     research_block = _render_research_context_for_prompt(research_context)
     direction_prompts = _build_direction_debate_prompt_bundle(
@@ -5391,9 +5535,47 @@ def build_direction_debate_crew(
         llm=direction_judge_llm,
     )
 
+    # v1.1.8 — Apply audit-mode appendices to each task description.  In
+    # the non-audit (default) path, ``_append_audit_mode_instructions`` is a
+    # no-op so the descriptions match pre-v1.1.8 exactly.
+    explorer_desc = _append_audit_mode_instructions(
+        direction_prompts["explorer"],
+        role="explorer",
+        audit_mode=audit_mode,
+        isolation_mode=isolation_mode,
+    )
+    comparator_desc = _append_audit_mode_instructions(
+        direction_prompts["comparator"],
+        role="comparator",
+        audit_mode=audit_mode,
+        isolation_mode=isolation_mode,
+    )
+    skeptic_desc = _append_audit_mode_instructions(
+        direction_prompts["skeptic"],
+        role="skeptic",
+        audit_mode=audit_mode,
+        isolation_mode=isolation_mode,
+    )
+    auditor_desc = _append_audit_mode_instructions(
+        direction_prompts["auditor"],
+        role="evidence_auditor",
+        audit_mode=audit_mode,
+        isolation_mode=isolation_mode,
+    )
+    judge_desc = _append_audit_mode_instructions(
+        direction_prompts["judge"],
+        role="judge",
+        audit_mode=audit_mode,
+        isolation_mode=isolation_mode,
+    )
+    if audit_mode:
+        # Judge additionally emits a GATE_VERDICT block with the expanded
+        # decision space (PROCEED / BRANCH / KILL / NEEDS_MORE_DATA).
+        judge_desc = judge_desc + _JUDGE_GATE_VERDICT_APPENDIX
+
     explorer_task = _tag_direction_stage_task(
         Task(
-            description=direction_prompts["explorer"],
+            description=explorer_desc,
             agent=explorer,
             expected_output="JSON with options list only.",
         ),
@@ -5401,7 +5583,7 @@ def build_direction_debate_crew(
     )
 
     comparator_task_kwargs = {
-        "description": direction_prompts["comparator"],
+        "description": comparator_desc,
         "agent": comparator,
         "context": [explorer_task],
         "expected_output": "JSON with structured comparison matrix and top-three short-list.",
@@ -5415,7 +5597,7 @@ def build_direction_debate_crew(
 
     skeptic_task = _tag_direction_stage_task(
         Task(
-            description=direction_prompts["skeptic"],
+            description=skeptic_desc,
             agent=skeptic,
             context=[explorer_task, comparator_task],
             expected_output="JSON with deep risk review for comparator top-three directions.",
@@ -5424,7 +5606,7 @@ def build_direction_debate_crew(
     )
 
     auditor_task_kwargs = {
-        "description": direction_prompts["auditor"],
+        "description": auditor_desc,
         "agent": auditor,
         "context": [explorer_task, comparator_task, skeptic_task],
         "expected_output": "JSON with per-direction evidence scorecard.",
@@ -5435,7 +5617,7 @@ def build_direction_debate_crew(
     auditor_task = _tag_direction_stage_task(Task(**auditor_task_kwargs), "auditor")
 
     judge_task_kwargs = {
-        "description": direction_prompts["judge"],
+        "description": judge_desc,
         "agent": judge,
         "context": [explorer_task, comparator_task, skeptic_task, auditor_task],
         "expected_output": "Valid DirectionDecision JSON only (no markdown, no extra text).",
@@ -5466,6 +5648,15 @@ def build_direction_debate_crew(
         RetryPolicy(max_attempts=20, backoff_seconds=2.0, retry_on_json_fail=True),
     )
     setattr(crew, "_crew_name", "direction_debate")
+    # v1.1.8 — Stamp audit-mode flags onto the crew so the orchestrator can
+    # later assert "this crew was built with audit_mode=on" without re-reading
+    # env vars (which may have changed between build and kickoff).
+    setattr(crew, "_audit_mode_enabled", bool(audit_mode))
+    setattr(
+        crew,
+        "_audit_isolation_mode",
+        str(isolation_mode or "sequential").strip().lower() or "sequential",
+    )
     return crew
 
 

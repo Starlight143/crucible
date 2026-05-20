@@ -915,6 +915,30 @@ def main() -> None:
         # Correlation-id binding must never break the pipeline boot.
         pass
 
+    # v1.1.8 — Direction Debate Audit Mode contradiction detection.
+    # If AUDIT_MODE=1 but the Run Insights ledger is disabled, there is
+    # nowhere for the disagreement log to land — print a warning and
+    # silently treat audit mode as disabled.  Other audit-mode env
+    # combinations (e.g. AUDIT_MODE=1 + EXTERNAL_CRITIC=0) are valid
+    # configurations and intentionally NOT checked here.
+    try:
+        if _env_bool("CRUCIBLE_DEBATE_AUDIT_MODE", False) and not _env_bool(
+            "CRUCIBLE_RUN_INSIGHTS_ENABLED", True
+        ):
+            print(
+                "[Warn] CRUCIBLE_DEBATE_AUDIT_MODE=1 but "
+                "CRUCIBLE_RUN_INSIGHTS_ENABLED=0 — audit mode has nothing "
+                "to write to.  Effectively disabled.  Set "
+                "CRUCIBLE_RUN_INSIGHTS_ENABLED=1 to record the audit trail."
+            )
+            # Force-disable audit_mode for this process so downstream emit
+            # pipelines do not waste tokens generating structured findings
+            # the ledger will never persist.  Operator can still see the
+            # warning above and decide what to fix.
+            os.environ["CRUCIBLE_DEBATE_AUDIT_MODE"] = "0"
+    except Exception:
+        pass
+
     entry_defaults = _resolve_runtime_entry_defaults()
     parser = argparse.ArgumentParser(
         prog="run_crucible.py",

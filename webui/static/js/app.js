@@ -238,6 +238,11 @@ const FLAG_META = {
   self_check:            { label:'Self Check',          modes:'p', types:[1,2,3,4], desc:{en:'Run an offline environment self-check, then exit. No analysis is performed.\nUse case: quick verification that the install and module loading are healthy.', zh:'執行離線環境自我檢查後立即退出，不做任何分析。\n用途：快速確認安裝環境與 module 載入是否正常。'} },
   direction_debate:      { label:'Direction Debate',    modes:'i', types:[1,2,3,4], desc:{en:'Run Stage 0 before the main pipeline: generate 7 directions → Evidence Audit → multi-axis comparison → Judge selects the best.\nUse case: when an idea has multiple viable paths, let the system pick the best direction first.', zh:'主流程前先執行 Stage 0：產生 7 個策略方向 → Evidence Audit → 多軸比較 → Judge 擇優。\n用途：idea 有多條路徑時，讓系統幫你選最佳方向再往下走。'} },
   direction_debate_only: { label:'Debate Only',         modes:'i', types:[1,2,3,4], desc:{en:'Run direction debate only — select the best direction and exit before Analysis Crew.\nUse case: quickly evaluate multiple strategic directions without the full analysis pipeline.', zh:'只執行方向辯論選出最佳方向後立即退出，不進入 Analysis Crew。\n用途：快速評估多個策略方向，不需要完整分析流程。'} },
+  // v1.1.8 — Direction Debate Audit Mode per-run toggles.  Both keys are
+  // env-backed (see ENV_BACKED_FLAGS) so the checkbox state syncs from the
+  // operator's Settings choice on every page load.
+  debate_audit_mode:     { label:'Audit Mode',          modes:'i', types:[1,2,3,4], desc:{en:'Enable Direction Debate Audit Mode for this run. Every specialist emits a structured AUDIT_FINDING; the Judge emits a GATE_VERDICT (PROCEED/BRANCH/KILL/NEEDS_MORE_DATA). v1.1.8 is observation-only — the audit ledger captures the disagreement trace but the legacy force-none flow is preserved.\nUse case: capture an auditable disagreement log for v1.2.0 retrieval, or to spot premature consensus on contentious ideas.', zh:'本次執行啟用 Direction Debate Audit Mode。每位 specialist 輸出結構化的 AUDIT_FINDING；Judge 額外輸出 GATE_VERDICT (PROCEED / BRANCH / KILL / NEEDS_MORE_DATA)。v1.1.8 只觀察不覆寫 —— audit ledger 記錄分歧軌跡，但保留 force-none 既有行為。\n用途：為 v1.2.0 retrieval 準備可審計的分歧紀錄，或在有爭議的 idea 上偵測過早共識。'} },
+  debate_external_critic:{ label:'External Critic',     modes:'i', types:[1,2,3,4], desc:{en:'Enable the External Critic — a sixth agent that re-judges Judge’s verdict using ONLY raw evidence + Judge’s decision token. Critic does NOT see prior agents’ chain-of-thought. v1.1.8 same-family Critic; cross-family ships in v1.3.0. Critic dissent is recorded in audit_trail but does NOT override Judge unless CRUCIBLE_DEBATE_CRITIC_OVERRIDE_PROCEED=1.\nUse case: get a second independent opinion on directions that look too easy or too risky.', zh:'啟用 External Critic —— 第六位 agent，僅使用「原始證據 + Judge 的決策 token」重新審判 Judge 的結論。Critic 看不到其他 agent 的推理過程。v1.1.8 採同模型族 Critic；跨模型族留待 v1.3.0。Critic 反對意見會寫入 audit_trail，但除非 CRUCIBLE_DEBATE_CRITIC_OVERRIDE_PROCEED=1 否則不會覆寫 Judge。\n用途：為看起來太容易或太冒險的方向取得獨立的第二意見。'} },
   strict_json:           { label:'Strict JSON',         modes:'b', types:[1,2,3,4], desc:{en:'Force every LLM call to emit schema-conformant strict JSON, with auto-retry on failure.\nUse case: stable output structure for cases where analysis results are consumed by machines.', zh:'強制所有 LLM 呼叫輸出符合 schema 的嚴格 JSON，失敗時自動重試。\n用途：確保輸出結構穩定，適合需要機器讀取分析結果的場合。'} },
   cost_trace:            { label:'Cost Trace',          modes:'b', types:[1,2,3,4], desc:{en:'Emit a cost marker to stderr after every LLM call completes.\nUse case: debug cost anomalies and trace which stage consumes the most.', zh:'每個 LLM 呼叫完成後即時將成本標記輸出到 stderr。\n用途：Debug 成本異常，追蹤哪個階段消耗最多費用。'} },
   cache:                 { label:'Local Cache',         modes:'b', types:[1,2,3,4], desc:{en:'Enable a local SQLite cache so identical LLM calls return cached results instantly.\nUse case: avoid duplicate LLM cost across repeated runs or flag tweaks; iterate much faster.', zh:'啟用 SQLite 本地快取，相同輸入的 LLM 步驟直接讀取快取結果。\n用途：重複執行或微調旗標時避免重複 LLM 費用，大幅加速迭代。'} },
@@ -375,6 +380,15 @@ const FLAG_GROUPS = [
   { id:'run_insights', title:'Run Insights Ledger',   icon:'📚', open:false,
     flags:['run_insights_enabled','run_insights_record_output','run_insights_record_errors',
            'run_insights_record_debate','run_insights_redact'] },
+  // v1.1.8 — Direction Debate Audit Mode group.  Only the two boolean
+  // toggles (debate_audit_mode, debate_external_critic) are exposed in the
+  // per-run panel.  Other audit-mode settings (ISOLATION_MODE select,
+  // CONSENSUS_RISK_THRESHOLD float, CRITIC_OVERRIDE_PROCEED boolean) are
+  // operator-level decisions and live in the Settings page instead — keeps
+  // the per-run panel from sprawling and matches the v1.1.0 design where
+  // FLAG_META only supports boolean checkboxes.
+  { id:'debate_audit', title:'Direction Debate Audit', icon:'⚖️', open:false,
+    flags:['debate_audit_mode','debate_external_critic'] },
   { id:'quant',      title:'Quant Analytics Suite',   icon:'📊', open:false,
     flags:['quant_analytics','walk_forward','significance_test','regime_detection',
            'factor_analysis','transaction_cost','monte_carlo','tearsheet',
@@ -441,6 +455,11 @@ const ENV_BACKED_FLAGS = {
   run_insights_record_errors: 'CRUCIBLE_RUN_INSIGHTS_RECORD_ERRORS',
   run_insights_record_debate: 'CRUCIBLE_RUN_INSIGHTS_RECORD_DEBATE',
   run_insights_redact:        'CRUCIBLE_RUN_INSIGHTS_REDACT',
+  // v1.1.8 — Direction Debate Audit Mode per-run toggles.  Backend mirror
+  // lives in webui/app.py:_RUN_INSIGHTS_FLAG_TO_ENV — both must stay in
+  // lockstep (test_wiring.py verifies the lockstep structurally).
+  debate_audit_mode:          'CRUCIBLE_DEBATE_AUDIT_MODE',
+  debate_external_critic:     'CRUCIBLE_DEBATE_EXTERNAL_CRITIC',
   // Analysis flags
   strict_json:                'STRICT_JSON',
   cost_trace:                 'COST_TRACE',
@@ -2754,6 +2773,17 @@ const SETTINGS_SCHEMA = [
   { id:'gate', title:'Direction & Gate Control', icon:'🎯', open:false,
     keys:['GATE_CONTROL_ENABLED','SELECTIVE_RERUN_ENABLED',
           'DIRECTION_REFINEMENT_ENABLED','DIRECTION_REFINEMENT_MAX_ITERATIONS','GATE_DIRECTION_FEEDBACK_ENABLED','SELECTIVE_RERUN_MAX_ATTEMPTS'] },
+  // v1.1.8 — Direction Debate Audit Mode.  Adjacent to ``gate`` group
+  // because the two control related decision-flow surfaces.  Eight keys
+  // covering audit master switch, structural finding enforcement, isolation
+  // mode, external critic, override semantics, consensus threshold, and the
+  // two ledger per-stream toggles.
+  { id:'debate_audit', title:'Direction Debate Audit', icon:'⚖️', open:false,
+    keys:['CRUCIBLE_DEBATE_AUDIT_MODE','CRUCIBLE_DEBATE_REQUIRE_STRUCTURED_FINDINGS',
+          'CRUCIBLE_DEBATE_ISOLATION_MODE','CRUCIBLE_DEBATE_EXTERNAL_CRITIC',
+          'CRUCIBLE_DEBATE_CRITIC_OVERRIDE_PROCEED','CRUCIBLE_DEBATE_CONSENSUS_RISK_THRESHOLD',
+          'CRUCIBLE_DEBATE_CRITIC_MAX_ATTEMPTS',
+          'CRUCIBLE_RUN_INSIGHTS_RECORD_DEBATE_FINDING','CRUCIBLE_RUN_INSIGHTS_RECORD_GATE_VERDICT'] },
   { id:'budget', title:'Budget & Cost Limits', icon:'💰', open:false,
     keys:['BUDGET_SOFT_COST_LIMIT','BUDGET_HARD_COST_LIMIT','BUDGET_MAX_TOTAL_TOKENS'] },
   { id:'convergence', title:'Convergence Guard', icon:'🔄', open:false,
@@ -3019,6 +3049,20 @@ const KEY_META = {
   CRUCIBLE_RUN_INSIGHTS_RECORD_PARAMS:    { label:'Record Runtime Parameters', desc:{en:'auto = record in Quant mode only (matches the Quant-records / non-Quant-skips requirement); 1 = always record; 0 = never record. Typos fall back to auto, never truthy-coerce.', zh:'auto = 僅 Quant 模式記錄(符合「Quant 記錄、非 Quant 不記錄」需求);1 = 永遠記錄;0 = 永遠不記錄。拼錯的值 fallback 回 auto,不會被 truthy-coerce。'}, type:'select', opts:[{v:'auto',l:'auto (Quant only)'},{v:'1',l:'1 (always record)'},{v:'0',l:'0 (never record)'}] },
   CRUCIBLE_RUN_INSIGHTS_REDACT:           { label:'Redact Sensitive Fields', desc:{en:'Recursively redact sensitive field names (api_key, token, secret, webhook_url, auth, etc.) from payloads before write. Highly recommended; runtime_params payloads can embed operator config dicts with webhook URLs / API tokens.', zh:'寫入前對敏感欄位(api_key、token、secret、webhook_url、auth 等)做遞迴遮蔽。強烈建議開啟;runtime_params payload 可能嵌入含 webhook URL / API token 的設定 dict。'}, type:'boolean' },
   CRUCIBLE_RUN_INSIGHTS_BACKEND:          { label:'Storage Backend',       desc:{en:'Storage backend selector. local = JSONL streams under .crucible_insights/ (only this is implemented today). cloudflare / dual are protocol stubs that raise NotImplementedError until the cloud backend ships.', zh:'儲存後端選擇器。local = .crucible_insights/ 下的 JSONL streams(目前唯一實作);cloudflare / dual 為 protocol stub,雲端後端上線前會 raise NotImplementedError。'}, type:'select', opts:[{v:'local',l:'local (JSONL on disk)'},{v:'cloudflare',l:'cloudflare (not yet implemented)'},{v:'dual',l:'dual (not yet implemented)'}] },
+
+  // v1.1.8 — Direction Debate Audit Mode keys.  All descriptions are
+  // bilingual ({en, zh}) per the v1.1.0 KEY_META bilingual contract.  The
+  // ISOLATION_MODE select offers two opts; RECORD_DEBATE_FINDING offers
+  // auto/1/0 to match the runtime_params pattern.
+  CRUCIBLE_DEBATE_AUDIT_MODE: { label:'Enable Audit Mode', desc:{en:'Master switch for Direction Debate Audit Mode. When enabled, every specialist (Explorer, Comparator, Skeptic, Evidence Auditor, Judge) emits a structured AUDIT_FINDING block and the Judge emits a GATE_VERDICT in the expanded PROCEED/BRANCH/KILL/NEEDS_MORE_DATA space. v1.1.8 is observation-only: the audit ledger captures the disagreement trace but legacy force-none flow is unchanged for back-compat.', zh:'Direction Debate Audit Mode 主開關。開啟後每位 specialist (Explorer / Comparator / Skeptic / Evidence Auditor / Judge) 都會輸出結構化的 AUDIT_FINDING 區塊，Judge 額外輸出 GATE_VERDICT (擴張的 PROCEED / BRANCH / KILL / NEEDS_MORE_DATA 決策空間)。v1.1.8 設計為「只觀察不覆寫」：audit ledger 抓到分歧軌跡，但舊的 force-none 行為保持不變以維持 back-compat。'}, type:'boolean' },
+  CRUCIBLE_DEBATE_REQUIRE_STRUCTURED_FINDINGS: { label:'Require Structured Findings', desc:{en:'When enabled, the orchestrator retries direction-debate attempts where any specialist failed to emit a parseable AUDIT_FINDING block. When disabled, missing findings are silently skipped (audit trail will be sparse but the main pipeline proceeds).', zh:'開啟時，若任一 specialist 未輸出可解析的 AUDIT_FINDING 區塊，orchestrator 會重試 direction-debate。關閉時，缺失的 findings 會被靜默跳過 (audit trail 會稀疏，但主流程繼續進行)。'}, type:'boolean' },
+  CRUCIBLE_DEBATE_ISOLATION_MODE: { label:'Isolation Mode', desc:{en:'How prior agents’ context is shared with downstream agents. sequential (default) = full prior task output passed via Task.context (legacy v1.1.7 behaviour). hybrid = prior agents’ free-form chain-of-thought is marked untrusted; only their structured AUDIT_FINDING blocks are authoritative. hybrid reduces sequential anchoring at the cost of slightly stricter prompts.', zh:'前一位 agent 的 context 如何傳給下一位 agent。sequential (預設) = 完整輸出透過 Task.context 傳遞 (v1.1.7 既有行為)。hybrid = 前一位 agent 的 free-form 推理被標記為不可信，只有結構化的 AUDIT_FINDING 區塊是權威。hybrid 模式以稍嚴的 prompt 為代價，降低 sequential anchoring 風險。'}, type:'select', opts:[{v:'sequential',l:'sequential (legacy v1.1.7)'},{v:'hybrid',l:'hybrid (structured-only authority)'}] },
+  CRUCIBLE_DEBATE_EXTERNAL_CRITIC: { label:'Enable External Critic', desc:{en:'Spawn a sixth agent that re-judges the Judge’s verdict using ONLY the raw research evidence + Judge’s decision token. Critic does NOT see prior agents’ chain-of-thought, so it is isolated from sequential anchoring. v1.1.8 uses the same model family as Judge (cross-family critic ships in v1.3.0).', zh:'啟用第六位 agent，僅使用「原始研究證據 + Judge 的決策 token」重新審判 Judge 的結論。Critic 看不到其他 agent 的推理過程，因此免於 sequential anchoring 偏差。v1.1.8 使用與 Judge 相同的模型族 (跨模型族 critic 留待 v1.3.0)。'}, type:'boolean' },
+  CRUCIBLE_DEBATE_CRITIC_OVERRIDE_PROCEED: { label:'Critic Can Override Judge', desc:{en:'When enabled, an External Critic KILL verdict overrides Judge PROCEED. When disabled (default), Critic dissent is recorded in audit_trail but the Judge verdict stands. Recommended to keep disabled until the Critic has been calibrated on real workloads.', zh:'開啟時，External Critic 的 KILL 結論可覆寫 Judge 的 PROCEED。關閉時 (預設)，Critic 的反對意見會寫入 audit_trail，但最終以 Judge 結論為準。建議在 Critic 校準完成前保持關閉。'}, type:'boolean' },
+  CRUCIBLE_DEBATE_CONSENSUS_RISK_THRESHOLD: { label:'Consensus Risk Threshold', desc:{en:'Pairwise Jaccard distance threshold for the consensus-risk computation. When concern_diversity falls below this value AND mean confidence > 0.85, the low_diversity_high_confidence flag fires. Range [0.0, 1.0]; default 0.3. Lower = stricter (more sensitive to groupthink).', zh:'consensus-risk 計算的 pairwise Jaccard distance 閾值。當 concern_diversity 低於此值且平均 confidence > 0.85 時，會觸發 low_diversity_high_confidence 旗標。範圍 [0.0, 1.0]，預設 0.3。值越低越嚴格 (對 groupthink 更敏感)。'}, type:'number' },
+  CRUCIBLE_DEBATE_CRITIC_MAX_ATTEMPTS: { label:'Critic Max Attempts', desc:{en:'Maximum retry attempts for the External Critic LLM call. Range 1-5; default 2. Hitting the limit returns a NEEDS_MORE_DATA fallback (never KILL) so a flaky LLM cannot silently destroy viable directions.', zh:'External Critic LLM 呼叫的最大重試次數。範圍 1-5，預設 2。耗盡重試後回傳 NEEDS_MORE_DATA 的安全 fallback (絕對不 KILL)，確保 LLM 不穩定時不會誤殺可行方向。'}, type:'number' },
+  CRUCIBLE_RUN_INSIGHTS_RECORD_DEBATE_FINDING: { label:'Record Debate Findings', desc:{en:'auto = follow CRUCIBLE_DEBATE_AUDIT_MODE (record only in audit mode; default). 1 = always record findings (even when audit_mode is off). 0 = never record. Typos fall back to auto, never truthy-coerce.', zh:'auto = 跟隨 CRUCIBLE_DEBATE_AUDIT_MODE (只在 audit mode 開啟時記錄;預設)。1 = 永遠記錄 findings (即使 audit_mode 關閉)。0 = 永遠不記錄。拼錯的值 fallback 回 auto,不會被 truthy-coerce。'}, type:'select', opts:[{v:'auto',l:'auto (follow audit_mode)'},{v:'1',l:'1 (always record)'},{v:'0',l:'0 (never record)'}] },
+  CRUCIBLE_RUN_INSIGHTS_RECORD_GATE_VERDICT: { label:'Record Gate Verdicts', desc:{en:'When enabled (default), every direction-debate attempt emits a debate_verdict ledger event with the Judge’s terminal decision (PROCEED / BRANCH / KILL / NEEDS_MORE_DATA). Gate verdicts are cheap to record and the single most-valuable signal for v1.2.0 retrieval — recommended to keep enabled.', zh:'開啟時 (預設)，每次 direction-debate 嘗試都會輸出一筆 debate_verdict ledger 事件，記錄 Judge 的終態決策 (PROCEED / BRANCH / KILL / NEEDS_MORE_DATA)。Gate verdicts 寫入成本低且對 v1.2.0 retrieval 是最有價值的訊號，建議保持開啟。'}, type:'boolean' },
 };
 
 function _toggleSection(hdr) {

@@ -1127,6 +1127,37 @@ def cmd_run(args: argparse.Namespace) -> None:
     """
     workspace_dir = str(_REPO_ROOT)
 
+    # v1.1.8 — Direction Debate Audit Mode CLI → env translation.  Each of
+    # the four new flags maps onto a CRUCIBLE_DEBATE_* env var that
+    # section_02:_run_single_direction_debate reads at runtime.  The
+    # translation MUST happen BEFORE any section module is imported (which
+    # currently is fine because section_02 reads env at call-time, not
+    # import-time).  ``getattr(..., None)`` is used so missing args from
+    # alternate subcommands don't crash this branch — the env override is
+    # skipped silently when the flag is absent.  ``_b2e`` is local to avoid
+    # polluting the module namespace.
+    def _b2e(val: Any) -> Optional[str]:
+        if val is True:
+            return "1"
+        if val is False:
+            return "0"
+        return None
+
+    _audit_mode_arg = getattr(args, "audit_mode", None)
+    if _audit_mode_arg is not None:
+        os.environ["CRUCIBLE_DEBATE_AUDIT_MODE"] = _b2e(_audit_mode_arg) or "0"
+    _isolation_arg = getattr(args, "debate_isolation", None)
+    if _isolation_arg:
+        os.environ["CRUCIBLE_DEBATE_ISOLATION_MODE"] = str(_isolation_arg).strip().lower()
+    _critic_arg = getattr(args, "external_critic", None)
+    if _critic_arg is not None:
+        os.environ["CRUCIBLE_DEBATE_EXTERNAL_CRITIC"] = _b2e(_critic_arg) or "0"
+    _critic_override_arg = getattr(args, "critic_can_override", None)
+    if _critic_override_arg is not None:
+        os.environ["CRUCIBLE_DEBATE_CRITIC_OVERRIDE_PROCEED"] = (
+            _b2e(_critic_override_arg) or "0"
+        )
+
     # Pre-run: interactive context-gathering session
     _interactive_context_path: Optional[str] = None
     interactive = getattr(args, "interactive", False)
@@ -1666,6 +1697,59 @@ def _build_parser() -> argparse.ArgumentParser:
         action=argparse.BooleanOptionalAction,
         default=_env_bool("ENHANCED_RUN_REGISTRY", False),
         help="Index run into SQLite registry (default: off).",
+    )
+    # v1.1.8 — Direction Debate Audit Mode CLI flags.  Each translates into
+    # an env var override in cmd_run BEFORE the core pipeline imports any
+    # section module, so the section_02 orchestration sees the correct
+    # values at run time.  All flags are additive — default behaviour is
+    # off, preserving pre-v1.1.8 sequential debate flow.
+    run_p.add_argument(
+        "--audit-mode",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("CRUCIBLE_DEBATE_AUDIT_MODE", False),
+        help=(
+            "Enable Direction Debate Audit Mode: each specialist emits a "
+            "structured AUDIT_FINDING block; the Judge emits a GATE_VERDICT "
+            "(PROCEED/BRANCH/KILL/NEEDS_MORE_DATA).  v1.1.8 is observation-"
+            "only — the audit ledger captures the disagreement trace but "
+            "the legacy force-none flow is unchanged (default: off)."
+        ),
+    )
+    run_p.add_argument(
+        "--debate-isolation",
+        choices=["sequential", "hybrid"],
+        default=(
+            os.environ.get("CRUCIBLE_DEBATE_ISOLATION_MODE", "sequential") or "sequential"
+        ).strip().lower(),
+        help=(
+            "Direction-debate context-sharing mode.  sequential (default) = "
+            "full prior task output passed via Task.context (legacy v1.1.7 "
+            "behaviour).  hybrid = prior agents' free-form chain-of-thought "
+            "is marked untrusted; only their structured AUDIT_FINDING blocks "
+            "are authoritative — reduces sequential anchoring bias."
+        ),
+    )
+    run_p.add_argument(
+        "--external-critic",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("CRUCIBLE_DEBATE_EXTERNAL_CRITIC", False),
+        help=(
+            "Enable the External Critic (sixth agent) that re-judges the "
+            "Judge's verdict using ONLY the raw research evidence + Judge's "
+            "decision token.  Isolated from prior agents' chain-of-thought.  "
+            "v1.1.8 uses the same model family as Judge (default: off)."
+        ),
+    )
+    run_p.add_argument(
+        "--critic-can-override",
+        action=argparse.BooleanOptionalAction,
+        default=_env_bool("CRUCIBLE_DEBATE_CRITIC_OVERRIDE_PROCEED", False),
+        help=(
+            "Allow the External Critic's KILL verdict to override Judge "
+            "PROCEED.  When off (default), Critic dissent is recorded in "
+            "the audit trail but the Judge verdict stands.  Recommended to "
+            "keep off until the Critic has been calibrated on real loads."
+        ),
     )
     run_p.add_argument(
         "--backtest-runner",

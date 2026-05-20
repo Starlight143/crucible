@@ -89,6 +89,14 @@ class EventKind(str, Enum):
     ERROR_RECORD = "error_record"
     DIRECTION_DEBATE_REJECTION = "direction_debate_rejection"
     RUNTIME_PARAMS = "runtime_params"
+    # v1.1.8 — Direction Debate Audit Mode adds two new event kinds that share
+    # the existing ``debate`` JSONL stream (no new file).  The recorder writes
+    # ``debate_finding`` once per specialist (5+ per direction_debate run when
+    # audit_mode=1) and ``debate_verdict`` once at the end with the gate's
+    # terminal decision.  See ``CLAUDE.md § 11`` for the v1.1.8 audit-trail
+    # contract — these events are the physical carrier of "disagreement log".
+    DIRECTION_DEBATE_FINDING = "direction_debate_finding"
+    DIRECTION_DEBATE_VERDICT = "direction_debate_verdict"
 
 
 class OutcomeStatus(str, Enum):
@@ -662,18 +670,27 @@ class InsightEvent:
     def stream_name(self) -> str:
         """Return the JSONL stream this event belongs to.
 
-        Mapping (one stream per kind, matches the layout documented in
-        ``backends.py``):
+        Mapping (matches the layout documented in ``backends.py``):
 
         * ``output_method`` → ``output``
         * ``error_record`` → ``error``
         * ``direction_debate_rejection`` → ``debate``
+        * ``direction_debate_finding`` → ``debate``  (v1.1.8, audit mode)
+        * ``direction_debate_verdict`` → ``debate``  (v1.1.8, audit mode)
         * ``runtime_params`` → ``params``
+
+        v1.1.8 deliberately reuses the existing ``debate`` stream for the new
+        finding/verdict events rather than creating fresh streams — this keeps
+        ``_STREAM_FILENAMES`` / ``_VALID_STREAMS`` invariants and ledger-prune
+        semantics unchanged.  Downstream readers should branch on ``kind``
+        (not stream) to distinguish the three debate event types.
         """
         return {
             EventKind.OUTPUT_METHOD: "output",
             EventKind.ERROR_RECORD: "error",
             EventKind.DIRECTION_DEBATE_REJECTION: "debate",
+            EventKind.DIRECTION_DEBATE_FINDING: "debate",
+            EventKind.DIRECTION_DEBATE_VERDICT: "debate",
             EventKind.RUNTIME_PARAMS: "params",
         }[self.kind]
 

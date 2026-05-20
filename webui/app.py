@@ -1810,6 +1810,14 @@ _RUN_INSIGHTS_FLAG_TO_ENV: dict[str, str] = {
     "run_insights_record_errors": "CRUCIBLE_RUN_INSIGHTS_RECORD_ERRORS",
     "run_insights_record_debate": "CRUCIBLE_RUN_INSIGHTS_RECORD_DEBATE",
     "run_insights_redact":        "CRUCIBLE_RUN_INSIGHTS_REDACT",
+    # v1.1.8 — Direction Debate Audit Mode per-run toggles.  Frontend
+    # mirror lives in webui/static/js/app.js:ENV_BACKED_FLAGS — both
+    # must stay in lockstep.  RHS env names match the actual reads in
+    # section_02_research_and_llm.py and the recorder helper
+    # ``_resolve_record_debate_finding`` (producer→consumer wiring
+    # verified by test_wiring.py per CLAUDE.md § 9.6).
+    "debate_audit_mode":          "CRUCIBLE_DEBATE_AUDIT_MODE",
+    "debate_external_critic":     "CRUCIBLE_DEBATE_EXTERNAL_CRITIC",
 }
 
 
