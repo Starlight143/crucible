@@ -29,6 +29,7 @@ Usage::
 from __future__ import annotations
 
 import contextlib
+import os
 import uuid
 from typing import Iterator, Optional
 import contextvars
@@ -78,6 +79,25 @@ def set_run_id(run_id: Optional[str] = None) -> str:
     _RUN_ID.set(rid)
     update_log_context(run_id=rid)
     return rid
+
+
+def init_run_correlation_from_env(env_var: str = "CRUCIBLE_RUN_ID") -> str:
+    """Bootstrap helper: bind the run-correlation ContextVar from an env var.
+
+    Reads *env_var* (default ``CRUCIBLE_RUN_ID``), strips it, and passes
+    it through :func:`set_run_id` so whitespace-only values fall back to
+    a fresh UUID4 rather than silently pinning a blank-looking run_id.
+    Never raises — correlation-id binding must not abort the pipeline boot.
+
+    v1.1.9 (L1): factored out of the three identical try/except blocks at
+    ``crucible/__main__.py``, ``run_crucible.py`` and
+    ``run_crucible_enhanced.py:main()`` so they stay in lockstep.  Each
+    entry point now calls this helper exactly once at process start.
+    """
+    try:
+        return set_run_id((os.environ.get(env_var) or "").strip() or None)
+    except Exception:
+        return ""
 
 
 @contextlib.contextmanager

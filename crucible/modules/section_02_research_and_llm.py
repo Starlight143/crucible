@@ -1587,6 +1587,21 @@ def _run_single_direction_debate(
                     )
                 except Exception:
                     pass
+                # v1.1.9 (M3 / P5): stash the pre-clamp candidate decision
+                # into ``gap_info`` so the outer ``run_direction_debate``
+                # loop can opt into a degrade-not-die return when
+                # ``CRUCIBLE_DEBATE_TOLERATE_UNVERIFIABLE_EVIDENCE=1``.
+                # This is purely additive — the previous return shape
+                # (``(None, comparator_report, audit_report, gap_info)``)
+                # is preserved; the only change is that ``gap_info`` now
+                # carries an extra optional key that legacy callers can
+                # ignore.
+                try:
+                    if decision is not None and isinstance(gap_info, dict):
+                        gap_info["preclamp_decision"] = decision
+                        gap_info["preclamp_reason"] = str(reason or "")
+                except Exception:
+                    pass
                 return None, comparator_report, audit_report, gap_info
             decision = _apply_deterministic_direction_rerank(
                 decision,
@@ -2311,13 +2326,17 @@ def run_direction_debate(
     # times AND the operator has opted into the toggle, emit a
     # ``direction_debate_degraded_proceed`` ledger event so v1.2.0
     # retrieval can identify which runs would have benefited.
-    # v1.1.8 is OBSERVATION-ONLY for the degrade path — the actual
-    # behavioural change (returning a low-confidence direction instead
-    # of None) is deferred to v1.1.9 because it requires a non-trivial
-    # signature change to ``_run_single_direction_debate``.  The env
-    # toggle ``CRUCIBLE_DEBATE_TOLERATE_UNVERIFIABLE_EVIDENCE`` therefore
-    # currently controls only whether the event is emitted (and is
-    # primed for the future behavioural change).
+    # v1.1.9 (M3): degrade-not-die is now ACTIVE.  When the operator
+    # opts into ``CRUCIBLE_DEBATE_TOLERATE_UNVERIFIABLE_EVIDENCE`` and
+    # ``_run_single_direction_debate`` has stashed a pre-clamp candidate
+    # into ``last_gap_info["preclamp_decision"]``, we return that
+    # candidate (with a low-confidence cap) instead of None.  The ledger
+    # event now carries ``decision_taken=True`` so downstream consumers
+    # can distinguish v1.1.8 observation rows from v1.1.9 active rows.
+    # When the toggle is OFF (the default) behaviour is identical to
+    # v1.1.8 — the event is not emitted and the function still returns
+    # None.
+    _degraded_decision: Optional["DirectionDecision"] = None
     if last_gap_info is not None:
         try:
             _tolerate = _env_bool(
@@ -2328,16 +2347,40 @@ def run_direction_debate(
             ) or 3
             _total_iter = DIRECTION_REFINEMENT_MAX_ITERATIONS + 1
             if _tolerate and _total_iter >= _n_threshold:
+                _preclamp = last_gap_info.get("preclamp_decision")
                 _candidate_dir = ""
                 _weak = list(last_gap_info.get("weak_directions") or [])
-                if _weak:
+                if _preclamp is not None:
+                    _candidate_dir = str(
+                        getattr(_preclamp, "selected_direction", "") or ""
+                    )
+                if not _candidate_dir and _weak:
                     _candidate_dir = str(_weak[0])
+                _decision_taken = False
+                if _preclamp is not None and _candidate_dir:
+                    # Cap confidence to "low" so the rest of the
+                    # pipeline (gate controller, codegen scope chooser,
+                    # etc.) treats this as a tentative direction.  We
+                    # deliberately mutate the existing object rather than
+                    # construct a new one because DirectionDecision has
+                    # seven required ``options`` and re-synthesising them
+                    # from scratch would lose all of the debate's work.
+                    try:
+                        if hasattr(_preclamp, "confidence"):
+                            setattr(_preclamp, "confidence", "low")
+                        _degraded_decision = _preclamp
+                        _decision_taken = True
+                    except Exception:
+                        _degraded_decision = None
+                        _decision_taken = False
                 _get_insights_recorder().record_direction_debate_degraded_proceed(
                     run_id=_resolve_run_id_for_ledger_emit(),
                     project_name="stage0_pending",
                     mode=str(mode or "mode_unknown"),
                     selected_direction=_candidate_dir or "unknown",
-                    original_decision="force_none",
+                    original_decision=(
+                        "degraded_proceed" if _decision_taken else "force_none"
+                    ),
                     consecutive_force_none_count=int(_total_iter),
                     final_score=0,
                     gate_reason=(
@@ -2400,6 +2443,17 @@ def run_direction_debate(
             "saved_projects/direction_debug/ "
             "(or %TEMP%/CrucibleCrew_direction_debug/ on Windows fallback)."
         )
+    # v1.1.9 (M3 / P5): if the degrade-not-die path computed an active
+    # decision above, surface it now so the gate controller has something
+    # to work with instead of bailing the entire run.  Default (toggle
+    # off) still returns None and matches pre-v1.1.9 behaviour bit-for-bit.
+    if _degraded_decision is not None:
+        print(
+            "[Info] Direction debate returning low-confidence pre-clamp "
+            "candidate under CRUCIBLE_DEBATE_TOLERATE_UNVERIFIABLE_EVIDENCE; "
+            "downstream gate controller will treat as tentative."
+        )
+        return _degraded_decision
     return None
 
 

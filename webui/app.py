@@ -1859,6 +1859,67 @@ _STORE_TRUE_FLAG_TO_ENV: dict[str, str] = {
 }
 
 
+# v1.1.9 (L2): the frontend ENV_BACKED_FLAGS panel exposes 35 additional
+# checkboxes (``security_scan``, ``html_report``, ``quant_analytics``,
+# ``backtest_runner``, ``gate_control``, etc.) but pre-v1.1.9 only the 8
+# run-insights + 3 store-true entries above were translated into
+# subprocess env overrides.  Toggling any of the other boxes had **no
+# subprocess-side effect** — the panel showed the new state, but
+# ``run_crucible_enhanced.py`` still computed its argparse defaults from
+# the parent process's inherited ``.env`` values.
+#
+# Every entry below maps directly to a default value read by
+# ``run_crucible_enhanced.py`` (most via ``argparse default=_env_bool(...)``)
+# or a flag honoured by section_05 / section_06 / section_07.  The RHS
+# names match what those consumers read verbatim — change one without the
+# other and ``TestL2EnhancedFlagWiring.test_mapping_rhs_matches_consumer_reads``
+# trips.  The producer→consumer wiring rule in CLAUDE.md § 9.6 was the
+# direct motivation for this fix (the v1.1.0 fifth-pass G-1 incident
+# showed the same trap with a mis-spelled RHS — wiring a mapping is
+# never enough; the consumer must read the exact name the mapping writes).
+_ENHANCED_FLAG_TO_ENV: dict[str, str] = {
+    # Direction / gate / validation controls
+    "gate_control":           "GATE_CONTROL_ENABLED",
+    "selective_rerun":        "SELECTIVE_RERUN_ENABLED",
+    "api_version_check":      "API_VERSION_CHECK_ENABLED",
+    # Enhanced post-processing
+    "use_memory":             "ENHANCED_PROJECT_MEMORY",
+    "security_scan":          "ENHANCED_SECURITY_SCAN",
+    "deployment_artifacts":   "ENHANCED_DEPLOYMENT_ARTIFACTS",
+    "generate_tests":         "ENHANCED_GENERATE_TESTS",
+    "api_autopatch":          "ENHANCED_API_AUTOPATCH",
+    "independent_validation": "ENHANCED_INDEPENDENT_VALIDATION",
+    "ci_output":              "ENHANCED_CI_OUTPUT",
+    "auto_remediation":       "ENHANCED_AUTO_REMEDIATION",
+    "dependency_audit":       "ENHANCED_DEPENDENCY_AUDIT",
+    "html_report":            "ENHANCED_HTML_REPORT",
+    "code_quality":           "ENHANCED_CODE_QUALITY",
+    "run_registry":           "ENHANCED_RUN_REGISTRY",
+    # Advanced features
+    "interactive":            "ENHANCED_INTERACTIVE",
+    "dedup_check":            "ENHANCED_DEDUP_CHECK",
+    "backtest_runner":        "ENHANCED_BACKTEST_RUNNER",
+    "post_chat":              "ENHANCED_POST_CHAT",
+    "agent_metrics":          "ENHANCED_AGENT_METRICS",
+    "ingest_docs":            "ENHANCED_INGEST_DOCS",
+    "multilang_codegen":      "ENHANCED_MULTILANG_CODEGEN",
+    "lockfile_gen":           "ENHANCED_LOCKFILE_GEN",
+    # Quant Analytics Suite
+    "quant_analytics":        "ENHANCED_QUANT_ANALYTICS",
+    "walk_forward":           "ENHANCED_WALK_FORWARD",
+    "significance_test":      "ENHANCED_SIGNIFICANCE_TEST",
+    "regime_detection":       "ENHANCED_REGIME_DETECTION",
+    "factor_analysis":        "ENHANCED_FACTOR_ANALYSIS",
+    "transaction_cost":       "ENHANCED_TRANSACTION_COST",
+    "monte_carlo":            "ENHANCED_MONTE_CARLO",
+    "tearsheet":              "ENHANCED_TEARSHEET",
+    "signal_analysis":        "ENHANCED_SIGNAL_ANALYSIS",
+    "risk_attribution":       "ENHANCED_RISK_ATTRIBUTION",
+    "cointegration":          "ENHANCED_COINTEGRATION",
+    "dynamic_correlation":    "ENHANCED_DYNAMIC_CORRELATION",
+}
+
+
 def _resolve_run_insights_env_overrides(flags: dict[str, Any]) -> dict[str, str]:
     """Maps per-run flag toggles → subprocess env vars.
 
@@ -1870,32 +1931,35 @@ def _resolve_run_insights_env_overrides(flags: dict[str, Any]) -> dict[str, str]
 
     v1.1.0 fourth-pass: also resolves ``_STORE_TRUE_FLAG_TO_ENV`` so the
     three legacy ``store_true``-only flags (``cache`` / ``strict_json`` /
-    ``cost_trace``) can finally be per-run-disabled.  The function name
-    is kept for backward compatibility with the four call sites; despite
-    the "run_insights" in the name, this is now the canonical
-    flags→env resolver for ALL env-backed bool flags.
+    ``cost_trace``) can finally be per-run-disabled.
+
+    v1.1.9 (L2): also resolves ``_ENHANCED_FLAG_TO_ENV`` so the 35
+    ``ENHANCED_*`` / ``GATE_*`` / ``SELECTIVE_RERUN_ENABLED`` /
+    ``API_VERSION_CHECK_ENABLED`` checkboxes the frontend has always
+    exposed actually reach the subprocess.  Without this branch, those
+    boxes were visual-only — toggling them changed the panel but not
+    the run.
+
+    The function name is kept for backward compatibility with the four
+    call sites; despite the "run_insights" in the name, this is the
+    canonical flags→env resolver for ALL env-backed bool flags.
     """
     out: dict[str, str] = {}
     if not isinstance(flags, dict):
         return out
-    # Run-insights toggles (cleanly bidirectional True/False ↔ "1"/"0").
-    for flag_key, env_key in _RUN_INSIGHTS_FLAG_TO_ENV.items():
-        val = flags.get(flag_key)
-        if val is True:
-            out[env_key] = "1"
-        elif val is False:
-            out[env_key] = "0"
-    # Store-true legacy flags that lack ``--no-`` CLI form: same
-    # bidirectional resolution.  Without this branch, the only effect
-    # of unchecking the box was visual — the run_insights ledger and
-    # cache code paths still ran because the env var stayed at its
-    # ``.env`` default.
-    for flag_key, env_key in _STORE_TRUE_FLAG_TO_ENV.items():
-        val = flags.get(flag_key)
-        if val is True:
-            out[env_key] = "1"
-        elif val is False:
-            out[env_key] = "0"
+    # Iterate every mapping group in turn; later groups never overwrite
+    # earlier ones because every flag_key lives in exactly one group.
+    for mapping in (
+        _RUN_INSIGHTS_FLAG_TO_ENV,
+        _STORE_TRUE_FLAG_TO_ENV,
+        _ENHANCED_FLAG_TO_ENV,
+    ):
+        for flag_key, env_key in mapping.items():
+            val = flags.get(flag_key)
+            if val is True:
+                out[env_key] = "1"
+            elif val is False:
+                out[env_key] = "0"
     return out
 
 

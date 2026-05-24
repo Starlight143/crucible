@@ -5,6 +5,150 @@ Versioning follows [Semantic Versioning](https://semver.org/). The first public 
 
 ---
 
+## [v1.1.9] — 2026-05-24
+
+Audit-fix release: 8 findings (H1/H2/M1/M2/M3/M4/L1/L2) from the
+post-v1.1.8 review.  All changes are additive; no env-var default
+flipped, no public schema broken, no CLI flag removed.  Defaults match
+v1.1.8 bit-for-bit unless the operator opts into the new behaviour
+(only `CRUCIBLE_DEBATE_TOLERATE_UNVERIFIABLE_EVIDENCE`, which v1.1.8
+already shipped as observation-only).
+
+### Added
+- **`crucible/_atomic_io.py`** (H1) — shared `atomic_write_text()` +
+  `fsync_dir()` helpers.  `os.replace` on POSIX needs a parent-dir
+  fsync to durably commit the rename; without it a power loss after
+  the replace can leave the new bytes on disk while the directory
+  entry still points at the old inode.  `section_07._atomic_write_text`
+  (the writer behind every final-stage artefact — `final_output.json`,
+  `quality_report.json`, `gate_decision.json`, README, etc.) and
+  `quant_analytics.py` (walk-forward + analytics report writers) now
+  route through it.  Windows is a no-op (NTFS commits metadata on the
+  file handle).
+- **`init_run_correlation_from_env()`** in `crucible/run_correlation.py`
+  (L1) — single shared bootstrap helper that all three CLI entry points
+  (`crucible/__main__.py`, `run_crucible.py`, `run_crucible_enhanced.py`)
+  now call instead of carrying the same inline
+  `_set_run_id((os.environ.get("CRUCIBLE_RUN_ID") or "").strip() or None)`
+  pattern.  Behaviour identical; v1.1.2 sixth-pass H-3 whitespace-strip
+  contract preserved by `set_run_id`'s own `.strip()` defence.
+- **`_ENHANCED_FLAG_TO_ENV`** in `webui/app.py` (L2) — 35 per-run flag
+  toggles (`security_scan`, `html_report`, `quant_analytics`,
+  `backtest_runner`, `gate_control`, `selective_rerun`,
+  `api_version_check`, all 12 `ENHANCED_*` post-processing flags, the
+  10 Quant Analytics Suite flags, etc.) now actually reach the
+  subprocess.  Pre-v1.1.9 these were **visual-only** — `ENV_BACKED_FLAGS`
+  on the frontend synced the initial checkbox state from `.env`, but
+  the backend resolver only translated the 11 run-insights /
+  store-true flags into subprocess env overrides, so unchecking any of
+  the other 35 boxes changed the panel but not the run.  Now wired in
+  lockstep, pinned by `tests/test_v1_1_9_regressions.py::
+  TestL2EnhancedFlagWiring` (4-layer producer→consumer wiring per
+  CLAUDE.md § 9.6).
+
+### Changed
+- **`run_direction_debate()` degrade-not-die now active** (M3 / P5) — when
+  `CRUCIBLE_DEBATE_TOLERATE_UNVERIFIABLE_EVIDENCE=1` and the force-none
+  refinement loop exhausts, the outer caller now returns the pre-clamp
+  candidate decision (with `confidence` capped to "low") instead of
+  None.  v1.1.8 emitted the `direction_debate_degraded_proceed` ledger
+  event but kept returning None; v1.1.9 honours the toggle for real.
+  The `original_decision` field of the emitted event distinguishes
+  active rows (`"degraded_proceed"`) from v1.1.8 observation rows
+  (`"force_none"`).  Default (toggle off) returns None unchanged.
+  Additive: `_run_single_direction_debate` now stashes the pre-clamp
+  decision into `gap_info["preclamp_decision"]`; the return-tuple shape
+  is unchanged so legacy callers ignore the new key.
+- **`section_01._try_build` lenient pydantic retry** (M4 / P1) — when
+  strict `model_cls(**d)` fails because the LLM emitted extra keys the
+  schema doesn't know about, filter to declared `model_fields` and try
+  once more.  Strict validation still wins on clean payloads; the
+  lenient pass only fires after the strict attempt fails.  Closes the
+  v1.1.8 known limitation where one stray chatty-model key would burn
+  the entire retry budget.
+- **`section_04` dispatcher wire-in for cooldown + health** (H2) —
+  the Q2 (`crucible/web_research/cooldown.py`) and Q7
+  (`crucible/web_research/health.py`) modules shipped in v1.1.8 but
+  never reached the dispatcher.  `_safe_http_json` / `_safe_http_text`
+  now accept an optional `provider_name=` kwarg; when given they
+  check `CooldownRegistry.is_cooling_down(provider)` before the call
+  (raising `_CooldownSkipError` if cooling), record the request on the
+  health tracker, classify any failure into 429 / 202 / timeout /
+  other and trigger the cooldown + tracker events appropriately.  All
+  seven existing dispatcher call sites (`_search_websearch` x2,
+  `_search_context7`, `_search_github_*` x2, `_search_arxiv`,
+  `_search_grep_app`) pass `provider_name=`.  Cache hits record to
+  `tracker.record_cache_hit` so end-of-stage summary doesn't undercount
+  provider activity.  At end of `_collect_librarian_search_materials`
+  the dispatcher prints the per-provider summary lines and emits a
+  `record_provider_health_summary` ledger event when
+  `LIBRARIAN_PROVIDER_HEALTH_SUMMARY` is on (default).  Q3 fallback
+  chain + Q5 async fan-out wire-in remain deferred — they need a loop
+  restructure that's out of scope for this audit-fix release.
+- **`auto_remediator._call_llm` exception logging** (M1) — the
+  previously silent `except Exception: pass` now logs at DEBUG via a
+  module-level `LOGGER`.  Operators staring at "no patch generated"
+  can now flip `CRUCIBLE_LOG_LEVEL=DEBUG` and see whether the LLM
+  call hit a timeout, expired credential, or rate limit.
+- **`requirements.txt` optional-dep version floors** (M2) — every
+  actively-imported optional dependency now carries a minimum version
+  (`python-dotenv>=1.0`, `pyyaml>=6.0`, `appdirs>=1.4`, `yfinance>=0.2.0`,
+  `ccxt>=4.0`, `optuna>=3.0`, `fpdf2>=2.7`, `pypdf>=3.0`,
+  `python-docx>=0.8.11`, `chromadb>=0.4`, `scikit-learn>=1.0`,
+  `watchdog>=3.0`, `mlflow>=2.0`, `scipy>=1.7`, `statsmodels>=0.14`,
+  `pandas-datareader>=0.10`, `quantstats>=0.0.59`,
+  `opentelemetry-{api,sdk,exporter-otlp}>=1.20`, `APScheduler>=3.10`,
+  `redis>=4.0`, `prometheus_client>=0.15`, `PyJWT>=2.0`, `bcrypt>=4.0`,
+  `celery>=5.0`, `python-telegram-bot>=20.0`, `discord.py>=2.0`).
+  Same rationale as the v1.1.2 sixth-pass M-11 floors on the core
+  deps: `pip-audit` results and `actions/setup-python` cache keys
+  stay reproducible from one CI run to the next.
+
+### Fixed
+- **Five structural tests realigned to the v1.1.9 patterns** —
+  `test_v1_1_2_sixth_pass.py::TestH3RunIdStripProducers` and
+  `test_v1_1_2_audit_fixes.py::TestGroup1RunIdRedux::
+  test_flat_launcher_calls_set_run_id_at_module_top` updated to accept
+  either the pre-v1.1.9 inline `.strip()` pattern or the new
+  `init_run_correlation_from_env()` helper (whichever the entry point
+  uses).  The H-3 strip contract is still re-tested at the function
+  level by `TestL1RunCorrelationHelper`.
+  `test_module_cancellation.py::_has_cancel_guard_before_except_exc`
+  loosened to allow intermediate `except X: raise` clauses between the
+  cancellation guard and the broad `except Exception` — needed for
+  `_search_websearch` after H2 added `except _CooldownSkipError: raise`,
+  which is structurally equivalent (re-raises, doesn't swallow
+  cancellation).
+
+### Validation
+- Full pytest suite: **3 153 passed, 2 skipped** (was 3 104 + 2 at
+  v1.1.8; +49 new tests in `tests/test_v1_1_9_regressions.py` covering
+  all eight findings).  Two skips unchanged: `SyntheticGoldenRun`
+  missing optional `run_meta.json`, and HTTP/2 SSRF test gated on the
+  `h2` package.
+- `crucible/smoke_test.py`: 5/5 OK.
+- `python run_crucible.py --self-check`: OK.
+- `pyproject.toml` and `crucible.__version__` bumped to `"1.1.9"` in
+  lock-step so `test_pyproject_version_matches_package_version`
+  stays green.
+
+### Compatibility
+- Drop-in for v1.1.8.  No env-var default flipped, no public schema
+  broken, no CLI flag removed.  All eight findings are additive — the
+  default behaviour matches v1.1.8 exactly unless the operator opts
+  into the new path (only `CRUCIBLE_DEBATE_TOLERATE_UNVERIFIABLE_EVIDENCE=1`
+  changes runtime behaviour, and that toggle was already opt-in in
+  v1.1.8).
+- L2 mapping additions are bidirectional but only emit env overrides
+  when the per-run flag is **explicitly** True or False.  Missing /
+  `None` values still leave the parent process's `.env` defaults
+  untouched, matching the pre-v1.1.9 "untouched panel" semantics.
+- H1 `atomic_write_text(fsync_parent=True)` is the default; pass
+  `fsync_parent=False` to suppress the parent fsync on callers that
+  intentionally want the pre-v1.1.9 no-fsync behaviour.
+
+---
+
 ## [v1.1.8] — 2026-05-20
 
 Two-theme release: Direction Debate Audit Mode (the per-specialist

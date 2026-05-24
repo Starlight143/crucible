@@ -22,12 +22,19 @@ from __future__ import annotations
 
 import ast
 import json
+import logging
 import os
 import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set
 
 from crucible.output_validation import strip_reasoning_blocks
+
+# v1.1.9 (M1): module logger used to surface previously-silent LLM call
+# exceptions at DEBUG level.  ``_call_llm`` used to swallow every exception
+# with a bare ``pass`` which made network / credential / rate-limit
+# failures invisible to operators staring at "no patch generated" output.
+LOGGER = logging.getLogger(__name__)
 
 # ── Data models ──────────────────────────────────────────────────────────────
 
@@ -118,8 +125,14 @@ def _call_llm(llm: Any, prompt: str) -> Optional[str]:
         if callable(llm):
             result = llm(prompt)
             return (str(result) or None) if result is not None else None
-    except Exception:
-        pass
+    except Exception as exc:
+        # v1.1.9 (M1): log at DEBUG so the failure surfaces under
+        # ``CRUCIBLE_LOG_LEVEL=DEBUG`` without polluting normal runs.
+        # Previously this was a bare ``pass`` which made transient LLM
+        # API failures (timeouts, 429s, expired credentials) indistinguishable
+        # from "model declined to suggest a patch" — an operator-hostile
+        # silent failure mode flagged in the v1.1.9 audit.
+        LOGGER.debug("auto_remediator._call_llm failed: %r", exc, exc_info=True)
     return None
 
 

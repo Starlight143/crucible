@@ -169,36 +169,70 @@ class TestH2HttpClientsSSRF:
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TestH3RunIdStripProducers:
+    """v1.1.2 sixth-pass H-3 contract:  the three CLI entry points must
+    bind ``CRUCIBLE_RUN_ID`` into the run-correlation ContextVar with
+    whitespace-only values rejected (no silent "   " run_id pollution).
 
-    def test_run_crucible_bridge_strips(self) -> None:
+    v1.1.9 (L1):  the three entry points used to duplicate the
+    ``_set_run_id((os.environ.get(...) or "").strip() or None)`` literal
+    inline.  They now share the canonical
+    ``init_run_correlation_from_env()`` helper which delegates to
+    ``set_run_id`` (whose own ``.strip()`` + UUID fallback satisfies the
+    H-3 contract).  The structural pins below were rewritten to assert
+    the new entry-point shape; the underlying contract is unchanged and
+    still re-tested at the function level inside
+    ``test_v1_1_9_regressions.py::TestL1RunCorrelationHelper``.
+    """
+
+    def test_run_crucible_bridge_uses_helper(self) -> None:
         src = (_REPO_ROOT / "run_crucible.py").read_text(encoding="utf-8")
-        # The bridge call must strip BEFORE the ``or None`` fall-through.
-        m = re.search(
-            r"_set_run_id\(\s*\(_os\.environ\.get\(\s*[\"']CRUCIBLE_RUN_ID[\"']\s*\)"
-            r"\s*or\s*[\"']{2}\s*\)\.strip\(\)\s*or\s*None\s*\)",
-            src,
-        )
-        assert m is not None, (
-            "run_crucible.py bridge must apply .strip() before ``or None``"
+        assert "init_run_correlation_from_env" in src, (
+            "run_crucible.py must call the v1.1.9 shared helper "
+            "init_run_correlation_from_env() — see CLAUDE.md § 2 for the "
+            "lockstep contract across the three entry points."
         )
 
-    def test_main_module_bridge_strips(self) -> None:
+    def test_main_module_bridge_uses_helper(self) -> None:
         src = (_REPO_ROOT / "crucible/__main__.py").read_text(encoding="utf-8")
-        m = re.search(
-            r"_set_run_id\(\s*\(_os\.environ\.get\(\s*[\"']CRUCIBLE_RUN_ID[\"']\s*\)"
-            r"\s*or\s*[\"']{2}\s*\)\.strip\(\)\s*or\s*None\s*\)",
-            src,
+        assert "init_run_correlation_from_env" in src, (
+            "crucible/__main__.py must call the v1.1.9 shared helper "
+            "init_run_correlation_from_env()."
         )
-        assert m is not None, "__main__.py bridge missing .strip()"
 
-    def test_run_crucible_enhanced_bridge_strips(self) -> None:
+    def test_run_crucible_enhanced_bridge_uses_helper(self) -> None:
         src = (_REPO_ROOT / "run_crucible_enhanced.py").read_text(encoding="utf-8")
-        m = re.search(
-            r"_set_run_id\(\s*\(os\.environ\.get\(\s*[\"']CRUCIBLE_RUN_ID[\"']\s*\)"
-            r"\s*or\s*[\"']{2}\s*\)\.strip\(\)\s*or\s*None\s*\)",
-            src,
+        assert "init_run_correlation_from_env" in src, (
+            "run_crucible_enhanced.py:main() must call the v1.1.9 shared "
+            "helper init_run_correlation_from_env()."
         )
-        assert m is not None, "run_crucible_enhanced.py bridge missing .strip()"
+
+    def test_init_helper_still_strips_whitespace_only_run_id(self) -> None:
+        """Behavioural pin for the H-3 contract: the shared helper used
+        by all three entry points must still reject whitespace-only
+        ``CRUCIBLE_RUN_ID`` values (this is what v1.1.2 H-3 originally
+        guarded; v1.1.9 keeps the contract by delegating to ``set_run_id``
+        which already strips)."""
+        import os as _os
+        from crucible.run_correlation import (
+            get_run_id,
+            init_run_correlation_from_env,
+            set_run_id,
+        )
+        set_run_id("")  # reset
+        prev = _os.environ.get("CRUCIBLE_RUN_ID")
+        try:
+            _os.environ["CRUCIBLE_RUN_ID"] = "   "
+            rid = init_run_correlation_from_env()
+            assert rid and rid.strip() == rid, (
+                "Whitespace-only CRUCIBLE_RUN_ID must fall back to a fresh "
+                "UUID, not pin a blank-looking run_id."
+            )
+            assert get_run_id() == rid
+        finally:
+            if prev is None:
+                _os.environ.pop("CRUCIBLE_RUN_ID", None)
+            else:
+                _os.environ["CRUCIBLE_RUN_ID"] = prev
 
     def test_recorder_emit_strips_run_id_before_truncate(self) -> None:
         from crucible.features.run_insights import recorder

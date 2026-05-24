@@ -49,11 +49,19 @@ def _has_cancel_guard_before_except_exc(source: str, context_str: str) -> bool:
 
         except _OperationCancelledError:
             raise
+        [...optional re-raise guards (e.g. _CooldownSkipError) ...]
         except Exception...
 
-    i.e., the cancellation guard immediately precedes a broad exception handler.
-    The check is performed on the *source* string, which must contain the relevant
-    try/except block.  ``context_str`` is used only in assertion messages.
+    i.e., the cancellation guard precedes a broad exception handler,
+    possibly with other ``except X: raise`` guards stacked between them
+    (v1.1.9 added ``except _CooldownSkipError: raise`` in section_04's
+    ``_search_websearch`` for the H2 wire-in, which is structurally
+    equivalent — neither swallows OperationCancelledError, so the
+    cancellation contract is still satisfied).
+
+    The check is performed on the *source* string, which must contain
+    the relevant try/except block.  ``context_str`` is used only in
+    assertion messages.
     """
     # Normalise whitespace to make pattern matching robust across indent levels
     lines = [ln.strip() for ln in source.splitlines()]
@@ -64,12 +72,38 @@ def _has_cancel_guard_before_except_exc(source: str, context_str: str) -> bool:
             while j < len(lines) and (not lines[j] or lines[j].startswith("#")):
                 j += 1
             if j < len(lines) and lines[j] == "raise":
-                # After the raise, the next except clause should be ``except Exception``
+                # Scan forward past any intermediate ``except X: raise``
+                # guards.  An ``except Exception`` clause anywhere in
+                # the same try block satisfies the contract — the cancel
+                # guard above it ensures cancellation is never swallowed.
                 k = j + 1
-                while k < len(lines) and (not lines[k] or lines[k].startswith("#")):
-                    k += 1
-                if k < len(lines) and lines[k].startswith("except Exception"):
-                    return True
+                while k < len(lines):
+                    # Skip blanks / comments
+                    while k < len(lines) and (
+                        not lines[k] or lines[k].startswith("#")
+                    ):
+                        k += 1
+                    if k >= len(lines):
+                        break
+                    if lines[k].startswith("except Exception"):
+                        return True
+                    # If the next clause is another ``except X:`` followed
+                    # by a sole ``raise``, accept it and continue scanning.
+                    if lines[k].startswith("except "):
+                        m = k + 1
+                        while m < len(lines) and (
+                            not lines[m] or lines[m].startswith("#")
+                        ):
+                            m += 1
+                        if m < len(lines) and lines[m] == "raise":
+                            k = m + 1
+                            continue
+                        # Some other body — give up on this site, the
+                        # caller may match a later cancel guard in the
+                        # function.
+                        break
+                    # Anything else terminates the chain.
+                    break
     return False
 
 

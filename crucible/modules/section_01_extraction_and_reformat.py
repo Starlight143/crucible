@@ -217,6 +217,31 @@ def _extract_pydantic_from_result(
         try:
             return model_cls(**d)
         except Exception:
+            # v1.1.9 (M4 / P1): lenient retry — when the strict build fails
+            # because the LLM emitted extra fields the model schema doesn't
+            # know about (``ConfigDict(extra="forbid")`` or unknown keyword
+            # argument), filter the payload down to the model's declared
+            # fields and try once more.  This is the CLAUDE.md § 12.1 P1
+            # follow-up — the v1.1.8 known limitation was that one stray
+            # extra key from a chatty model would burn the entire retry
+            # budget even though the required fields were present.  Strict
+            # validation still wins when the model emits a clean payload;
+            # the lenient retry only fires after the strict attempt fails.
+            try:
+                known_fields = set(getattr(model_cls, "model_fields", {}) or {})
+                if not known_fields:
+                    # pydantic v1 fallback (we ship pydantic>=2 so this is
+                    # belt-and-braces only).
+                    known_fields = set(getattr(model_cls, "__fields__", {}) or {})
+                if known_fields:
+                    filtered = {k: v for k, v in d.items() if k in known_fields}
+                    if filtered and (
+                        not required_keys
+                        or all(k in filtered for k in required_keys)
+                    ):
+                        return model_cls(**filtered)
+            except Exception:
+                return None
             return None
 
     if isinstance(result, model_cls):

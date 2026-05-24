@@ -63,21 +63,19 @@ import math  # noqa: E402 — stdlib, used by the v1.1.2 sixth-pass M-7 outcome_
 def _atomic_write_text(path: str, content: str, encoding: str = "utf-8") -> None:
     """Write *content* to *path* atomically via a sibling .tmp file.
 
-    If the process is killed between ``open()`` and ``close()``, the original
-    *path* is left intact.  ``os.replace()`` is atomic on POSIX and
-    best-effort on Windows (both better than a direct overwrite).
+    Delegates to :func:`crucible._atomic_io.atomic_write_text` (v1.1.9 H1)
+    so the POSIX parent-directory fsync that durably commits the rename
+    is applied uniformly to every final-stage artefact written by
+    section 07 (final_output.json, quality_report.json, gate_decision.json,
+    README.md, etc.).  Without that fsync, a power loss after ``os.replace``
+    can leave the new file content on disk while the directory entry still
+    points at the old inode.
     """
-    tmp_path = path + ".tmp"
     try:
-        with open(tmp_path, "w", encoding=encoding) as _fh:
-            _fh.write(content)
-        os.replace(tmp_path, path)
-    except Exception:
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
-        raise
+        from .._atomic_io import atomic_write_text as _aw
+    except ImportError:  # flat-launcher mode (``python crucible/__main__.py``)
+        from _atomic_io import atomic_write_text as _aw  # type: ignore[no-redef]
+    _aw(path, content, encoding=encoding)
 
 
 def sanitize_name(name: str) -> str:

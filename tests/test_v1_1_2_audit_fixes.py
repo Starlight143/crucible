@@ -36,26 +36,39 @@ class TestGroup1RunIdRedux:
     def test_flat_launcher_calls_set_run_id_at_module_top(self):
         repo_root = Path(__file__).resolve().parent.parent
         text = (repo_root / "run_crucible.py").read_text(encoding="utf-8")
-        # Must import set_run_id and call it before the cli import.
-        assert "from crucible.run_correlation import set_run_id" in text
-        # v1.1.2 (sixth-pass M-9): use a regex that tolerates the H-3
-        # ``.strip() or None`` defence-in-depth wrapper.  The previous
-        # exact-string fingerprint was the original v1.1.2 form and
-        # broke when the sixth-pass H-3 fix wrapped the env read in a
-        # ``.strip() or None`` to reject whitespace-only inputs.  The
-        # contract being pinned is "set_run_id is called on the env
-        # var", not the exact argument form — the value-form is
-        # exercised by ``test_set_run_id_strips_whitespace_only_input``.
-        call_re = re.compile(
-            r"set_run_id\s*\(\s*\(?\s*_os\.environ\.get\(\s*[\"']CRUCIBLE_RUN_ID[\"']",
+        # v1.1.9 (L1) — the three entry points now share
+        # ``init_run_correlation_from_env`` which internally calls
+        # ``set_run_id``.  The contract being pinned is "the env var
+        # is wired into the run-correlation ContextVar BEFORE
+        # ``crucible.cli.main`` runs".  Both old and new shapes satisfy
+        # the contract.
+        has_helper = "init_run_correlation_from_env" in text
+        has_legacy = "from crucible.run_correlation import set_run_id" in text
+        assert has_helper or has_legacy, (
+            "run_crucible.py must wire CRUCIBLE_RUN_ID into the "
+            "run-correlation ContextVar — either via the v1.1.9 shared "
+            "init_run_correlation_from_env helper (preferred) or the "
+            "pre-v1.1.9 inline set_run_id pattern."
         )
-        m = call_re.search(text)
-        assert m is not None, (
-            "run_crucible.py must call set_run_id on os.environ['CRUCIBLE_RUN_ID']"
-        )
-        # set_run_id must appear BEFORE `from crucible.cli import main`.
-        idx_cli = text.find("from crucible.cli import main")
-        assert 0 < m.start() < idx_cli, "set_run_id must run before cli import"
+        if has_helper:
+            # Helper call must precede the cli import.
+            idx_call = text.find("init_run_correlation_from_env()")
+            idx_cli = text.find("from crucible.cli import main")
+            assert 0 < idx_call < idx_cli, (
+                "init_run_correlation_from_env() must run before "
+                "the cli import so resilience.py / section_02 emit paths "
+                "have a populated ContextVar."
+            )
+        else:
+            call_re = re.compile(
+                r"set_run_id\s*\(\s*\(?\s*_os\.environ\.get\(\s*[\"']CRUCIBLE_RUN_ID[\"']",
+            )
+            m = call_re.search(text)
+            assert m is not None, (
+                "run_crucible.py must call set_run_id on os.environ['CRUCIBLE_RUN_ID']"
+            )
+            idx_cli = text.find("from crucible.cli import main")
+            assert 0 < m.start() < idx_cli, "set_run_id must run before cli import"
 
     def test_set_run_id_strips_whitespace_only_input(self):
         from crucible import run_correlation

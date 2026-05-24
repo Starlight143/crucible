@@ -624,22 +624,113 @@ def _append_url_query(
     return _append_url_query_from_module(base_url, params, doseq=doseq)
 
 
+# v1.1.9 (H2): the cooldown + health-tracking modules shipped in v1.1.8
+# but never reached the dispatcher.  We wire them in at the chokepoint —
+# every outbound provider HTTP call goes through ``_safe_http_json`` /
+# ``_safe_http_text`` in this module, so adding the ``provider_name``
+# kwarg here means every search helper that opts in (by passing the kwarg)
+# gets cooldown skip + per-status health accounting + ledger emit for
+# free.  Helpers that don't pass ``provider_name`` keep their pre-v1.1.9
+# behaviour bit-for-bit (the ``provider_name`` branch is a strict
+# additive).
+class _CooldownSkipError(Exception):
+    """Raised by ``_safe_http_*`` when the named provider is in cooldown.
+
+    Caught by the dispatcher's existing per-lane ``except Exception``
+    handler so the lane moves on to the next provider without surfacing
+    a user-visible traceback.
+    """
+
+
+def _v119_get_cooldown_registry() -> Optional[Any]:
+    """Tri-modal import of the cooldown singleton, returning None if the
+    module is missing in unusual deployments (the dispatcher then behaves
+    exactly as it did pre-v1.1.9)."""
+    try:
+        try:
+            from ..web_research.cooldown import CooldownRegistry
+        except ImportError:  # flat-launcher mode
+            from web_research.cooldown import CooldownRegistry  # type: ignore[no-redef]
+        return CooldownRegistry.get_default()
+    except Exception:
+        return None
+
+
+def _v119_get_health_tracker() -> Optional[Any]:
+    """Tri-modal import of the health tracker singleton."""
+    try:
+        try:
+            from ..web_research.health import HealthTracker
+        except ImportError:  # flat-launcher mode
+            from web_research.health import HealthTracker  # type: ignore[no-redef]
+        return HealthTracker.get_default()
+    except Exception:
+        return None
+
+
+def _v119_classify_http_failure(
+    provider_name: str, exc: Exception
+) -> Tuple[str, bool]:
+    """Classify ``exc`` into a (health_event_name, should_trigger_cooldown) tuple.
+
+    * 429 → ``rate_limit`` + cooldown
+    * 202 → ``bot_detection`` + cooldown (DDG bot-mode)
+    * Other 4xx / 5xx → ``other_error`` + no cooldown
+    * httpx.TimeoutException → ``timeout`` + no cooldown
+    * Anything else → ``other_error`` + no cooldown
+    """
+    try:
+        import httpx  # tracker imports httpx already
+    except Exception:
+        httpx = None  # type: ignore
+    if httpx is not None and isinstance(exc, httpx.HTTPStatusError):
+        status = int(getattr(getattr(exc, "response", None), "status_code", 0) or 0)
+        if status == 429:
+            return "rate_limit", True
+        if status == 202:
+            return "bot_detection", True
+        return "other_error", False
+    if httpx is not None and isinstance(exc, httpx.TimeoutException):
+        return "timeout", False
+    return "other_error", False
+
+
 def _safe_http_json(
     url: str,
     *,
     method: str = "GET",
     headers: Optional[Dict[str, str]] = None,
     payload: Optional[Dict[str, Any]] = None,
+    provider_name: Optional[str] = None,
 ) -> Any:
-    return _safe_http_json_from_module(
-        url,
-        timeout_seconds=LIBRARIAN_HTTP_TIMEOUT_SECONDS,
-        max_bytes=LIBRARIAN_HTTP_MAX_BYTES,
-        user_agent=LIBRARIAN_HTTP_USER_AGENT,
-        method=method,
-        headers=headers,
-        payload=payload,
-    )
+    if provider_name:
+        _registry = _v119_get_cooldown_registry()
+        if _registry is not None and _registry.is_cooling_down(provider_name):
+            raise _CooldownSkipError(
+                f"provider {provider_name!r} is in cooldown; skipping"
+            )
+        _tracker = _v119_get_health_tracker()
+        if _tracker is not None:
+            _tracker.record_request(provider_name)
+    try:
+        result = _safe_http_json_from_module(
+            url,
+            timeout_seconds=LIBRARIAN_HTTP_TIMEOUT_SECONDS,
+            max_bytes=LIBRARIAN_HTTP_MAX_BYTES,
+            user_agent=LIBRARIAN_HTTP_USER_AGENT,
+            method=method,
+            headers=headers,
+            payload=payload,
+        )
+    except Exception as exc:
+        if provider_name:
+            _v119_record_http_failure(provider_name, exc)
+        raise
+    if provider_name:
+        _tracker = _v119_get_health_tracker()
+        if _tracker is not None:
+            _tracker.record_ok(provider_name)
+    return result
 
 
 def _safe_http_text(
@@ -648,20 +739,70 @@ def _safe_http_text(
     method: str = "GET",
     headers: Optional[Dict[str, str]] = None,
     timeout_seconds: Optional[int] = None,
+    provider_name: Optional[str] = None,
 ) -> str:
     resolved_timeout = (
         int(timeout_seconds)
         if timeout_seconds is not None and int(timeout_seconds) > 0
         else LIBRARIAN_HTTP_TIMEOUT_SECONDS
     )
-    return _safe_http_text_from_module(
-        url,
-        timeout_seconds=resolved_timeout,
-        max_bytes=LIBRARIAN_HTTP_MAX_BYTES,
-        user_agent=LIBRARIAN_HTTP_USER_AGENT,
-        method=method,
-        headers=headers,
-    )
+    if provider_name:
+        _registry = _v119_get_cooldown_registry()
+        if _registry is not None and _registry.is_cooling_down(provider_name):
+            raise _CooldownSkipError(
+                f"provider {provider_name!r} is in cooldown; skipping"
+            )
+        _tracker = _v119_get_health_tracker()
+        if _tracker is not None:
+            _tracker.record_request(provider_name)
+    try:
+        result = _safe_http_text_from_module(
+            url,
+            timeout_seconds=resolved_timeout,
+            max_bytes=LIBRARIAN_HTTP_MAX_BYTES,
+            user_agent=LIBRARIAN_HTTP_USER_AGENT,
+            method=method,
+            headers=headers,
+        )
+    except Exception as exc:
+        if provider_name:
+            _v119_record_http_failure(provider_name, exc)
+        raise
+    if provider_name:
+        _tracker = _v119_get_health_tracker()
+        if _tracker is not None:
+            _tracker.record_ok(provider_name)
+    return result
+
+
+def _v119_record_http_failure(provider_name: str, exc: Exception) -> None:
+    """Dispatcher-side post-failure bookkeeping for v1.1.9 H2 wire-in.
+
+    Classifies the exception, records the appropriate health counter, and
+    (for 429 / 202) triggers the per-provider cooldown.  Best-effort: a
+    counter or cooldown failure must never mask the original exception
+    the caller is about to re-raise.
+    """
+    try:
+        event, should_cooldown = _v119_classify_http_failure(provider_name, exc)
+        _tracker = _v119_get_health_tracker()
+        if _tracker is not None:
+            if event == "rate_limit":
+                _tracker.record_rate_limit(provider_name)
+            elif event == "bot_detection":
+                _tracker.record_bot_detection(provider_name)
+            elif event == "timeout":
+                _tracker.record_timeout(provider_name)
+            else:
+                _tracker.record_other_error(provider_name)
+        if should_cooldown:
+            _registry = _v119_get_cooldown_registry()
+            if _registry is not None:
+                _registry.trigger(provider_name, reason=event)
+    except Exception:
+        # Bookkeeping must never raise — the dispatcher loop is about to
+        # re-raise the original exception and any noise here would mask it.
+        pass
 
 
 def _citation_source_domain(url: str) -> str:
@@ -2792,22 +2933,30 @@ def _search_websearch(
     }
     try:
         html_text = _safe_http_text(
-            url, headers=headers, timeout_seconds=timeout_seconds
+            url, headers=headers, timeout_seconds=timeout_seconds,
+            provider_name="websearch",  # v1.1.9 H2 wire-in
         )
         citations = _extract_websearch_citations_from_html(html_text, query=query)
         if citations:
             return citations
     except _OperationCancelledError:
         raise
+    except _CooldownSkipError:
+        # Cooldown active — bubble up so the dispatcher records a skip
+        # rather than silently treating an empty result as "no hits".
+        raise
     except Exception:
         pass
     lite_url = f"https://lite.duckduckgo.com/lite/?{params}"
     try:
         html_text = _safe_http_text(
-            lite_url, headers=headers, timeout_seconds=timeout_seconds
+            lite_url, headers=headers, timeout_seconds=timeout_seconds,
+            provider_name="websearch",  # v1.1.9 H2 wire-in
         )
         return _extract_websearch_citations_from_html(html_text, query=query)
     except _OperationCancelledError:
+        raise
+    except _CooldownSkipError:
         raise
     except Exception:
         # Both primary and lite endpoints failed.  Return an empty citation
@@ -2843,7 +2992,7 @@ def _search_context7(
     citations: List[ResearchCitation] = []
     for library in libraries:
         url = _append_url_query(base_url, {"query": f"{library} {clean_query}"})
-        response = _safe_http_json(url)
+        response = _safe_http_json(url, provider_name="context7")  # v1.1.9 H2
         results = response.get("results", []) if isinstance(response, dict) else []
         for item in results[:LIBRARIAN_MAX_RESULTS_PER_QUERY]:
             citation = _citation_from_payload(
@@ -2921,6 +3070,7 @@ def _search_github_repositories(query: str) -> List[ResearchCitation]:
     response = _safe_http_json(
         url,
         headers=_github_api_headers(accept="application/vnd.github+json"),
+        provider_name="github",  # v1.1.9 H2 wire-in
     )
     items = response.get("items", []) if isinstance(response, dict) else []
     citations: List[ResearchCitation] = []
@@ -2974,6 +3124,7 @@ def _search_github_code(query: str) -> List[ResearchCitation]:
         headers=_github_api_headers(
             accept="application/vnd.github.text-match+json, application/vnd.github+json",
         ),
+        provider_name="github",  # v1.1.9 H2 wire-in
     )
     items = response.get("items", []) if isinstance(response, dict) else []
     citations: List[ResearchCitation] = []
@@ -3037,6 +3188,7 @@ def _search_arxiv(query: str) -> List[ResearchCitation]:
     raw_xml = _safe_http_text(
         url,
         headers={"Accept": "application/atom+xml, text/xml, application/xml"},
+        provider_name="arxiv",  # v1.1.9 H2 wire-in
     )
     # arxiv occasionally returns an HTML error page or truncated Atom feed —
     # `ET.fromstring` then raises `ParseError`.  Treat as empty result rather
@@ -3227,7 +3379,7 @@ def _search_grep_app(query: str) -> List[ResearchCitation]:
         url = "https://grep.app/api/search?" + urllib.parse.urlencode(
             params, doseq=True
         )
-        response = _safe_http_json(url)
+        response = _safe_http_json(url, provider_name="grep_app")  # v1.1.9 H2
         hits = response.get("hits", {}) if isinstance(response, dict) else {}
         results = hits.get("hits", []) if isinstance(hits, dict) else []
         for item in results:
@@ -3399,6 +3551,19 @@ def _collect_librarian_search_materials(
                     if _cached_qresult is not None:
                         lane_results.extend(_cached_qresult)
                         last_query = query
+                        # v1.1.9 (H2): record the cache hit in the
+                        # provider health tracker so end-of-stage summary
+                        # surfaces "N req, M cache_hit" instead of leaving
+                        # cache-served queries invisible.  Cache hits do
+                        # NOT count toward ``requests`` (no outbound call
+                        # was issued) — see ``HealthTracker.record_cache_hit``
+                        # docstring for the semantics.
+                        try:
+                            _tracker = _v119_get_health_tracker()
+                            if _tracker is not None:
+                                _tracker.record_cache_hit(provider_name)
+                        except Exception:
+                            pass
                         # v1.1.8 extended (Phase 4, Q6): cache hits also
                         # mark the pair as covered so future providers in
                         # the same class can dedup against this.
@@ -3511,6 +3676,60 @@ def _collect_librarian_search_materials(
         lane_citations[lane] = _dedupe_citations(
             lane_citations[lane], limit=LIBRARIAN_MAX_CITATIONS
         )
+
+    # v1.1.9 (H2): end-of-stage health summary emission.  Runs after the
+    # provider × lane × query nested loop completes so the snapshot
+    # reflects every outbound call this librarian stage made.  Best-effort:
+    # a tracker / recorder / print failure must never break the regular
+    # dispatcher return path below.
+    try:
+        try:
+            from ..web_research.health import health_summary_enabled
+        except ImportError:  # flat-launcher mode
+            from web_research.health import health_summary_enabled  # type: ignore[no-redef]
+        if health_summary_enabled():
+            _tracker = _v119_get_health_tracker()
+            if _tracker is not None:
+                _snapshot = _tracker.snapshot()
+                if _snapshot:
+                    for _line in _tracker.format_summary_lines():
+                        try:
+                            print(_line)
+                        except Exception:
+                            pass
+                    try:
+                        try:
+                            from ..features.run_insights import (
+                                get_recorder as _v119_get_recorder,
+                            )
+                            from ..run_correlation import get_run_id as _v119_get_run_id
+                        except ImportError:  # flat-launcher mode
+                            from features.run_insights import (  # type: ignore[no-redef]
+                                get_recorder as _v119_get_recorder,
+                            )
+                            from run_correlation import (  # type: ignore[no-redef]
+                                get_run_id as _v119_get_run_id,
+                            )
+                        _v119_get_recorder().record_provider_health_summary(
+                            run_id=str(
+                                _v119_get_run_id()
+                                or os.environ.get("CRUCIBLE_RUN_ID")
+                                or ""
+                            ),
+                            project_name="stage0_pending",
+                            mode=str(mode or "mode_unknown"),
+                            counters=_snapshot,
+                        )
+                    except Exception:
+                        pass
+                # Reset so a second librarian stage in the same process
+                # starts from a clean per-provider counter set.
+                try:
+                    _tracker.reset()
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
     all_citations: List[ResearchCitation] = []
     for citations in lane_citations.values():

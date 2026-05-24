@@ -670,21 +670,15 @@ def run_walk_forward(
         positive_oos = sum(1 for r in oos_returns if r > 0)
         result.consistency_score = positive_oos / len(oos_returns)
 
-    # Persist report (atomic write via tmp + os.replace)
+    # Persist report (atomic write via tmp + os.replace + POSIX dir fsync — v1.1.9 H1)
     report_path = os.path.join(run_dir, "walk_forward_report.json")
-    _tmp_path = report_path + ".tmp"
     try:
-        with open(_tmp_path, "w", encoding="utf-8") as f:
-            json.dump(result.to_dict(), f, indent=2, default=str)
-        os.replace(_tmp_path, report_path)
+        from .._atomic_io import atomic_write_text as _atomic_write_text
+        _atomic_write_text(report_path, json.dumps(result.to_dict(), indent=2, default=str))
         result.report_path = report_path
         if verbose:
             logger.info("Walk-forward report saved to %s", report_path)
     except Exception as exc:
-        try:
-            os.unlink(_tmp_path)
-        except OSError:
-            pass
         result.errors.append(f"Could not save report: {exc}")
 
     return result
@@ -1044,20 +1038,14 @@ def run_quant_analytics(
 
     output["success"] = not output["errors"]
 
-    # Persist report (atomic write via tmp + os.replace)
+    # Persist report (atomic write via tmp + os.replace + POSIX dir fsync — v1.1.9 H1)
     report_path = os.path.join(run_dir, "quant_analytics_report.json")
-    _tmp_path = report_path + ".tmp"
     try:
-        with open(_tmp_path, "w", encoding="utf-8") as f:
-            json.dump(output, f, indent=2, default=str)
-        os.replace(_tmp_path, report_path)
+        from .._atomic_io import atomic_write_text as _atomic_write_text
+        _atomic_write_text(report_path, json.dumps(output, indent=2, default=str))
         output["report_path"] = report_path
         logger.info("Quant analytics report saved to %s", report_path)
     except Exception as exc:
-        try:
-            os.unlink(_tmp_path)
-        except OSError:
-            pass
         output["errors"].append(f"Could not save report: {exc}")
 
     return output

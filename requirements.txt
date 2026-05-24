@@ -36,84 +36,91 @@ tiktoken>=0.5
 # Optional — operators who export their env vars from the shell will see
 # the same behaviour as before if this package is absent (the runtime
 # falls back silently with try/except ImportError).
-python-dotenv
+#
+# v1.1.9 (M2): the optional dependency block below also carries minimum
+# floors so ``pip-audit`` and the actions/setup-python cache key stay
+# semantically meaningful.  Floors reflect the public-API surface actually
+# consumed by the codebase and intentionally stay one or two majors back
+# from the latest release to avoid forcing pointless upgrades on operators
+# who already have a working install.
+python-dotenv>=1.0
 
 # --- YAML parsing (project profile) -----------------------------------------
-pyyaml
+pyyaml>=6.0
 
 # --- Platform directory resolution ------------------------------------------
-appdirs
+appdirs>=1.4
 
 # --- Optional — backtest runner data fetching --------------------------------
 # Install if using --backtest-runner
-yfinance
-ccxt
+yfinance>=0.2.0
+ccxt>=4.0
 
 # --- Optional — Bayesian hyperparameter optimisation -------------------------
 # Install if using BACKTEST_PARAM_SEARCH=bayesian
-optuna
+optuna>=3.0
 
 # --- Optional — PDF report export --------------------------------------------
 # Falls back to pure-stdlib writer if absent.
-fpdf2
+fpdf2>=2.7
 
 # --- Optional — PDF / Word document ingestion --------------------------------
 # Install if using --ingest-docs with PDF or DOCX files.
-pypdf
-python-docx
+pypdf>=3.0
+python-docx>=0.8.11
 
 # --- Optional — project memory (vector database) ----------------------------
 # Install if using --use-memory
-chromadb
+chromadb>=0.4
 
 # --- Optional — semantic deduplication ---------------------------------------
 # Install if using ENHANCED_DEDUP_ENABLED=true
-scikit-learn
+scikit-learn>=1.0
 
 # --- Optional — file system watch mode ---------------------------------------
 # Install if using the watch subcommand
-watchdog
+watchdog>=3.0
 
 # --- Optional — MLflow experiment tracking -----------------------------------
 # Install if using MLFLOW_TRACKING_URI
-mlflow
+mlflow>=2.0
 
 # --- Optional — Quant Analytics Suite ----------------------------------------
 # All fall back to pure-stdlib implementations if absent.
-scipy            # improves statistical significance tests (t-dist CDF, normal CDF)
-statsmodels      # used by factor_analyzer for OLS diagnostics if available
-pandas-datareader  # enables Fama-French factor data download (factor_analyzer --ff-data)
-quantstats       # tearsheet HTML rendering enhancement (falls back to pure Markdown)
+scipy>=1.7            # improves statistical significance tests (t-dist CDF, normal CDF)
+statsmodels>=0.14     # used by factor_analyzer for OLS diagnostics if available
+pandas-datareader>=0.10  # enables Fama-French factor data download (factor_analyzer --ff-data)
+quantstats>=0.0.59    # tearsheet HTML rendering enhancement (falls back to pure Markdown)
 
 # --- Optional — distributed tracing / observability --------------------------
 # Install if using OTEL_EXPORTER_OTLP_ENDPOINT
-opentelemetry-api
-opentelemetry-sdk
-opentelemetry-exporter-otlp
+opentelemetry-api>=1.20
+opentelemetry-sdk>=1.20
+opentelemetry-exporter-otlp>=1.20
 
 # --- Optional — web UI -------------------------------------------------------
 flask>=2.3
 
 # --- Optional — extended feature modules -------------------------------------
 # scheduler.py: built-in APScheduler job scheduling
-APScheduler
+APScheduler>=3.10
 
 # redis_cache.py: Redis-backed research result cache
-redis
+redis>=4.0
 
 # prometheus_exporter.py: push metrics to Prometheus Pushgateway
-prometheus_client
+prometheus_client>=0.15
 
 # auth_manager.py: JWT authentication for WebUI
-PyJWT
-bcrypt
+PyJWT>=2.0
+bcrypt>=4.0
 
 # celery_worker.py: distributed task queue
-celery
+celery>=5.0
 
 # chat_bot.py: Telegram and Discord bot interfaces
-python-telegram-bot
-discord.py
+python-telegram-bot>=20.0
+discord.py>=2.0
 
 # notion_export.py: Notion API integration
 # (uses stdlib urllib — no extra dep required)

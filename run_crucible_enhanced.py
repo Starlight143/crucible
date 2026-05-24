@@ -2585,15 +2585,17 @@ def main() -> None:
     # WebUI's own run_id was passed via CRUCIBLE_RUN_ID so its `sess.run_id`
     # matches the ledger entries and the per-run Insights tab populates.
     # Direct CLI invocations fall back to a fresh UUID4.
+    #
+    # v1.1.9 (L1): the three entry points now share
+    # ``init_run_correlation_from_env`` so the whitespace-strip + UUID
+    # fallback contract stays in lockstep across all of
+    # ``crucible/__main__.py``, ``run_crucible.py`` and this file.
     try:
         try:
-            from crucible.run_correlation import set_run_id as _set_run_id
+            from crucible.run_correlation import init_run_correlation_from_env
         except ImportError:
-            from run_correlation import set_run_id as _set_run_id  # type: ignore[no-redef]
-        # v1.1.2 (sixth-pass H-3): strip before ``or None`` to reject
-        # whitespace-only ``CRUCIBLE_RUN_ID`` values that would otherwise
-        # bypass set_run_id's own ``.strip()`` defence.
-        _set_run_id((os.environ.get("CRUCIBLE_RUN_ID") or "").strip() or None)
+            from run_correlation import init_run_correlation_from_env  # type: ignore[no-redef]
+        init_run_correlation_from_env()
     except Exception:
         # Correlation-id binding must never break the pipeline boot.
         pass
