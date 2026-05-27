@@ -2965,6 +2965,51 @@ def _search_websearch(
         return []
 
 
+def _resolve_context7_token() -> str:
+    """Return a Context7 API token from the environment, or "" when absent.
+
+    Checked in order: CONTEXT7_API_KEY, CONTEXT7_TOKEN.  Whitespace-stripped;
+    placeholder sentinels (your_*, xxx*, replace_*, placeholder*, changeme*)
+    are ignored.  Mirrors :func:`_resolve_github_token` so a consistent
+    "anonymous when no real key configured" semantics applies across all
+    librarian providers that have an auth tier.
+
+    v1.1.10 (S3 follow-up): context7.com enforces a per-IP monthly anonymous
+    quota; once exhausted every search call returns HTTP 429 with a
+    ``Retry-After`` of multiple days and the librarian loses an entire
+    provider for the remainder of the session.  Configuring an API key via
+    https://context7.com/dashboard lifts the quota to the dashboard tier
+    and eliminates the silent provider attrition.
+    """
+    for key in ("CONTEXT7_API_KEY", "CONTEXT7_TOKEN"):
+        raw = str(os.environ.get(key) or "").strip()
+        if not raw:
+            continue
+        lowered = raw.lower()
+        if lowered.startswith(
+            ("your_", "xxxx", "placeholder", "changeme", "replace_")
+        ):
+            continue
+        return raw
+    return ""
+
+
+def _context7_api_headers() -> Dict[str, str]:
+    """Build outbound headers for the Context7 search endpoint.
+
+    Always sets ``Accept: application/json``.  When a configured token is
+    available, also injects ``Authorization: Bearer <token>`` so the request
+    is charged to the dashboard tier rather than the anonymous IP quota.
+    Token-less requests still work — they just fall back to the anonymous
+    pool, matching pre-v1.1.10 behaviour bit-for-bit.
+    """
+    headers: Dict[str, str] = {"Accept": "application/json"}
+    token = _resolve_context7_token()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
 def _search_context7(
     query: str,
     *,
@@ -2989,10 +3034,15 @@ def _search_context7(
     if not clean_query:
         return []
     base_url = _current_context7_api_url()
+    request_headers = _context7_api_headers()  # v1.1.10: Bearer when configured
     citations: List[ResearchCitation] = []
     for library in libraries:
         url = _append_url_query(base_url, {"query": f"{library} {clean_query}"})
-        response = _safe_http_json(url, provider_name="context7")  # v1.1.9 H2
+        response = _safe_http_json(
+            url,
+            headers=request_headers,
+            provider_name="context7",  # v1.1.9 H2
+        )
         results = response.get("results", []) if isinstance(response, dict) else []
         for item in results[:LIBRARIAN_MAX_RESULTS_PER_QUERY]:
             citation = _citation_from_payload(

@@ -2821,6 +2821,14 @@ const SETTINGS_SCHEMA = [
           'LIBRARIAN_HTTP2_ENABLED','LIBRARIAN_HTTP_KEEPALIVE_ENABLED'] },
   { id:'librarian_providers', title:'Librarian Extra Providers', icon:'🔌', open:false,
     keys:['LIBRARIAN_EXTRA_PROVIDERS'] },
+  // v1.1.10 — Librarian Provider Auth.  Optional API tokens for the two
+  // search providers that gate behaviour on credentials.  Both default to
+  // a placeholder string in .env.example so the Settings UI surfaces an
+  // input box; placeholder values are filtered out by the backend
+  // ``_resolve_*_token`` helpers, so unconfigured operators keep the
+  // anonymous behaviour bit-for-bit.
+  { id:'librarian_auth', title:'Librarian Provider Auth', icon:'🔐', open:false,
+    keys:['CONTEXT7_API_KEY','GITHUB_TOKEN'] },
   { id:'librarian_query_quality', title:'Librarian Query Quality', icon:'🎯', open:false,
     keys:['LIBRARIAN_DOMAIN_PINS_ENABLED','LIBRARIAN_DOMAIN_PINS_PATH',
           'LIBRARIAN_BILINGUAL_QUERY_EXPANSION','LIBRARIAN_BILINGUAL_QUERY_THRESHOLD',
@@ -3134,6 +3142,15 @@ const KEY_META = {
   LIBRARIAN_BILINGUAL_QUERY_THRESHOLD: { label:'Bilingual Threshold', desc:{en:'Native-language result count below which the English mirror is issued. Range 1-10; default 3 — only translate when the native search is clearly under-yielding.', zh:'原文結果數低於這個門檻才加打英文鏡像。範圍 1-10，預設 3 — 原文搜索結果明顯不足才翻譯。'}, type:'number' },
   LIBRARIAN_QUERY_TRANSLATE_MODEL: { label:'Translate Model', desc:{en:'LLM model handling CJK to English query translation. Empty = reuse the librarian model. Override with a smaller / cheaper model for translation-only workload.', zh:'處理 CJK 到英文查詢翻譯的 LLM model。空值 = 重用 librarian model。需要用更小 / 更便宜的模型只跑翻譯時改這裡。'}, type:'text' },
   LIBRARIAN_CLAIM_ATTRIBUTION_DIRECTION_KEY: { label:'Per-Direction Attribution', desc:{en:'Per-direction claim attribution. When enabled, the librarian tags each claim with direction key (A..G) and decision field (thesis / primary_metric / fastest_test / major_risk / data_sources) it anchors to. The evidence auditor reads these tags to populate supported_fields — without this, supported_fields is empty for every direction and the force-none gate always triggers (see v1.1.8 diagnostic). Disable only for librarian-prompt regression debugging.', zh:'每個方向的 claim attribution。開啟時 librarian 替每條 claim 標記它支持哪個方向（A..G）的哪個欄位（thesis / primary_metric / fastest_test / major_risk / data_sources）。Evidence auditor 讀這些標記填 supported_fields — 不開的話每個方向 supported_fields 都是空，force-none gate 必然觸發（見 v1.1.8 診斷）。除非 debug librarian prompt 回歸否則不要關。'}, type:'boolean' },
+
+  // v1.1.10 — Librarian Provider Auth.  Both fields are passwords because
+  // they are credentials, and both use bilingual desc {en, zh} per the
+  // v1.1.0 KEY_META bilingual contract.  Placeholder strings (``replace_*``,
+  // ``your_*``, ``xxx*``, ``placeholder*``, ``changeme*``) are filtered out
+  // by the backend ``_resolve_*_token`` helpers, so leaving these at their
+  // .env.example placeholder value is equivalent to omitting the key.
+  CONTEXT7_API_KEY: { label:'Context7 API Key', desc:{en:'Optional Context7 API key from https://context7.com/dashboard. Without a key, context7 search runs on the per-IP anonymous monthly quota; once exhausted every request returns HTTP 429 with a multi-day Retry-After. With a key, requests are charged to the dashboard tier (much higher quota). Leave at the placeholder value to keep anonymous behaviour.', zh:'選填的 Context7 API 金鑰，至 https://context7.com/dashboard 申請（免費）。未填時 context7 搜索使用 per-IP 匿名月度 quota，配額用盡後每次請求都回 HTTP 429 並帶數天的 Retry-After。填入後請求改走 dashboard tier（quota 大幅提高）。保留 placeholder 值等同於不設定，維持匿名行為。'}, type:'password' },
+  GITHUB_TOKEN: { label:'GitHub Token (classic PAT)', desc:{en:'Optional GitHub Personal Access Token (classic) used by the librarian search/code + search/repositories endpoints AND by the --github-repo repo analyzer. Generate at GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic). Minimum scope: public_repo. Without it, search/code returns 401 and search/repositories falls back to 10 req/hr; with it, 30 req/min and 5000 req/hr respectively. GH_TOKEN / GITHUB_API_TOKEN accepted as fallback names.', zh:'選填的 GitHub Personal Access Token（classic），librarian 的 search/code + search/repositories 與 --github-repo repo analyzer 都會使用。產生方式：GitHub → Settings → Developer settings → Personal access tokens → Tokens (classic)。最低權限：public_repo。未設定時 search/code 回 401、search/repositories 退回匿名（10 req/hr）；設定後分別提升至 30 req/min 與 5000 req/hr。GH_TOKEN / GITHUB_API_TOKEN 為備用名稱。'}, type:'password' },
 
   // v1.1.8 extended — Direction Gate Tuning (P5).
   CRUCIBLE_DEBATE_TOLERATE_UNVERIFIABLE_EVIDENCE: { label:'Tolerate Unverifiable Evidence', desc:{en:'Master switch for degrade-not-die. 0 (default) = legacy v1.1.7 force-none behaviour: gate kills pipeline if no direction can be defended. 1 = after N consecutive force-none iterations with the same reason, gate picks the highest-scoring direction (even if clamped to 0) and marks it low-confidence instead. Hard feasibility failures are NEVER downgraded.', zh:'degrade-not-die 主開關。0（預設）= v1.1.7 既有 force-none 行為，沒有方向可辯護時 gate 直接中止 pipeline。1 = N 次連續同原因 force-none 後，gate 選 final_score 最高的方向（即使被 clamp 到 0）標 low-confidence 繼續。hard feasibility 失敗永不降級。'}, type:'boolean' },

@@ -797,9 +797,23 @@ def _resolve_env_setting(
 
 
 OPENCODE_LIBRARIAN_DEFAULT_PROVIDERS: List[str] = [
+    # v1.1.10 (S2): ``grep_app`` removed from the default list.  grep.app is
+    # fronted by Vercel Bot Protection which now serves a JS PoW challenge
+    # to every unauthenticated client (status 429 with X-Vercel-Mitigated:
+    # challenge); no pure-HTTP client can solve it, so every request burns
+    # the 3-attempt retry budget and triggers a 60s cooldown for the whole
+    # session.  The grep.app endpoint also offers no API-key tier, so the
+    # block cannot be lifted by configuring credentials.  ``github`` is
+    # the natural replacement for the "code" query class — its
+    # ``search/code`` endpoint requires authentication anyway and its
+    # 30 req/min authenticated quota is comfortably above what the
+    # librarian needs.  The ``_search_grep_app`` helper itself is
+    # preserved so operators who pin ``grep_app`` explicitly in
+    # ``LIBRARIAN_SEARCH_PROVIDERS`` still work (the function will just
+    # 429 for them until grep.app drops the Vercel challenge or exposes
+    # an auth tier).
     "websearch",
     "context7",
-    "grep_app",
     "github",
     "arxiv",
     "paperswithcode",

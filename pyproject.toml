@@ -9,7 +9,7 @@ name = "crucible"
 # this source tree advertised itself as 1.0.0; ``importlib.metadata.version("crucible")``
 # returned the wrong number; dependency-resolver pinning was incoherent.
 # Keep this in sync with the latest CHANGELOG entry on every release.
-version = "1.1.9"
+version = "1.1.10"
 description = "AI-native multi-agent research engine for quant, SaaS, agent, and scientific research workflows."
 readme = "README.md"
 requires-python = ">=3.10"

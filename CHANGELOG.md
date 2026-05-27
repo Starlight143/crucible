@@ -5,6 +5,135 @@ Versioning follows [Semantic Versioning](https://semver.org/). The first public 
 
 ---
 
+## [v1.1.10] — 2026-05-28
+
+Librarian-provider hardening release: five findings (S1–S5) from a
+live-log triage of the post-v1.1.9 librarian dispatcher.  All changes
+are additive; no env-var default flipped, no public schema broken, no
+CLI flag removed.  Defaults match v1.1.9 bit-for-bit unless the
+operator opts into the new behaviour (only configuring real values for
+the two new `CONTEXT7_API_KEY` / `GITHUB_TOKEN` placeholders changes
+runtime behaviour, and both fall back to the v1.1.9 anonymous tier
+when left at their `.env.example` placeholder values).
+
+### Added
+- **`_resolve_context7_token()` + `_context7_api_headers()`** in
+  `section_04_web_research_and_direction.py` (S1) — mirrors the
+  existing `_resolve_github_token()` + `_github_api_headers()` pair so
+  `_search_context7` can inject `Authorization: Bearer <token>` when
+  the operator configures one.  context7.com enforces a per-IP monthly
+  anonymous quota; once exhausted every search call returns HTTP 429
+  with a `Retry-After` of multiple days, which previously caused the
+  librarian to silently lose context7 for the remainder of every
+  session on that IP.  Configuring an API key via
+  https://context7.com/dashboard lifts the quota to the dashboard
+  tier.  Token check order: `CONTEXT7_API_KEY` → `CONTEXT7_TOKEN`;
+  placeholder sentinels (`your_*`, `xxxx*`, `placeholder*`,
+  `changeme*`, `replace_*`) are filtered out so a fresh `.env.example`
+  copy does not pretend to have a key.
+- **`.env.example` ships `CONTEXT7_API_KEY` and `GITHUB_TOKEN` as
+  uncommented placeholder entries** (S4) — both keys are now visible
+  to the `/api/env` reader on a fresh install, so the Settings UI
+  surfaces input boxes for them out-of-the-box.  Placeholder values
+  (`replace_with_context7_api_key`, `replace_with_github_personal_access_token`)
+  are filtered out by the backend resolvers, so operators who leave
+  them untouched get the v1.1.9 anonymous behaviour bit-for-bit.
+  `GITHUB_TOKEN` was previously documented in README only and had to
+  be added manually to `.env`; now it is discoverable through the UI.
+- **WebUI Settings `librarian_auth` group** (S5) — new `SETTINGS_SCHEMA`
+  entry just after `librarian_providers`, containing both
+  `CONTEXT7_API_KEY` and `GITHUB_TOKEN`.  Two new `KEY_META` entries
+  with bilingual `desc:{en, zh}` per the v1.1.0 KEY_META bilingual
+  contract; both are `type:'password'` so the masked input behaviour
+  matches the existing `OPENROUTER_API_KEY` / `ALPHA_VANTAGE_API_KEY`
+  entries.
+- **`tests/test_v1_1_10_regressions.py`** — 36 new tests organised by
+  finding (S1 x 11, S2 x 7, S3 x 8, S4 x 4, S5 x 4, plus 2
+  cross-cutting), each with both behavioural assertions and structural
+  `inspect.getsource` / regex pins per CLAUDE.md § 9.6.
+
+### Changed
+- **`OPENCODE_LIBRARIAN_DEFAULT_PROVIDERS` no longer includes
+  `grep_app`** (S2) — grep.app is fronted by Vercel Bot Protection
+  which now serves a JS proof-of-work challenge to every
+  unauthenticated client (status 429 with `X-Vercel-Mitigated:
+  challenge`); no pure-HTTP client can solve it, so every request
+  burns the 3-attempt retry budget and triggers a 60s cooldown for
+  the whole session.  grep.app also offers no API-key tier, so the
+  block cannot be lifted by configuring credentials.  `github` is the
+  natural replacement for the "code" query class — its `search/code`
+  endpoint requires authentication anyway and its 30 req/min
+  authenticated quota is comfortably above what the librarian needs.
+  `_search_grep_app` itself is preserved, the alias map still
+  recognises `grep_app`, and the `code` fallback chain still lists it
+  as position 2 — so operators who pin `grep_app` explicitly in
+  `LIBRARIAN_SEARCH_PROVIDERS` keep their behaviour, they just stop
+  paying the cooldown tax on a fresh install.  `fallback.py`'s own
+  literal default string is updated in lockstep, pinned by
+  `tests/test_v1_1_10_regressions.py::TestS2GrepAppRemovedFromDefaults::
+  test_fallback_default_matches_canonical_default`.
+- **`crucible/config/domain_pins.json` — six pin URLs replaced** (S3)
+  after agent-driven live-fetch testing confirmed they returned
+  non-200 for every unauthenticated HTTP client (CrucibleCrew UA AND
+  a full Chrome UA), exhausting the 3-attempt safe_http_text retry
+  budget on every prefetch:
+  - `www.binance.com/en/support/faq/introduction-to-binance-futures-funding-rates-...`
+    (AWS-WAF 202 + JS challenge) →
+    `developers.binance.com/docs/derivatives/usds-margined-futures/general-info`
+    (official developer portal, 200).
+  - `www.coingecko.com/en/api/documentation` (Cloudflare 403) →
+    `www.coingecko.com/learn` (free-tier docs hub, 200).
+  - `www.cmegroup.com/education.html` (CDN WAF 403) → two Wikipedia
+    substitutes covering the same conceptual material (Chicago
+    Mercantile Exchange + Futures contract).
+  - `cookbook.openai.com/` (308 permanent redirect) →
+    `developers.openai.com/cookbook` (canonical destination, no
+    trailing slash to avoid re-308).
+  - `python.langchain.com/docs/introduction/` (3-hop 308 chain that
+    exceeds the manual-redirect helper's `_MAX_REDIRECTS=3` budget) →
+    `docs.langchain.com/oss/python/langchain/overview` (canonical
+    destination).
+  - `search.brave4u.com` (DNS NXDOMAIN — host no longer resolves) →
+    `paulgo.io` (long-running public SearXNG instance).
+  All replacements verified 200 against the librarian's
+  `CrucibleCrew/14 librarian` UA in the v1.1.10 audit pass.
+
+### Validation
+- Full pytest suite: **3 189 passed, 2 skipped** (was 3 153 + 2 at
+  v1.1.9; +36 new tests in `tests/test_v1_1_10_regressions.py`
+  covering all five findings).  Two skips unchanged: `SyntheticGoldenRun`
+  missing optional `run_meta.json`, and HTTP/2 SSRF test gated on the
+  `h2` package.
+- `pyproject.toml` and `crucible.__version__` bumped to `"1.1.10"` in
+  lock-step so `test_pyproject_version_matches_package_version` stays
+  green.
+
+### Compatibility
+- Drop-in for v1.1.9.  No env-var default flipped, no public schema
+  broken, no CLI flag removed.  All five findings are additive:
+  - S1 / S4 / S5 only matter when the operator configures a real
+    `CONTEXT7_API_KEY` value; left at the placeholder, context7
+    keeps the v1.1.9 anonymous behaviour.
+  - S2 changes the default provider list but the v1.1.9 user can
+    restore the pre-v1.1.10 default by setting
+    `LIBRARIAN_SEARCH_PROVIDERS=websearch,context7,grep_app,github,arxiv,paperswithcode`
+    in `.env` (the `_search_grep_app` helper and the alias map still
+    accept `grep_app`).
+  - S3 replaces pin URLs that were already non-functional (they all
+    returned non-200 in v1.1.9 too — operators were silently losing
+    those Tier-1 anchors regardless).  All replacement URLs use the
+    same `tier: "Tier-1"` and provide equivalent or richer content;
+    no upgrade step required.
+- v1.1.8 invariants (4-stream ledger, canonical_json via
+  `_V8FloatJSONEncoder`, cross-process sidecar locks, two-sided
+  permutation default) all preserved.
+- v1.1.9 invariants (`_atomic_io` helpers, `init_run_correlation_from_env`,
+  `_ENHANCED_FLAG_TO_ENV` mapping, P5 degrade-not-die,
+  `_try_build` lenient retry, H2 dispatcher cooldown/health wire-in)
+  all preserved.
+
+---
+
 ## [v1.1.9] — 2026-05-24
 
 Audit-fix release: 8 findings (H1/H2/M1/M2/M3/M4/L1/L2) from the

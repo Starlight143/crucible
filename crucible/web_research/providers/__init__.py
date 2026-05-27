@@ -1,7 +1,9 @@
 """Librarian provider clients added in v1.1.8 extended (Phase 3, Q4).
 
 These are zero-auth additional providers that supplement the core
-list (websearch / context7 / grep_app / github / arxiv / paperswithcode).
+list (websearch / context7 / github / arxiv / paperswithcode; ``grep_app``
+was removed from the v1.1.10 defaults — see ``OPENCODE_LIBRARIAN_DEFAULT_PROVIDERS``
+in ``section_00_bootstrap_and_utils.py`` for the canonical default list).
 Each provider exposes a single ``search_<provider>`` function with a
 unified signature::
 

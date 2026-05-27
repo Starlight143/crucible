@@ -26,10 +26,10 @@
           "subject_hint": "funding rate mechanism, mark-price klines, paged-history limits"
         },
         {
-          "url": "https://www.binance.com/en/support/faq/introduction-to-binance-futures-funding-rates-360033525031",
+          "url": "https://developers.binance.com/docs/derivatives/usds-margined-futures/general-info",
           "tier": "Tier-1",
-          "label": "Binance Funding Rate FAQ",
-          "subject_hint": "interval, formula, premium index"
+          "label": "Binance USDS-M Futures developer docs",
+          "subject_hint": "funding interval, formula, premium index, mark price"
         },
         {
           "url": "https://hyperliquid.gitbook.io/hyperliquid-docs/trading/funding",
@@ -38,10 +38,10 @@
           "subject_hint": "funding interval, oracle-vs-mid premium"
         },
         {
-          "url": "https://www.coingecko.com/en/api/documentation",
+          "url": "https://www.coingecko.com/learn",
           "tier": "Tier-1",
-          "label": "CoinGecko Free API",
-          "subject_hint": "price history, volume, market cap"
+          "label": "CoinGecko Learn (free-tier docs hub)",
+          "subject_hint": "price history, volume, market cap, REST endpoints"
         }
       ]
     },
@@ -144,10 +144,16 @@
       },
       "pre_fetch": [
         {
-          "url": "https://www.cmegroup.com/education.html",
+          "url": "https://en.wikipedia.org/wiki/Chicago_Mercantile_Exchange",
           "tier": "Tier-1",
-          "label": "CME Group Education",
-          "subject_hint": "contract specs, margin, settlement"
+          "label": "Wikipedia: Chicago Mercantile Exchange",
+          "subject_hint": "exchange structure, contract specs, clearing"
+        },
+        {
+          "url": "https://en.wikipedia.org/wiki/Futures_contract",
+          "tier": "Tier-1",
+          "label": "Wikipedia: Futures contract",
+          "subject_hint": "margin, settlement, marked-to-market mechanics"
         },
         {
           "url": "https://en.wikipedia.org/wiki/Black%E2%80%93Scholes_model",
@@ -315,7 +321,7 @@
       },
       "pre_fetch": [
         {
-          "url": "https://cookbook.openai.com/",
+          "url": "https://developers.openai.com/cookbook",
           "tier": "Tier-1",
           "label": "OpenAI Cookbook",
           "subject_hint": "tool use, function calling, structured outputs"
@@ -327,7 +333,7 @@
           "subject_hint": "tool use, prompt caching, vision"
         },
         {
-          "url": "https://python.langchain.com/docs/introduction/",
+          "url": "https://docs.langchain.com/oss/python/langchain/overview",
           "tier": "Tier-1",
           "label": "LangChain Python documentation",
           "subject_hint": "chains, agents, retrievers, tools"
@@ -338,6 +344,6 @@
   "searxng_instances": [
     "https://searx.be",
     "https://searx.tiekoetter.com",
-    "https://search.brave4u.com"
+    "https://paulgo.io"
   ]
 }

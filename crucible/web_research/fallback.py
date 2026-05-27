@@ -117,10 +117,18 @@ def _parse_csv_env(name: str, default: str) -> List[str]:
 
 def _enabled_providers() -> List[str]:
     """Resolve the union of core + extras that the operator has
-    enabled via env."""
+    enabled via env.
+
+    v1.1.10 (S2): the default ``LIBRARIAN_SEARCH_PROVIDERS`` no longer
+    includes ``grep_app`` — Vercel Bot Protection now serves a JS PoW
+    challenge for every unauthenticated grep.app request, which a pure
+    HTTP client cannot solve.  Operators who still want grep_app can
+    re-add it explicitly via ``LIBRARIAN_SEARCH_PROVIDERS`` env override
+    (the ``_search_grep_app`` helper itself is preserved).
+    """
     core = _parse_csv_env(
         "LIBRARIAN_SEARCH_PROVIDERS",
-        "websearch,context7,grep_app,github,arxiv,paperswithcode",
+        "websearch,context7,github,arxiv,paperswithcode",
     )
     extras = _parse_csv_env(
         "LIBRARIAN_EXTRA_PROVIDERS",
