@@ -1051,7 +1051,19 @@ class DualWriteBackend:
     (cloud sync).  A cloud-side failure must never block the local write.
     """
 
-    def __init__(self, *_a: Any, **_kw: Any) -> None:
+    def __init__(
+        self,
+        *,
+        root: str | os.PathLike[str],
+        api_url: str,
+        api_token: str,
+        inline_max_bytes: int = 4096,
+        **_kw: Any,
+    ) -> None:
+        # Keyword-only signature documents the exact construction
+        # ``make_backend`` already performs (root/api_url/api_token/
+        # inline_max_bytes) so the future v1.2.0 implementation has a
+        # contract to fill in.  Still fail-fast until implemented (v1.1.11).
         raise NotImplementedError(
             "DualWriteBackend is planned for v1.2.0. "
             "v1.1.0 supports CRUCIBLE_RUN_INSIGHTS_BACKEND=local only."

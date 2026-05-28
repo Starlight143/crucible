@@ -240,7 +240,18 @@ def _extract_pydantic_from_result(
                         or all(k in filtered for k in required_keys)
                     ):
                         return model_cls(**filtered)
-            except Exception:
+            except Exception as _lenient_exc:
+                # v1.1.11: the filtered payload still failed strict validation
+                # (e.g. a declared field had the wrong type, not just a stray
+                # extra key).  Behaviour is unchanged — we still return None —
+                # but emit a debug line so a genuine schema mismatch is not
+                # indistinguishable from "no known fields present".
+                _model_name = getattr(model_cls, "__name__", repr(model_cls))
+                print(
+                    f"[Debug] _extract_pydantic_from_result lenient retry for "
+                    f"{_model_name} failed validation on filtered payload: "
+                    f"{_lenient_exc}"
+                )
                 return None
             return None
 

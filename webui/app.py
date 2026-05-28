@@ -404,6 +404,11 @@ _runs_lock = threading.Lock()
 _ab_tests: dict[str, dict[str, Any]] = {}
 _ab_tests_lock = threading.Lock()
 
+# v1.1.11 (audit fix): per-run active SSE streamer refcount (guarded by
+# _runs_lock).  _evict_stale_runs() uses it to avoid clearing a run's output
+# buffer or deleting its entry while any tab is still streaming it.
+_active_streamers: dict[str, int] = {}
+
 # Webhook history lock (DB writes are serialised through this)
 _webhook_history_lock = threading.Lock()
 
@@ -431,6 +436,11 @@ def _parse_max_concurrent_runs() -> int:
         return 4
 
 
+# NOTE (v1.1.11): the cap is read ONCE at import.  Changing
+# CRUCIBLE_WEBUI_MAX_CONCURRENT_RUNS via POST /api/env does NOT rebuild this
+# semaphore (rebuilding a live BoundedSemaphore that already has slots checked
+# out would corrupt slot accounting); it takes effect on the next Flask
+# restart, consistent with the documented "restart Flask after settings" rule.
 _RUNS_MAX_CONCURRENT = _parse_max_concurrent_runs()
 _runs_semaphore = threading.BoundedSemaphore(value=_RUNS_MAX_CONCURRENT)
 
@@ -475,12 +485,30 @@ def _evict_stale_runs(skip_run_id: str = "") -> None:
             if ended is None:
                 continue
             age = now - ended
+            # v1.1.11: never evict/clear a run that has an active SSE streamer
+            # (a second tab streaming a completed run could otherwise have its
+            # buffer cleared out from under it by an evict triggered elsewhere
+            # whose skip_run_id != this rid).
+            if _active_streamers.get(rid, 0) > 0:
+                continue
             if age > _RUNS_ENTRY_TTL:
                 to_delete.append(rid)
             elif age > _RUNS_OUTPUT_TTL and run.get("output"):
                 run["output"] = []  # Free the (potentially large) output buffer
         for rid in to_delete:
             del _runs[rid]
+    # v1.1.11 (audit fix): evict stale A/B-test records too.  _ab_tests was
+    # written on every /api/ab-test/run but never swept, so it grew unbounded
+    # for the process lifetime (attacker-drivable).  Bound it to the same entry
+    # TTL as _runs.
+    ab_to_delete: list[str] = []
+    with _ab_tests_lock:
+        for ab_id, ab in _ab_tests.items():
+            created = ab.get("created_at")
+            if created is not None and (now - created) > _RUNS_ENTRY_TTL:
+                ab_to_delete.append(ab_id)
+        for ab_id in ab_to_delete:
+            _ab_tests.pop(ab_id, None)
 
 # ─── SQLite run index sync state ───────────────────────────────────────────────
 
@@ -489,19 +517,71 @@ _last_sync_time: float = 0.0
 _SYNC_INTERVAL = 30.0  # max once per 30 seconds
 
 
+# ─── Process tree termination ───────────────────────────────────────────────
+
+def _terminate_process_tree(proc: "subprocess.Popen | None") -> None:
+    """Terminate *proc* AND its descendants.
+
+    v1.1.11 (audit fix): ``proc.terminate()`` signals only the direct child, so
+    the pipeline's LLM/git grandchildren survived a cancel and kept burning API
+    credits.  The worker spawns the child in its own process group / new session
+    (see ``subprocess.Popen`` in ``_run_worker``), so we can signal the whole
+    group.  POSIX: SIGTERM the group, then escalate to SIGKILL after a short
+    grace.  Windows: ``taskkill /F /T`` kills the tree.
+    """
+    if proc is None or proc.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            import subprocess as _sp
+            _sp.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=_sp.DEVNULL, stderr=_sp.DEVNULL, timeout=10,
+            )
+            return
+        import signal as _signal
+        try:
+            pgid = os.getpgid(proc.pid)
+        except (ProcessLookupError, OSError):
+            pgid = None
+        if pgid is None:
+            proc.terminate()
+            return
+        try:
+            os.killpg(pgid, _signal.SIGTERM)
+        except (ProcessLookupError, OSError):
+            return
+
+        def _escalate() -> None:
+            try:
+                if proc.poll() is None:
+                    os.killpg(pgid, _signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+
+        _t = threading.Timer(5.0, _escalate)
+        _t.daemon = True
+        _t.start()
+    except Exception:
+        LOGGER.debug("[webui] _terminate_process_tree failed", exc_info=True)
+        try:
+            proc.terminate()
+        except Exception:
+            pass
+
+
 # ─── Process cleanup on interpreter exit ───────────────────────────────────────
 
 @atexit.register
 def _cleanup_all_runs() -> None:
     """Terminate any child processes still running when Flask exits."""
     with _runs_lock:
-        for run in _runs.values():
-            proc: subprocess.Popen | None = run.get("process")
-            if proc and proc.poll() is None:
-                try:
-                    proc.terminate()
-                except Exception:
-                    LOGGER.debug("atexit terminate failed for run", exc_info=True)
+        _procs = [run.get("process") for run in _runs.values()]
+    # Terminate outside the lock — _terminate_process_tree may start a timer and
+    # os.killpg can block briefly.
+    for proc in _procs:
+        if proc and proc.poll() is None:
+            _terminate_process_tree(proc)
 
 
 # v1.1.2 (audit fix G5-C-LOW-14): proactive eviction timer.  Previously
@@ -566,6 +646,42 @@ def _load_env() -> dict[str, str]:
                 v = v[1:-1]
             result[k.strip()] = v
     return result
+
+
+# v1.1.11 (audit fix): mask secret values in the GET /api/env response so a
+# same-origin XSS or a logged-in browser cannot exfiltrate every credential in
+# one request.  The mask is a sentinel the POST handler recognises and treats
+# as "unchanged" (keep the stored value).  The key-name regex mirrors the
+# frontend secret detector in app.js (renderSettings) so the masked set is
+# identical to the fields the UI already renders as password inputs.
+_SECRET_VALUE_MASK = "********"
+_SECRET_KEY_RE = re.compile(
+    r"api.?key|secret|token|password|passwd|webhook.?url|routing.?key|"
+    r"bot.?(id|token)|credentials|bearer|signing.?key|private.?key|dsn|auth",
+    re.IGNORECASE,
+)
+# Conventional UPPER_SNAKE env-key shape; anything else is refused on POST.
+_ENV_KEY_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
+# Process-hijack vars that must never be writable through /api/env (they would
+# be inherited by the pipeline subprocess via _child_env).
+_ENV_KEY_DENYLIST = frozenset({
+    "PATH", "PYTHONPATH", "PYTHONHOME", "PYTHONSTARTUP", "PYTHONEXECUTABLE",
+    "LD_PRELOAD", "LD_LIBRARY_PATH", "DYLD_INSERT_LIBRARIES",
+    "DYLD_LIBRARY_PATH", "DYLD_FRAMEWORK_PATH", "IFS", "BASH_ENV", "ENV",
+})
+
+
+def _is_secret_env_key(key: str) -> bool:
+    return bool(_SECRET_KEY_RE.search(key or ""))
+
+
+def _mask_secret_env(env: dict[str, str]) -> dict[str, str]:
+    """Return a copy of *env* with non-empty secret values replaced by the mask
+    sentinel.  Empty values stay empty so the UI still shows "(not set)"."""
+    out: dict[str, str] = {}
+    for k, v in env.items():
+        out[k] = _SECRET_VALUE_MASK if (v and _is_secret_env_key(k)) else v
+    return out
 
 
 def _quote_env_value(v: str) -> str:
@@ -1671,7 +1787,10 @@ def index() -> str:
 
 @app.route("/api/env", methods=["GET"])
 def api_get_env():
-    return jsonify(_load_env())
+    # v1.1.11 (audit fix): mask secret values so the raw .env credentials are
+    # never shipped to the browser; the POST handler treats the mask sentinel
+    # as "unchanged" so an untouched field does not overwrite the real value.
+    return jsonify(_mask_secret_env(_load_env()))
 
 
 @app.route("/api/env", methods=["POST"])
@@ -1682,10 +1801,26 @@ def api_set_env():
     for k, v in data.items():
         if not isinstance(k, str) or not k or "=" in k or "\n" in k or "\r" in k or "\x00" in k:
             return jsonify({"error": f"Invalid key name: {k!r}"}), 400
+        # v1.1.11 (audit fix): only accept conventional UPPER_SNAKE env keys and
+        # reject the process-hijack denylist.  Without this, any key past the
+        # CSRF gate could write PATH / PYTHONPATH / LD_PRELOAD into .env, which
+        # the next pipeline subprocess inherits via _child_env (code-exec).
+        if not _ENV_KEY_NAME_RE.match(k) or k in _ENV_KEY_DENYLIST:
+            return jsonify({"error": f"Refused env key: {k!r}"}), 400
         if not isinstance(v, str):
             return jsonify({"error": f"Value for '{k}' must be a string, got {type(v).__name__}"}), 400
         if "\n" in v or "\r" in v or "\x00" in v:
             return jsonify({"error": f"Value for '{k}' must not contain newlines or null bytes"}), 400
+    # v1.1.11 (audit fix): drop masked secret sentinels so an untouched (masked)
+    # secret field round-trips without overwriting the real stored value with
+    # the mask.  saveSettings only POSTs changed keys, so this mainly guards the
+    # legacy "send everything" path and any client re-POSTing a masked value.
+    data = {
+        k: v for k, v in data.items()
+        if not (_is_secret_env_key(k) and v == _SECRET_VALUE_MASK)
+    }
+    if not data:
+        return jsonify({"success": True})
     try:
         _save_env(data)
     except Exception as exc:
@@ -2070,6 +2205,15 @@ def _run_worker(
                 if k == "CRUCIBLE_RUN_ID":
                     continue
                 _child_env[k] = v
+        # v1.1.11 (audit fix): put the child in its own process group / session
+        # so a cancel (DELETE /api/run) can terminate the whole tree (LLM/git
+        # grandchildren) instead of just the direct child — see
+        # _terminate_process_tree.
+        _popen_kwargs: dict[str, Any] = {}
+        if os.name == "nt":
+            _popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+        else:
+            _popen_kwargs["start_new_session"] = True
         proc = subprocess.Popen(
             cmd,
             stdin=subprocess.PIPE,
@@ -2081,6 +2225,7 @@ def _run_worker(
             cwd=str(PROJECT_ROOT),
             bufsize=1,
             env=_child_env,
+            **_popen_kwargs,
         )
         with _runs_lock:
             run_rec = _runs.get(run_id)
@@ -2098,7 +2243,10 @@ def _run_worker(
                 run_rec = _runs.get(run_id)
                 if run_rec is not None:
                     run_rec["output"].append(
-                        f"[WARN] Could not write to process stdin: {write_exc}"
+                        _redact_for_client(
+                            f"[WARN] Could not write to process stdin: {write_exc}",
+                            max_len=2000,
+                        )
                     )
 
         # Feature 1: store the open stdin pipe so that the /signal endpoint can
@@ -2228,7 +2376,9 @@ def _run_worker(
             if run_rec is not None:
                 if run_rec["status"] != "cancelled":
                     run_rec["status"] = "error"
-                run_rec["output"].append(f"[WEBUI ERROR] {exc}")
+                run_rec["output"].append(
+                    _redact_for_client(f"[WEBUI ERROR] {exc}", max_len=2000)
+                )
                 if run_rec.get("ended_at") is None:
                     run_rec["ended_at"] = time.time()
                 if run_rec.get("returncode") is None:
@@ -2276,7 +2426,7 @@ def _run_worker(
 @app.route("/api/run", methods=["POST"])
 def api_start_run():
     payload = request.get_json(silent=True) or {}
-    run_id = uuid.uuid4().hex[:8]
+    run_id = uuid.uuid4().hex[:12]
 
     try:
         cmd, stdin_text = _build_command(payload)
@@ -2363,6 +2513,12 @@ def api_stream_run(run_id: str):
         # True after the notice is emitted so the SSE stream doesn't spam
         # it on every poll.
         truncation_notified = False
+        # v1.1.11 (audit fix): mark this run as actively streamed so
+        # _evict_stale_runs never clears its output buffer / deletes its entry
+        # mid-stream, even when the evict is triggered from another request
+        # whose skip_run_id != this run_id.
+        with _runs_lock:
+            _active_streamers[run_id] = _active_streamers.get(run_id, 0) + 1
         try:
             while True:
                 # ── Snapshot run state under lock ─────────────────────────
@@ -2485,6 +2641,14 @@ def api_stream_run(run_id: str):
             # legitimate 45-min direction-debate over a 2-second reconnect.
             return
         finally:
+            # v1.1.11: drop this stream's refcount BEFORE the final eviction so
+            # the buffer becomes eligible once no streamer remains.
+            with _runs_lock:
+                _n = _active_streamers.get(run_id, 0) - 1
+                if _n > 0:
+                    _active_streamers[run_id] = _n
+                else:
+                    _active_streamers.pop(run_id, None)
             # One final eviction pass after the stream ends (normal completion
             # or client disconnect).  No skip_run_id: this run_id is no longer
             # being actively streamed, so its output buffer is now eligible for
@@ -2537,10 +2701,10 @@ def api_kill_run(run_id: str):
                 run["returncode"] = -1
     # Terminate outside the lock so we don't hold it during a blocking syscall
     if proc_to_kill:
-        try:
-            proc_to_kill.terminate()
-        except Exception:
-            LOGGER.debug("[webui] swallowed exception", exc_info=True)
+        # v1.1.11: kill the whole process tree, not just the direct child, so
+        # the pipeline's LLM/git grandchildren don't outlive the cancel and
+        # keep spending API credits.
+        _terminate_process_tree(proc_to_kill)
     return jsonify({"success": True})
 
 
@@ -3221,7 +3385,7 @@ def webhook_trigger():
     if not isinstance(payload, dict):
         return jsonify({"error": "Expected a JSON object body"}), 400
 
-    run_id = uuid.uuid4().hex[:8]
+    run_id = uuid.uuid4().hex[:12]
 
     # Build command using the same logic as api_start_run
     try:
@@ -3823,6 +3987,10 @@ def api_env_validate():
     # Never expose the raw API key in the error message
     if error_msg and api_key and api_key in error_msg:
         error_msg = error_msg.replace(api_key, _mask_api_key(api_key))
+    # v1.1.11: also scrub any internal hostname / path / other secret that a
+    # getaddrinfo / connection error string may carry.
+    if error_msg:
+        error_msg = _redact_for_client(error_msg, max_len=500)
 
     return jsonify({
         "valid":       valid,
@@ -4034,8 +4202,8 @@ def api_ab_test_run():
     env_overrides_a = _resolve_run_insights_env_overrides(variant_a.get("flags", {}) or {})
     env_overrides_b = _resolve_run_insights_env_overrides(variant_b.get("flags", {}) or {})
 
-    run_id_a = uuid.uuid4().hex[:8]
-    run_id_b = uuid.uuid4().hex[:8]
+    run_id_a = uuid.uuid4().hex[:12]
+    run_id_b = uuid.uuid4().hex[:12]
 
     now = time.time()
     with _runs_lock:

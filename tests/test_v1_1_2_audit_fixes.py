@@ -144,7 +144,10 @@ class TestGroup2RetrievalObservability:
         # Find the actual ``re.compile(...)`` lines rather than docstring
         # mentions — both patterns appear in comments first, so a simple
         # ``.find`` returns the comment offset.
-        deepseek_re = "re.compile(r\"(?<![A-Za-z0-9])sk-[A-Fa-f0-9]{32}"
+        # v1.1.11 (F-F2): widened from ``{32}`` to ``{32,}`` so a 33-39-char
+        # pure-hex sk- key is redacted in full (the old fixed-length pattern +
+        # trailing lookahead leaked those entirely).
+        deepseek_re = "re.compile(r\"(?<![A-Za-z0-9])sk-[A-Fa-f0-9]{32,}"
         generic_re = "re.compile(r\"(?<![A-Za-z0-9])sk-[A-Za-z0-9]{40,80}"
         deepseek_idx = src.find(deepseek_re)
         generic_idx = src.find(generic_re)
@@ -285,7 +288,13 @@ class TestGroup2RetrievalObservability:
         assert isinstance(r.backend, _NoOpBackend)
         # All protocol methods must be callable without raising.
         assert r.backend.write_event("output", {}) == ""
-        assert r.backend.read_events("output") == []
+        # v1.1.11 (F-F1): read_events now returns the protocol 2-tuple
+        # ``(events, next_cursor)`` to match StorageBackend / LocalJSONLBackend.
+        assert r.backend.read_events("output") == ([], None)
+        # write_blob now matches the protocol ``(content_id, payload)`` shape.
+        assert r.backend.write_blob("sha256:" + "00" * 32, b"x") == ""
+        # read_blob was missing entirely before this fix.
+        assert r.backend.read_blob("sha256:" + "00" * 32) is None
         assert r.backend.prune_stream("output", 100) == 0
         r.backend.flush()
         r.backend.close()

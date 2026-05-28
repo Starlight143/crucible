@@ -30,7 +30,7 @@ from __future__ import annotations
 
 import os
 import threading
-from typing import Any, Dict, List, Mapping, Optional
+from typing import Any, Dict, List, Mapping, Optional, Tuple
 
 # Tri-modal import: the section modules are loaded under three distinct
 # package layouts depending on how the entry point was launched:
@@ -184,6 +184,12 @@ class InsightsRecorder:
         # signal for every subsequent canonical-json / disk-full / backend
         # exception during the same process lifetime.
         self._warned_unknown_reason = False
+        # v1.1.11 (audit fix): separate one-shot channel for unrecognised gate
+        # *decisions* (record_gate_verdict).  Previously this reused
+        # ``_warned_unknown_reason``, re-coupling the two channels the v1.1.2
+        # G2-B-HIGH-1 fix deliberately split — one unknown rejection_reason
+        # would permanently mute the unknown-decision log and vice versa.
+        self._warned_unknown_decision = False
         self._warned_emit_failed = False
 
     # -- public emitters --------------------------------------------------------
@@ -527,13 +533,15 @@ class InsightsRecorder:
         known_decisions = {"PROCEED", "BRANCH", "KILL", "NEEDS_MORE_DATA"}
         if decision_clean not in known_decisions:
             # Unknown decision token gets recorded verbatim with a structural
-            # warning — same one-shot log discipline as rejection_reason.
-            if not self._warned_unknown_reason:
+            # warning — same one-shot log discipline as rejection_reason, but
+            # on its OWN channel (``_warned_unknown_decision``) so it does not
+            # share state with the rejection_reason warning (v1.1.11 audit fix).
+            if not self._warned_unknown_decision:
                 LOGGER.debug(
                     "run_insights: unrecognised gate decision=%r (recording verbatim)",
                     decision,
                 )
-                self._warned_unknown_reason = True
+                self._warned_unknown_decision = True
 
         # Status mapping: PROCEED is SUCCESS; KILL is FAILURE; NEEDS_MORE_DATA
         # is PARTIAL (not failure — the gate is awaiting input); BRANCH is
@@ -939,11 +947,33 @@ class _NoOpBackend:
     def write_event(self, _stream: str, _record: Mapping[str, Any]) -> str:
         return ""
 
-    def write_blob(self, _payload: bytes, *, suffix: str = ".bin") -> str:  # noqa: ARG002
+    def write_blob(self, content_id: str, payload: bytes) -> str:  # noqa: ARG002
+        # v1.1.11 (audit fix): byte-match StorageBackend.write_blob —
+        # (content_id, payload) positional, no ``suffix`` kwarg.  The old
+        # signature ``(_payload, *, suffix)`` silently bound content_id to the
+        # payload and dropped the real payload arg, so any disabled-subsystem
+        # caller passing ``write_blob(cid, data)`` got wrong-arg behaviour.
         return ""
 
-    def read_events(self, _stream: str, *, limit: Optional[int] = None) -> List[Dict[str, Any]]:  # noqa: ARG002
-        return []
+    def read_blob(self, content_id: str) -> Optional[bytes]:  # noqa: ARG002
+        # v1.1.11 (audit fix): protocol method was missing entirely →
+        # AttributeError for any ``recorder.backend.read_blob(...)`` reach-
+        # through when CRUCIBLE_RUN_INSIGHTS_ENABLED=0.
+        return None
+
+    def read_events(
+        self,
+        _stream: str,
+        *,
+        since: Optional[str] = None,
+        cursor: Optional[str] = None,
+        limit: int = 100,
+    ) -> Tuple[List[Dict[str, Any]], Optional[str]]:  # noqa: ARG002
+        # v1.1.11 (audit fix): protocol returns ``(events, next_cursor)``.
+        # The old bare ``[]`` broke every caller doing
+        # ``events, cursor = backend.read_events(...)`` (ValueError: not
+        # enough values to unpack).
+        return [], None
 
     def prune_stream(self, _stream: str, _max_entries: int) -> int:  # noqa: ARG002
         return 0

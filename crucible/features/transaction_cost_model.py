@@ -654,6 +654,30 @@ def run_transaction_cost_analysis(
     n_scenarios = _env_int("TC_N_SCENARIOS", 10)
     result = run_cost_sensitivity(returns, trade_signals, n_scenarios=n_scenarios, base_config=config)
 
+    # Data-integrity annotation (CLAUDE.md §8, v1.1.11): per-bar trade signals
+    # are not persisted by the backtest, so _load_backtest_data synthesises them
+    # (evenly distributing trade_count across bars, or assuming one trade per bar
+    # when trade_count is unknown).  The turnover-dependent cost figures
+    # (commission/slippage drag, breakeven thresholds) therefore reflect an
+    # INFERRED trade timeline, not the strategy's actual fills.  Surface a loud
+    # warning so downstream consumers (and the v1.2.0 ledger) never treat these
+    # as exact.  Reached for every non-empty equity series (real signals are
+    # never available here).
+    if trade_count is not None and trade_count > 0:
+        result.warnings.append(
+            "Trade signals were SYNTHESISED: per-bar signals are not logged, so "
+            f"{trade_count} trades were distributed uniformly across "
+            f"{len(returns)} bars. Cost-sensitivity turnover and breakeven "
+            "figures are approximate, not derived from actual fills."
+        )
+    else:
+        result.warnings.append(
+            "Trade signals were SYNTHESISED: neither per-bar signals nor a "
+            "trade_count were logged, so one trade per bar was assumed "
+            f"({len(returns)} bars). Cost-sensitivity turnover and breakeven "
+            "figures are a conservative upper bound, not actual fills."
+        )
+
     # Persist report (atomic write via tmp + os.replace to prevent partial files)
     report_path = os.path.join(run_dir, "transaction_cost_report.json")
     _tmp_path = report_path + ".tmp"

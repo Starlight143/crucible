@@ -7,7 +7,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/license-AGPL--3.0%20%2F%20Commercial-blue" alt="License">
   <img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python">
-  <img src="https://img.shields.io/badge/tests-3104%2B%20passing-brightgreen" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-3255%2B%20passing-brightgreen" alt="Tests">
 </p>
 
 <p align="center">
@@ -125,7 +125,7 @@ graph LR
 - ✅ **每個論點可追溯到引用來源** — Research Synthesizer 會把不支撐的論點移至 `unknowns` 或標為 `hallucination_flags`
 - ✅ **每個決策可追溯到分析師發現** — 完整證據鏈保存在輸出 artifacts
 - ✅ **證據不足時自動中斷** — 不會出現「自信但錯誤」的輸出
-- ✅ **2 588+ 自動化測試，100% 通過** — 含 injection、SSRF、redaction、數值穩定性、跨 process race 等覆蓋
+- ✅ **3 255+ 自動化測試，100% 通過** — 含 injection、SSRF、redaction、數值穩定性、跨 process race 等覆蓋
 - ✅ **Backtest 資料完整性預設啟用** — synthetic fallback 預設被拒絕，除非顯式 opt in（`BACKTEST_REQUIRE_REAL_DATA=1` 為預設）
 - ✅ **Pydantic 驗證的型別輸出** — 下游永遠不解析自由文本
 

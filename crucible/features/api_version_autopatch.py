@@ -298,16 +298,16 @@ def run_api_version_autopatch(
                 continue
 
             if not dry_run:
-                _tmp = filepath + ".autopatch_tmp"
                 try:
-                    with open(_tmp, "w", encoding="utf-8") as fh:
-                        fh.write(patched)
-                    os.replace(_tmp, filepath)
-                except OSError as exc:
-                    try:
-                        os.unlink(_tmp)
-                    except OSError:
-                        pass
+                    from .._atomic_io import atomic_write_text
+                except ImportError:  # flat-launcher mode
+                    from _atomic_io import atomic_write_text  # type: ignore[no-redef]
+                try:
+                    # v1.1.11: shared atomic writer (parent-dir fsync). This
+                    # rewrites the operator's actual source file, so durability
+                    # matters (CLAUDE.md §13.1).
+                    atomic_write_text(filepath, patched)
+                except Exception as exc:
                     results.append(AutoPatchResult(
                         success=False,
                         library=library,
@@ -342,15 +342,16 @@ def run_api_version_autopatch(
     )
 
     report_path = os.path.join(run_dir, "api_autopatch_report.json")
-    _tmp_report = report_path + ".tmp"
     try:
-        with open(_tmp_report, "w", encoding="utf-8") as fh:
-            json.dump(report.to_dict(), fh, ensure_ascii=False, indent=2)
-        os.replace(_tmp_report, report_path)
+        from .._atomic_io import atomic_write_text
+    except ImportError:  # flat-launcher mode
+        from _atomic_io import atomic_write_text  # type: ignore[no-redef]
+    try:
+        atomic_write_text(
+            report_path,
+            json.dumps(report.to_dict(), ensure_ascii=False, indent=2),
+        )
     except OSError:
-        try:
-            os.unlink(_tmp_report)
-        except OSError:
-            pass
+        pass
 
     return report

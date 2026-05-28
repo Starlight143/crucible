@@ -3709,6 +3709,17 @@ def _collect_librarian_search_materials(
                 # Cooperative cancellation must abort the entire search — do not
                 # record as a per-query provider error and continue searching.
                 raise
+            except _CooldownSkipError:
+                # v1.1.11: a cooldown skip is a benign "provider is resting"
+                # signal raised cheaply at the rate-limit gate BEFORE any HTTP
+                # call — NOT a research failure.  Mirrors the in-helper re-raise
+                # pattern (_search_websearch et al.).  Recording it in
+                # provider_error_details would leak "provider X error=cooldown"
+                # into provider_errors_json and pollute the direction-synthesis
+                # LLM prompt with a non-error.  Skip this lane silently; the
+                # provider's remaining lanes are still attempted (the cooldown
+                # check is cheap and will simply skip them too).
+                continue
             except Exception as exc:
                 query_label = repr(last_query) if last_query else "(no query)"
                 provider_error_details.append(

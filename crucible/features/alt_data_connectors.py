@@ -368,16 +368,17 @@ def prepare_alt_data(run_dir: str) -> Dict[str, Any]:
     }
 
     out_path = os.path.join(run_dir, 'alt_data_report.json')
-    _tmp_out = out_path + ".tmp"
     try:
-        with open(_tmp_out, 'w', encoding='utf-8') as fh:
-            json.dump(report, fh, indent=2, ensure_ascii=False)
-        os.replace(_tmp_out, out_path)
+        from .._atomic_io import atomic_write_text
+    except ImportError:  # flat-launcher mode
+        from _atomic_io import atomic_write_text  # type: ignore[no-redef]
+    try:
+        atomic_write_text(
+            out_path,
+            json.dumps(report, indent=2, ensure_ascii=False),
+        )
     except OSError:
-        try:
-            os.unlink(_tmp_out)
-        except OSError:
-            pass
+        pass
 
     return report
 

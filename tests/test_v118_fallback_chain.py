@@ -101,7 +101,11 @@ class TestBuildChainForQuery:
             "python asyncio site:github.com",
             "code",
         )
-        assert chain == ["github", "grep_app", "websearch"]
+        # v1.1.11 (F-G1): grep_app was removed from the default "code" chain
+        # template (Vercel PoW).  Even when env-enabled it no longer appears in
+        # the class chain; default code flow is github -> websearch.  grep_app
+        # remains in _CORE_PROVIDERS for explicit direct dispatch.
+        assert chain == ["github", "websearch"]
 
     def test_docs_class_chain(self, monkeypatch) -> None:
         monkeypatch.setenv(

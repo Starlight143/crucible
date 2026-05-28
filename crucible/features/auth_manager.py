@@ -205,17 +205,15 @@ def _write_text(path: str, content: str, *, overwrite: bool = True) -> bool:
     try:
         if not overwrite and os.path.exists(path):
             return False
-        _tmp = path + ".tmp"
         try:
-            with open(_tmp, "w", encoding="utf-8", newline="\n") as fh:
-                fh.write(content)
-            os.replace(_tmp, path)
-        except OSError:
-            try:
-                os.unlink(_tmp)
-            except OSError:
-                pass
-            raise
+            from .._atomic_io import atomic_write_text
+        except ImportError:  # flat-launcher mode
+            from _atomic_io import atomic_write_text  # type: ignore[no-redef]
+        # v1.1.11: delegate to the shared atomic writer (parent-dir fsync,
+        # CLAUDE.md §13.1).  newline="\n" preserves the prior LF-only output
+        # (the shared helper accepts a newline passthrough) so generated source
+        # files stay byte-identical on Windows and POSIX.
+        atomic_write_text(path, content, newline="\n")
         return True
     except OSError as exc:
         raise RuntimeError(f"cannot write {path}: {exc}") from exc

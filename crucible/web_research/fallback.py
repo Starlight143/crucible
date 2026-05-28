@@ -9,8 +9,10 @@ Query classes (CLAUDE.md plan):
 
 * ``general``  — broad web search.  Order: websearch (DDG html→lite)
   → searxng → wikipedia (definitional baseline).
-* ``code``     — code / repository search.  Order: github → grep_app →
-  websearch with ``site:github.com``.
+* ``code``     — code / repository search.  Order: github → websearch
+  with ``site:github.com`` (grep_app removed from v1.1.10 defaults — Vercel
+  Bot Protection serves a JS PoW challenge to unauthenticated clients; it is
+  opt-in via LIBRARIAN_SEARCH_PROVIDERS and remains in _CORE_PROVIDERS).
 * ``academic`` — academic papers.  Order: arxiv → openalex → crossref
   → semantic_scholar (future) → websearch with ``filetype:pdf``.
 * ``docs``     — documentation lookup.  Order: context7 → wikipedia →
@@ -58,7 +60,13 @@ LOGGER = get_logger(__name__)
 # lists are silently dropped from the chain.
 _DEFAULT_CHAIN_BY_CLASS: Dict[str, List[str]] = {
     "general": ["websearch", "searxng", "wikipedia"],
-    "code": ["github", "grep_app", "websearch"],
+    # v1.1.10 removed grep_app from the default provider list (Vercel Bot
+    # Protection serves a JS PoW challenge to unauthenticated HTTP clients).
+    # It is intentionally absent from the default chain here; operators who
+    # re-enable it via LIBRARIAN_SEARCH_PROVIDERS still resolve it because it
+    # remains in _CORE_PROVIDERS (the known-set filter).  Default code flow
+    # is github -> websearch.
+    "code": ["github", "websearch"],
     "academic": ["arxiv", "openalex", "crossref", "websearch"],
     "docs": ["context7", "wikipedia", "websearch"],
 }

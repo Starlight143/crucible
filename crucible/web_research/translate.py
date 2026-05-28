@@ -160,6 +160,13 @@ def translate_cjk_to_en(
     english_clean = english.strip()
     if not english_clean:
         return None
+    # NOTE (v1.1.11): the only echo we can cheaply detect is a CJK-containing
+    # echo (below).  A non-CJK failure sentinel (e.g. the LLM returning the
+    # literal string "translation failed") is indistinguishable from a real
+    # short translation without a semantic check this module intentionally
+    # avoids (no LLM coupling — see module docstring).  Such a value would be
+    # cached and issued as one extra English mirror query; downstream dedup +
+    # scoring absorb it, so this is an accepted, low-impact limitation.
     # Sanity check: translated output should NOT still contain CJK.
     # If it does, the translation likely failed (LLM echoed the input).
     if contains_cjk(english_clean):

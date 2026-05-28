@@ -49,7 +49,7 @@ def _has_cancel_guard_before_except_exc(source: str, context_str: str) -> bool:
 
         except _OperationCancelledError:
             raise
-        [...optional re-raise guards (e.g. _CooldownSkipError) ...]
+        [...optional re-raise / continue guards (e.g. _CooldownSkipError) ...]
         except Exception...
 
     i.e., the cancellation guard precedes a broad exception handler,
@@ -87,15 +87,21 @@ def _has_cancel_guard_before_except_exc(source: str, context_str: str) -> bool:
                         break
                     if lines[k].startswith("except Exception"):
                         return True
-                    # If the next clause is another ``except X:`` followed
-                    # by a sole ``raise``, accept it and continue scanning.
+                    # If the next clause is another ``except X:`` whose body is
+                    # a sole ``raise`` or ``continue``, accept it and keep
+                    # scanning.  ``continue`` is safe too: it only fires for
+                    # that clause's specific type (e.g. v1.1.11 added
+                    # ``except _CooldownSkipError: continue`` in the section_04
+                    # dispatcher to skip a cooled-down provider's lane) and
+                    # never catches _OperationCancelledError, which the guard
+                    # above already re-raised.
                     if lines[k].startswith("except "):
                         m = k + 1
                         while m < len(lines) and (
                             not lines[m] or lines[m].startswith("#")
                         ):
                             m += 1
-                        if m < len(lines) and lines[m] == "raise":
+                        if m < len(lines) and lines[m] in ("raise", "continue"):
                             k = m + 1
                             continue
                         # Some other body — give up on this site, the

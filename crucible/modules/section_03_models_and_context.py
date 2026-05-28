@@ -619,6 +619,17 @@ class SpecialistFinding(BaseModel):
                 f"SpecialistFinding.failed_invariants is only valid for "
                 f"role=judge|critic, got role={self.role!r}"
             )
+        # v1.1.11 (self-documenting): ``confidence`` is already constrained to
+        # [0.0, 1.0] by the field's ``ge``/``le`` (which reject NaN/Inf since
+        # any comparison with NaN is False and Inf fails ``le``).  This explicit
+        # guard makes the non-finite rejection legible at the model level and
+        # mirrors recorder.py's ``math.isfinite`` check.  It does NOT change the
+        # accepted/rejected set — finite [0,1] still accepted, NaN/Inf rejected.
+        import math as _math
+        if not _math.isfinite(float(self.confidence)):
+            raise ValueError(
+                "SpecialistFinding.confidence must be finite (no NaN/Inf)"
+            )
         return self
 
 
@@ -784,6 +795,14 @@ class GateVerdict(BaseModel):
 
         # Pydantic ``Literal`` already validates the enum value; the checks
         # below enforce the *structural shape* requirement per decision.
+        # Each decision has a *mutually-exclusive* field shape (§11.1): the
+        # required field(s) plus an explicit forbid on every other decision's
+        # signature field, so an LLM cannot smuggle a second decision's payload
+        # alongside a valid one (e.g. PROCEED carrying stray branched_paths).
+        # v1.1.11 audit fix: the symmetric forbid checks below were incomplete
+        # (PROCEED/KILL did not forbid branched_paths; NEEDS_MORE_DATA permitted
+        # selected_direction + branched_paths; BRANCH permitted
+        # selected_direction + blocking_evidence_queries).
         if d == "PROCEED":
             sd = self.selected_direction
             if not sd or sd == "none":
@@ -804,6 +823,11 @@ class GateVerdict(BaseModel):
                     "GateVerdict.decision=PROCEED must not have "
                     "blocking_evidence_queries (use NEEDS_MORE_DATA for that)"
                 )
+            if self.branched_paths:
+                raise ValueError(
+                    "GateVerdict.decision=PROCEED must not have branched_paths "
+                    "(use BRANCH for multi-path splits)"
+                )
         elif d == "KILL":
             if not self.failed_invariants:
                 raise ValueError(
@@ -819,6 +843,11 @@ class GateVerdict(BaseModel):
                     "GateVerdict.decision=KILL must not have "
                     "blocking_evidence_queries (use NEEDS_MORE_DATA for that)"
                 )
+            if self.branched_paths:
+                raise ValueError(
+                    "GateVerdict.decision=KILL must not have branched_paths "
+                    "(use BRANCH for multi-path splits)"
+                )
         elif d == "NEEDS_MORE_DATA":
             if not self.blocking_evidence_queries:
                 raise ValueError(
@@ -830,6 +859,16 @@ class GateVerdict(BaseModel):
                     "GateVerdict.decision=NEEDS_MORE_DATA must not have "
                     "failed_invariants (use KILL for hard violations)"
                 )
+            if self.selected_direction not in (None, "", "none"):
+                raise ValueError(
+                    "GateVerdict.decision=NEEDS_MORE_DATA must not have "
+                    "selected_direction (use PROCEED once evidence is sufficient)"
+                )
+            if self.branched_paths:
+                raise ValueError(
+                    "GateVerdict.decision=NEEDS_MORE_DATA must not have "
+                    "branched_paths (use BRANCH for multi-path splits)"
+                )
         elif d == "BRANCH":
             if len(self.branched_paths) < 2:
                 raise ValueError(
@@ -839,6 +878,16 @@ class GateVerdict(BaseModel):
             if self.failed_invariants:
                 raise ValueError(
                     "GateVerdict.decision=BRANCH must not have failed_invariants"
+                )
+            if self.selected_direction not in (None, "", "none"):
+                raise ValueError(
+                    "GateVerdict.decision=BRANCH must not have selected_direction "
+                    "(the orchestrator picks branched_paths[0] downstream)"
+                )
+            if self.blocking_evidence_queries:
+                raise ValueError(
+                    "GateVerdict.decision=BRANCH must not have "
+                    "blocking_evidence_queries (use NEEDS_MORE_DATA for that)"
                 )
 
         return self

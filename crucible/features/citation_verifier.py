@@ -314,19 +314,19 @@ class CitationVerifierFeature(BaseFeature):
         }
 
         out_path = rdp / "citation_verification_report.json"
-        tmp_path = out_path.with_suffix(".json.tmp")
         artifacts: List[str] = []
         try:
-            tmp_path.write_text(
-                json.dumps(report, indent=2, default=str), encoding="utf-8"
+            from .._atomic_io import atomic_write_text
+        except ImportError:  # flat-launcher mode
+            from _atomic_io import atomic_write_text  # type: ignore[no-redef]
+        try:
+            # v1.1.11: shared atomic writer (parent-dir fsync, CLAUDE.md §13.1).
+            atomic_write_text(
+                out_path,
+                json.dumps(report, indent=2, default=str),
             )
-            os.replace(str(tmp_path), str(out_path))
             artifacts.append(str(out_path))
         except Exception as exc:
-            try:
-                tmp_path.unlink(missing_ok=True)
-            except Exception:
-                pass
             warnings.append(f"Failed to write citation report: {exc}")
 
         return FeatureResult(

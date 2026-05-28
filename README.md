@@ -7,7 +7,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/license-AGPL--3.0%20%2F%20Commercial-blue" alt="License">
   <img src="https://img.shields.io/badge/python-3.10%2B-blue" alt="Python">
-  <img src="https://img.shields.io/badge/tests-3104%2B%20passing-brightgreen" alt="Tests">
+  <img src="https://img.shields.io/badge/tests-3255%2B%20passing-brightgreen" alt="Tests">
 </p>
 
 <p align="center">
@@ -125,7 +125,7 @@ Five stages. Any stage can halt the pipeline if its quality gate fails — by de
 - ✅ **Every claim is traceable to a cited source** — the Research Synthesizer drops unsupported claims to `unknowns` or flags them as `hallucination_flags`
 - ✅ **Every decision is traceable to a specific analyst finding** — full evidence chain preserved in output artifacts
 - ✅ **The pipeline halts automatically when evidence is insufficient** — no confident-but-wrong outputs
-- ✅ **2 588+ automated tests, 100% passing** — covering injection, SSRF, redaction, numerical stability, and cross-process races
+- ✅ **3 255+ automated tests, 100% passing** — covering injection, SSRF, redaction, numerical stability, and cross-process races
 - ✅ **Backtest data integrity is enforced by default** — synthetic fallback data is rejected unless you explicitly opt in (`BACKTEST_REQUIRE_REAL_DATA=1` is the default)
 - ✅ **Pydantic-validated outputs at every stage** — downstream stages never parse free text
 

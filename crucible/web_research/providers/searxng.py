@@ -48,14 +48,15 @@ except ImportError:  # pragma: no cover - flat-launcher fallback
 LOGGER = get_logger(__name__)
 
 
-# Hard-coded fallback list if domain_pins.json is missing or doesn't
-# include searxng_instances.  Operators should configure their own
-# trusted instances via domain_pins.json or via env override.
-_DEFAULT_INSTANCES = [
-    "https://searx.be",
-    "https://searx.tiekoetter.com",
-    "https://search.brave4u.com",
-]
+# No hard-coded public instances (v1.1.11).  Querying arbitrary third-party
+# public SearXNG hosts by default contradicts the "operator should pin
+# instances they trust" contract (see module docstring "Weak for: Trust").
+# When this list is empty AND domain_pins.json supplies no
+# ``searxng_instances``, the provider no-ops (search_searxng returns []), so
+# it never silently routes operator queries through an untrusted aggregator.
+# Operators opt in by adding trusted hosts to ``searxng_instances`` in
+# domain_pins.json (or via the LIBRARIAN_DOMAIN_PINS_PATH override).
+_DEFAULT_INSTANCES: List[str] = []
 
 
 _USER_AGENT = (
@@ -88,7 +89,17 @@ def _resolve_instances() -> List[str]:
     instances = data.get("searxng_instances")
     if not isinstance(instances, list) or not instances:
         return list(_DEFAULT_INSTANCES)
-    return [str(i).strip().rstrip("/") for i in instances if isinstance(i, str)]
+    # SSRF safety (v1.1.11): only accept https:// instances (mirrors
+    # domain_pins _fetch_one).  A pin entry such as "http://10.0.0.1" or
+    # "file:///etc/passwd" is dropped rather than queried.
+    resolved: List[str] = []
+    for i in instances:
+        if not isinstance(i, str):
+            continue
+        cleaned = i.strip().rstrip("/")
+        if cleaned.startswith("https://"):
+            resolved.append(cleaned)
+    return resolved
 
 
 def search_searxng(

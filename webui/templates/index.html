@@ -43,7 +43,7 @@
 <!-- ════════════════════════════════════════════════════════
      SIDEBAR
 ════════════════════════════════════════════════════════ -->
-<nav class="sidebar">
+<nav class="sidebar" id="primary-sidebar">
   <div class="logo">
     <div class="logo-icon">⚛</div>
     <div class="logo-text">Crucible<span>Crew Review</span></div>
@@ -84,20 +84,28 @@
     <div class="domain-badge" id="domain-badge">crucible.com</div>
   </div>
 </nav>
+<div class="sidebar-scrim" id="sidebar-scrim" onclick="toggleSidebar(false)" aria-hidden="true"></div>
+<!-- a11y: persistent assertive live region; showToast() appends children here -->
+<div id="toast-region" aria-live="assertive" role="alert" aria-atomic="false"
+     style="position:fixed; bottom:24px; right:24px; z-index:9999; display:flex; flex-direction:column; gap:8px; pointer-events:none;"></div>
 
 <!-- ════════════════════════════════════════════════════════
      MAIN
 ════════════════════════════════════════════════════════ -->
 <div class="main">
   <div class="topbar">
+    <button type="button" class="mobile-nav-toggle" id="mobile-nav-toggle"
+            onclick="toggleSidebar()" aria-label="Toggle navigation menu"
+            aria-controls="primary-sidebar" aria-expanded="false">☰</button>
     <div>
       <div class="topbar-title" id="topbar-title">Project Path Mode</div>
       <div class="topbar-sub" id="topbar-sub">Analyze an existing project repository</div>
     </div>
     <div class="topbar-right" id="run-status-bar">
+      <span id="global-run-pill" class="run-pill" hidden aria-live="polite"></span>
       <div class="lang-toggle" role="group" aria-label="Language">
-        <button type="button" class="lang-btn active" id="lang-btn-en" onclick="setLanguage('en')" title="English">EN</button>
-        <button type="button" class="lang-btn"        id="lang-btn-zh" onclick="setLanguage('zh')" title="中文">中</button>
+        <button type="button" class="lang-btn active" id="lang-btn-en" data-lang="en" onclick="setLanguage('en')" title="English">EN</button>
+        <button type="button" class="lang-btn"        id="lang-btn-zh" data-lang="zh" onclick="setLanguage('zh')" title="中文">中</button>
       </div>
       <span id="webhook-status-badge"></span>
     </div>
@@ -111,7 +119,7 @@
           <div class="card-title"><span class="icon">📁</span> Project Path</div>
         </div>
         <div class="field">
-          <label>Project Directory Path</label>
+          <label for="project-path">Project Directory Path</label>
           <input type="text" id="project-path" placeholder="e.g. C:\Users\you\my_project  or  /home/user/project">
           <div class="hint">Absolute path to the project you want to analyze or fix</div>
         </div>
@@ -178,7 +186,7 @@
             <input class="hitl-banner-input" id="hitl-input-project" type="text" placeholder="Type your response…" onkeydown="if(event.key==='Enter')_submitHitl('project')">
             <button class="btn btn-primary btn-sm" onclick="_submitHitl('project')">Submit</button>
           </div>
-          <div class="terminal" id="terminal-project"><span class="term-cursor"></span></div>
+          <div class="terminal" id="terminal-project" role="log" aria-live="polite" aria-label="Project run terminal output"><span class="term-cursor"></span></div>
         </div>
         <div class="agentflow-panel" id="agentflow-panel-project">
           <div class="agentflow-legend">
@@ -211,7 +219,7 @@
           <div class="card-title"><span class="icon">💡</span> Idea / Strategy Prompt</div>
         </div>
         <div class="field">
-          <label>Describe your idea or strategy</label>
+          <label for="idea-text">Describe your idea or strategy</label>
           <textarea id="idea-text" rows="6" placeholder="e.g. Build a momentum-based crypto trading bot that monitors BTC/ETH on Binance, applies a 20-day EMA crossover strategy, and auto-executes trades with risk management…"></textarea>
         </div>
       </div>
@@ -277,7 +285,7 @@
             <input class="hitl-banner-input" id="hitl-input-idea" type="text" placeholder="Type your response…" onkeydown="if(event.key==='Enter')_submitHitl('idea')">
             <button class="btn btn-primary btn-sm" onclick="_submitHitl('idea')">Submit</button>
           </div>
-          <div class="terminal" id="terminal-idea"><span class="term-cursor"></span></div>
+          <div class="terminal" id="terminal-idea" role="log" aria-live="polite" aria-label="Idea run terminal output"><span class="term-cursor"></span></div>
         </div>
         <div class="agentflow-panel" id="agentflow-panel-idea">
           <div class="agentflow-legend">
@@ -489,11 +497,11 @@
         </div>
         <div class="compare-inputs">
           <div class="field" style="flex:1;min-width:200px;">
-            <label>Run ID — A</label>
+            <label for="compare-run-a">Run ID — A</label>
             <input type="text" id="compare-run-a" placeholder="e.g. run_20240101_123456" list="compare-runs-datalist">
           </div>
           <div class="field" style="flex:1;min-width:200px;">
-            <label>Run ID — B</label>
+            <label for="compare-run-b">Run ID — B</label>
             <input type="text" id="compare-run-b" placeholder="e.g. run_20240102_654321" list="compare-runs-datalist">
           </div>
           <datalist id="compare-runs-datalist"></datalist>
@@ -516,22 +524,22 @@
           <div class="ab-variant-card">
             <div class="ab-variant-title variant-a">⬡ Variant A</div>
             <div class="field">
-              <label>Mode</label>
+              <label for="ab-mode-a">Mode</label>
               <select id="ab-mode-a">
                 <option value="idea">Idea Mode</option>
                 <option value="project">Project Path Mode</option>
               </select>
             </div>
             <div class="field" id="ab-idea-field-a">
-              <label>Idea / Prompt</label>
+              <label for="ab-idea-a">Idea / Prompt</label>
               <textarea id="ab-idea-a" rows="4" placeholder="Describe strategy or idea for Variant A…"></textarea>
             </div>
             <div class="field" id="ab-path-field-a" style="display:none;">
-              <label>Project Path</label>
+              <label for="ab-path-a">Project Path</label>
               <input type="text" id="ab-path-a" placeholder="/path/to/project">
             </div>
             <div class="field">
-              <label>Analysis Type</label>
+              <label for="ab-type-a">Analysis Type</label>
               <select id="ab-type-a">
                 <option value="1">Quant</option>
                 <option value="2">SaaS</option>
@@ -544,22 +552,22 @@
           <div class="ab-variant-card">
             <div class="ab-variant-title variant-b">⬡ Variant B</div>
             <div class="field">
-              <label>Mode</label>
+              <label for="ab-mode-b">Mode</label>
               <select id="ab-mode-b">
                 <option value="idea">Idea Mode</option>
                 <option value="project">Project Path Mode</option>
               </select>
             </div>
             <div class="field" id="ab-idea-field-b">
-              <label>Idea / Prompt</label>
+              <label for="ab-idea-b">Idea / Prompt</label>
               <textarea id="ab-idea-b" rows="4" placeholder="Describe strategy or idea for Variant B…"></textarea>
             </div>
             <div class="field" id="ab-path-field-b" style="display:none;">
-              <label>Project Path</label>
+              <label for="ab-path-b">Project Path</label>
               <input type="text" id="ab-path-b" placeholder="/path/to/project">
             </div>
             <div class="field">
-              <label>Analysis Type</label>
+              <label for="ab-type-b">Analysis Type</label>
               <select id="ab-type-b">
                 <option value="1">Quant</option>
                 <option value="2">SaaS</option>
@@ -597,10 +605,10 @@
      RUN DETAIL MODAL
 ════════════════════════════════════════════════════════ -->
 <div class="modal-overlay" id="run-detail-modal" onclick="closeRunDetailModal(event)">
-  <div class="modal-panel">
+  <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="modal-run-id" tabindex="-1">
     <div class="modal-header">
       <div class="modal-title" id="modal-run-id">Run Detail</div>
-      <button class="modal-close" onclick="closeRunDetailModal(null)">×</button>
+      <button class="modal-close" onclick="closeRunDetailModal(null)" aria-label="Close run detail">×</button>
     </div>
     <div class="modal-body" id="modal-body">
       <div class="empty-state"><div class="em-icon">⏳</div>Loading…</div>

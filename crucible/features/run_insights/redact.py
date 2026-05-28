@@ -151,7 +151,13 @@ _VALUE_SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     # generic OpenAI legacy pattern so this strict 32-hex format wins on
     # DeepSeek tokens (which would also match the {40,80} alphanumeric
     # pattern in some operator-rotated formats).
-    re.compile(r"(?<![A-Za-z0-9])sk-[A-Fa-f0-9]{32}(?![A-Za-z0-9])"),
+    # v1.1.11 (audit fix): ``{32,}`` (was ``{32}``) so a pure-hex ``sk-`` key
+    # of length 33-39 is redacted IN FULL.  With the fixed ``{32}`` + trailing
+    # negative-lookahead, a 33-39-hex key matched NEITHER this pattern (the
+    # lookahead failed at char 32 because char 33 is still hex) NOR the generic
+    # ``{40,80}`` pattern (too short) — leaking the whole key.  Greedy ``{32,}``
+    # plus the lookahead now extends the match to the end of the hex run.
+    re.compile(r"(?<![A-Za-z0-9])sk-[A-Fa-f0-9]{32,}(?![A-Za-z0-9])"),
     # OpenAI legacy keys: "sk-<48 alphanumeric>" — must come AFTER sk-ant /
     # sk-or / sk-proj / DeepSeek-32-hex so the more-specific patterns win.
     # Boundary assertions prevent matching mid-token (e.g. inside a URL path).

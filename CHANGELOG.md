@@ -5,6 +5,122 @@ Versioning follows [Semantic Versioning](https://semver.org/). The first public 
 
 ---
 
+## [v1.1.11] — 2026-05-28
+
+Audit-fix release: a ten-agent read-only audit of the frontend and backend
+surfaced ~50 findings (4 high, ~18 medium, the rest low) across WebUI
+behaviour, accessibility, backend security, the core pipeline, the run-insights
+ledger, and web-research / durability infrastructure.  All changes are
+additive — no env-var default flipped, no public schema or CLI flag changed,
+and runtime behaviour matches v1.1.10 unless an operator opts into a new surface.
+
+### Added
+- **Responsive + accessible WebUI** (`app.css` / `index.html` / `app.js`) —
+  900 px / 600 px breakpoints collapse the multi-column grids and turn the
+  hover-only sidebar rail into a tap-to-open off-canvas drawer (`☰` + scrim);
+  modal focus-trap/restore, keyboard-reachable tooltips, an `aria-live` toast
+  region, `<label for>` on 12 inputs, `role="log"` terminals, and a global
+  "run in progress" pill.  Destructive actions (clearing a populated terminal,
+  stopping a run, closing an active-run tab) now require confirmation.
+- **Atomic-write durability** — eight writers (`checkpoint`, `agent_metrics`,
+  `citation_verifier`, `api_version_autopatch`, `auth_manager`, `celery_worker`,
+  `alt_data_connectors`, and `section_00`'s debug dump) route through
+  `crucible._atomic_io.atomic_write_text` (parent-dir fsync); the helper gained
+  a `newline=` passthrough so generated sources stay LF-only on Windows.
+- **Settings exposure** — `BACKTEST_PARAM_SEED` /
+  `BACKTEST_FETCH_HARD_TIMEOUT_SEC` added to the `backtest` group with bilingual
+  `KEY_META` (they previously fell into the unlabelled "Other" group); seven
+  `LIBRARIAN_*` keys plus `BACKTEST_PARAM_SEARCH` / `BACKTEST_BAYESIAN_N_TRIALS`
+  uncommented in `.env.example`.
+- **Transaction-cost annotation** — `transaction_cost_model.py` flags synthesised
+  trade signals in `result.warnings` (per CLAUDE.md §8).
+- **`tests/test_v1_1_11_regressions.py`** — 66 behavioural + structural pins.
+
+### Changed
+- **`grep_app` dropped from the default `code` fallback chain**
+  (`web_research/fallback.py`) — still reachable via explicit
+  `LIBRARIAN_SEARCH_PROVIDERS` (`_CORE_PROVIDERS` keeps it).
+- **SearXNG default instance list emptied** (`providers/searxng.py`) — the
+  provider no-ops without an operator-pinned `https://` instance instead of
+  querying hard-coded public hosts (the shipped `domain_pins.json` still supplies
+  instances, so the default deployment is unchanged).
+- **WebUI `run_id`** widened from 8 to 12 hex chars; status labels unified
+  through one `_STATUS_LABELS` map; `_ab_tests` records evicted on the same TTL
+  as `_runs` (was an unbounded leak); `_evict_stale_runs` is streamer-aware.
+- **`DualWriteBackend` stub** given its real keyword-only signature (still
+  `NotImplementedError` until v1.2.0); **`SpecialistFinding.confidence`** gained
+  an explicit non-finite guard.
+- **README test badge refreshed** — `README.md` / `README_zh.md` bumped from the
+  stale `3104+` / `2 588+` to `3 255+`; the `_FULL` READMEs already defer to this
+  file for the count.
+
+### Fixed
+- **`GET /api/env` leaked secrets** (`webui/app.py`) — the endpoint returned the
+  whole `.env` (every `sk-*` token, `WEBHOOK_SECRET`) in plaintext to any
+  same-origin caller; secret-named keys now return a `********` sentinel and the
+  POST handler treats an unchanged sentinel as "keep stored value", so the
+  Settings save round-trip is intact (`_load_env()` is unchanged internally).
+- **`POST /api/env` accepted arbitrary keys** (`webui/app.py`) — keys must now
+  match `^[A-Z][A-Z0-9_]*$` and are rejected against a denylist
+  (`PATH`/`PYTHONPATH`/`LD_PRELOAD`/`DYLD_*`/…), closing a process-hijack vector
+  via the inherited `_child_env`.
+- **`sk-` redaction gap** (`run_insights/redact.py`) — the DeepSeek `sk-`+hex
+  pattern was widened `{32}` → `{32,}`; a 33–39-char pure-hex key matched neither
+  it nor the generic `{40,80}` pattern and reached ledger error rows.
+- **`http_retry` SSRF** — the dormant `safe_get`/`safe_post` helpers reject
+  non-public targets via a lazily-imported `_is_public_http_url` and set
+  `follow_redirects=False` (blocks a 30x → `169.254.169.254` metadata hop).
+- **Client error strings leaked paths** (`webui/app.py`) — `[WEBUI ERROR]`, the
+  stdin-write warning, and `api_env_validate` errors route through
+  `_redact_for_client`.
+- **Cancel left a process tree running** (`webui/app.py`) — the pipeline runs in
+  its own group/session and `DELETE /api/run/<id>` escalates SIGTERM→SIGKILL
+  (Windows `taskkill /F /T`), so LLM/git grandchildren stop spending credits.
+- **`_NoOpBackend` protocol parity** (`run_insights/recorder.py`) — `read_events`
+  now returns `([], None)` (callers unpack a 2-tuple), `read_blob` exists, and
+  `write_blob`'s signature matches `StorageBackend`; the unknown-decision warning
+  uses its own `_warned_unknown_decision` flag.
+- **`GateVerdict` mutual-exclusion** (`section_03`) — the decision-shape validator
+  now forbids the off-shape fields for every decision (PROCEED/KILL forbid
+  `branched_paths`; NEEDS_MORE_DATA/BRANCH forbid `selected_direction`; …), and
+  the critic coercer gates each field by decision so a chatty model can't burn a
+  retry.
+- **Degraded-proceed ledger score** (`section_02`) — `final_score` now reflects
+  the pre-clamp confidence band instead of a hard-coded `0`.
+- **Cooldown-skip prompt pollution** (`section_04`) — a benign provider cooldown
+  is caught (`except _CooldownSkipError: continue`) instead of being logged as a
+  research failure and fed to the direction LLM.
+- **WebUI JS** (`app.js`) — the Run button no longer double-submits (gated by
+  `_modeHasLiveSession` through the `_setSessionStatus` chokepoint); Dashboard /
+  Settings load failures show an error state instead of a stuck "Loading…";
+  `runCompare()` drops stale pairs via `_compareToken`; `_submitHitl` validates
+  `runId` before clearing; `domain-badge` is null-guarded; `_try_build`
+  (`section_01`) logs a real lenient-retry failure.
+
+### Validation
+- pytest: **3 255 passed, 2 skipped** under `-p no:cacheprovider` (was 3 189 + 2
+  at v1.1.10; +66 in `tests/test_v1_1_11_regressions.py`).  Two skips unchanged:
+  `SyntheticGoldenRun` missing optional `run_meta.json`, HTTP/2 test gated on the
+  `h2` package.
+- `crucible/smoke_test.py`: 5/5 OK; `run_crucible.py --self-check`: OK.
+- `pyproject.toml` and `crucible.__version__` bumped to `"1.1.11"` in lock-step so
+  `test_pyproject_version_matches_package_version` stays green.
+
+### Compatibility
+- Drop-in for v1.1.10 — `pip install -U` is safe.  No env-var default flipped, no
+  public API / CLI flag / ledger schema changed.
+- Two client-visible deltas, neither needing an opt-out: GET `/api/env` masks
+  secret values (`********`; the Settings save round-trip is unaffected) and POST
+  `/api/env` rejects non-`UPPER_SNAKE` / process-hijack keys (all legitimate
+  crucible keys are uppercase-snake and unaffected).
+- All v1.1.8 / v1.1.9 invariants preserved (4-stream ledger, canonical JSON via
+  `_V8FloatJSONEncoder`, cross-process sidecar locks, two-sided permutation
+  default, `_atomic_io` helpers, `init_run_correlation_from_env`,
+  `_ENHANCED_FLAG_TO_ENV` wiring, degrade-not-die, `_try_build` lenient retry,
+  and the H2 dispatcher cooldown/health wire-in).
+
+---
+
 ## [v1.1.10] — 2026-05-28
 
 Librarian-provider hardening release: five findings (S1–S5) from a

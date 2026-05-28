@@ -316,12 +316,18 @@ def _coerce_verdict_dict_to_gateverdict(
 
     # Build payload for pydantic.  Pydantic invariant validators will
     # raise ValueError if any structural rule is violated.
+    # v1.1.11: gate every shape-specific field by decision so a chatty model
+    # that emits a valid decision *plus* a stray secondary-decision field does
+    # not trip the GateVerdict mutual-exclusion validator and burn a retry.
+    # Mirrors the existing selected_direction gate.
     payload: Dict[str, Any] = {
         "decision": decision,
         "selected_direction": selected_direction if decision == "PROCEED" else None,
-        "branched_paths": branched_paths,
-        "failed_invariants": failed_invariants,
-        "blocking_evidence_queries": blocking_queries,
+        "branched_paths": branched_paths if decision == "BRANCH" else [],
+        "failed_invariants": failed_invariants if decision == "KILL" else [],
+        "blocking_evidence_queries": (
+            blocking_queries if decision == "NEEDS_MORE_DATA" else []
+        ),
         "reason": reason,
     }
     return GateVerdict(**payload)

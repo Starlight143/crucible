@@ -249,23 +249,23 @@ class CheckpointManager:
         data_path = self._stage_path(stage_name)
         meta_path = self._meta_path(stage_name)
 
-        tmp_data = data_path + ".tmp"
-        tmp_meta = meta_path + ".tmp"
         try:
-            with open(tmp_data, "w", encoding="utf-8") as fh:
-                json.dump(data, fh, ensure_ascii=False, indent=2, default=str)
-            with open(tmp_meta, "w", encoding="utf-8") as fh:
-                json.dump(meta, fh, ensure_ascii=False, indent=2)
-            os.replace(tmp_data, data_path)
-            os.replace(tmp_meta, meta_path)
-        except Exception:
-            # Clean up temp files on any failure to avoid leftover .tmp artifacts
-            for tmp in (tmp_data, tmp_meta):
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
-            raise
+            from .._atomic_io import atomic_write_text
+        except ImportError:  # flat-launcher mode (python crucible/__main__.py)
+            from _atomic_io import atomic_write_text  # type: ignore[no-redef]
+        # v1.1.11: route through the shared atomic writer so each file's parent
+        # dir is fsynced after os.replace (POSIX power-loss durability,
+        # CLAUDE.md §13.1).  Data is written before meta so a crash between the
+        # two leaves at worst an orphan data file (meta absence => is_stage_
+        # complete() still returns False), never a meta-without-data state.
+        atomic_write_text(
+            data_path,
+            json.dumps(data, ensure_ascii=False, indent=2, default=str),
+        )
+        atomic_write_text(
+            meta_path,
+            json.dumps(meta, ensure_ascii=False, indent=2),
+        )
 
         # v2: persist state file
         self._write_state(stage_name, StageState.COMPLETED, duration=duration)

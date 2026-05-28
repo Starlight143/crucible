@@ -83,6 +83,11 @@ const State = {
   _detailDrawdownChart: null,
   // Tracks the run ID currently being fetched so stale responses are ignored
   _detailRunId: null,
+  // Monotonic token so an older runCompare() response cannot overwrite a newer
+  // one in #compare-result-wrap (overlapping request pairs race otherwise).
+  _compareToken: 0,
+  // a11y: element to refocus when the run-detail modal closes (v1.1.11 F-B2)
+  _modalLastFocused: null,
 };
 
 // ─── Page router ────────────────────────────────────────────────────────────────
@@ -96,6 +101,20 @@ const PAGE_META = {
   settings:    { title: 'Settings',             sub: 'Configure environment variables and API keys' },
 };
 
+// ─── Mobile off-canvas sidebar toggle (≤900px) ───────────────────────────────
+// `force`: omit to toggle, pass true/false to set explicitly.  Mirrors state
+// onto <body> (for the scrim), the <nav> (slide transform) and the hamburger's
+// aria-expanded so AT announces the disclosure state.  (v1.1.11 F-B1)
+function toggleSidebar(force) {
+  const nav = document.getElementById('primary-sidebar');
+  if (!nav) return;
+  const open = (typeof force === 'boolean') ? force : !nav.classList.contains('nav-open');
+  nav.classList.toggle('nav-open', open);
+  document.body.classList.toggle('nav-open', open);
+  const btn = document.getElementById('mobile-nav-toggle');
+  if (btn) btn.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+
 function showPage(name) {
   document.querySelectorAll('.page').forEach(p => p.classList.remove('active'));
   document.querySelectorAll('.nav-item').forEach(n => n.classList.remove('active'));
@@ -104,6 +123,7 @@ function showPage(name) {
   pageEl.classList.add('active');
   const navEl = document.querySelector(`[data-page="${name}"]`);
   if (navEl) navEl.classList.add('active');
+  toggleSidebar(false);  // collapse the mobile drawer after navigating (F-B1)
   // Stop the AB-test 4-second poll when the user navigates elsewhere so
   // a forgotten AB session does not keep hitting /api/ab-test/<id> in
   // the background indefinitely (every poll allocates request/response
@@ -587,7 +607,7 @@ function renderFlagGroups(mode, analysisType) {
       html += '<div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:4px">';
       grp.selects.forEach(sel => {
         html += `<div class="field">
-  <label class="input-label-with-tip">${escHtml(sel.label)}<span class="tip-icon" data-tooltip="${escHtml(getDesc(sel.tip))}">?</span></label>
+  <label class="input-label-with-tip">${escHtml(sel.label)}<span class="tip-icon" tabindex="0" role="img" aria-label="${escHtml(getDesc(sel.tip))}" data-tooltip="${escHtml(getDesc(sel.tip))}">?</span></label>
   <select id="${mode}-${sel.key}">`;
         sel.opts.forEach(o => { html += `<option value="${escHtml(o.v)}">${escHtml(o.l)}</option>`; });
         html += '</select></div>';
@@ -618,7 +638,7 @@ function renderFlagGroups(mode, analysisType) {
           const inputType = inp.kind === 'date' ? 'date' : (inp.kind === 'float' || inp.kind === 'int') ? 'number' : 'text';
           const extra = inp.kind === 'float' ? 'step="0.01" min="0"' : inp.kind === 'int' ? 'step="1" min="0"' : '';
           html += `<div class="field">
-  <label class="input-label-with-tip">${escHtml(inp.label)}<span class="tip-icon" data-tooltip="${escHtml(getDesc(inp.tip))}">?</span></label>
+  <label class="input-label-with-tip">${escHtml(inp.label)}<span class="tip-icon" tabindex="0" role="img" aria-label="${escHtml(getDesc(inp.tip))}" data-tooltip="${escHtml(getDesc(inp.tip))}">?</span></label>
   <input type="${inputType}" id="${mode}-${inp.key}" ${extra} placeholder="${escHtml(inp.ph || '')}">
 </div>`;
         });
@@ -911,6 +931,54 @@ const AGENT_PATTERNS = [
 const _MAX_SESSIONS = 6;
 let _sessCounter = { project: 0, idea: 0 };
 
+// Canonical human-readable labels for a session status.  Both the status pill
+// (_setSessionStatus) and the terminal header (_updateSessionHeader) resolve
+// display text through here so the vocabulary stays consistent across every
+// surface (was: pill said "Completed" while the header printed the raw "done").
+// Unknown statuses fall through to the raw token.  (v1.1.11 F-A9)
+const _STATUS_LABELS = {
+  starting: 'Starting…',
+  running:  'Running…',
+  done:     'Completed',
+  error:    'Error',
+  cancelled:'Stopped',
+};
+function _statusLabel(status) {
+  return _STATUS_LABELS[status] || status;
+}
+// True while the given mode has a session that has not yet reached a terminal
+// state.  Gates the run button (prevents a double-submit spawning a second
+// pipeline) and decides whether ■ Stop needs a confirm.  (v1.1.11 F-A1)
+function _modeHasLiveSession(mode) {
+  return (State.sessions[mode] || []).some(
+    s => s.status === 'starting' || s.status === 'running'
+  );
+}
+
+// Recompute the global topbar run-status pill from ALL sessions across both
+// modes, so a running pipeline is never invisible from Dashboard/Settings.
+// Guarded no-op if the pill node is absent.  (v1.1.11 F-B7)
+function _updateGlobalRunPill() {
+  const pill = document.getElementById('global-run-pill');
+  if (!pill) return;
+  let running = 0;
+  ['project', 'idea'].forEach(mode => {
+    (State.sessions[mode] || []).forEach(s => {
+      if (s.status === 'running' || s.status === 'starting') running++;
+    });
+  });
+  if (running > 0) {
+    const word = (typeof CURRENT_LANG !== 'undefined' && CURRENT_LANG === 'zh')
+      ? (running === 1 ? '執行中' : `${running} 個執行中`)
+      : (running === 1 ? 'Running' : `${running} running`);
+    pill.innerHTML = `<span class="run-pill-dot"></span>${word}`;
+    pill.hidden = false;
+  } else {
+    pill.hidden = true;
+    pill.textContent = '';
+  }
+}
+
 function _newSession(mode, analysisType) {
   _sessCounter[mode]++;
   const typeName = { 1:'Quant', 2:'SaaS', 3:'Agent', 4:'Scientist' }[analysisType] || '';
@@ -972,6 +1040,11 @@ function _renderSessionBar(mode) {
 function _removeSession(mode, sessId) {
   const sess = _getSession(sessId);
   if (sess && (sess.status === 'running' || sess.status === 'starting')) {
+    // v1.1.11 (F-A10): closing a tab whose pipeline is still running aborts it
+    // — confirm first.
+    if (!confirm('Close this session? Its run is still active and will be stopped.')) {
+      return;
+    }
     _closeEvtSource(sessId);
     if (sess.run_id) fetch(`/api/run/${sess.run_id}`, { method: 'DELETE' }).catch(() => {});
   }
@@ -985,6 +1058,7 @@ function _removeSession(mode, sessId) {
   _rebuildTerminal(mode);
   _refreshAgentFlow(mode);
   _updateSessionHeader(mode);
+  if (typeof _updateGlobalRunPill === 'function') _updateGlobalRunPill();  // F-B7
 }
 
 function _updateSessionHeader(mode) {
@@ -1002,7 +1076,7 @@ function _updateSessionHeader(mode) {
     const elapsed = sess.endedAt
       ? _fmtElapsed(sess.endedAt - sess.startedAt)
       : _fmtElapsed(Date.now() - sess.startedAt);
-    metaEl.textContent = `${sess.status}  ·  ${elapsed}`;
+    metaEl.textContent = `${_statusLabel(sess.status)}  ·  ${elapsed}`;
   }
 }
 
@@ -1105,6 +1179,11 @@ function _classifyLine(line) {
 function clearActiveSession(mode) {
   const sess = _activeSession(mode);
   if (!sess) return;
+  // v1.1.11 (F-A10): confirm only when there is terminal output to lose.
+  if (sess.lines && sess.lines.length &&
+      !confirm('Clear the terminal output for this session? This cannot be undone.')) {
+    return;
+  }
   sess.lines = [];
   _rebuildTerminal(mode);
 }
@@ -1139,10 +1218,17 @@ function _setSessionStatus(sessId, status, returncode = null) {
   _renderSessionBar(sess.mode);
   const el = document.getElementById(`run-status-${sess.mode}`);
   const inlineEl = document.getElementById(`run-status-${sess.mode}-inline`);
-  const labels = { starting:'Starting…', running:'Running…', done:'Completed', error:'Error', cancelled:'Stopped' };
-  const pill = `<span class="status-pill status-${status}"><span class="pulse"></span>${labels[status] || status}</span>`;
+  const pill = `<span class="status-pill status-${status}"><span class="pulse"></span>${_statusLabel(status)}</span>`;
   if (el) el.innerHTML = pill;
   if (inlineEl) inlineEl.innerHTML = pill;
+  // v1.1.11 (F-A1): single chokepoint for the per-mode run button — it stays
+  // disabled while this mode still has a starting/running session and
+  // re-enables only when every session in the mode is terminal.  Prevents the
+  // double-submit the old "re-enable right after the POST" path allowed.
+  const _runBtn = document.getElementById(`btn-run-${sess.mode}`);
+  if (_runBtn) _runBtn.disabled = _modeHasLiveSession(sess.mode);
+  // v1.1.11 (F-B7): keep the global topbar run pill in sync.
+  if (typeof _updateGlobalRunPill === 'function') _updateGlobalRunPill();
 }
 
 // ─── Agent flow ───────────────────────────────────────────────
@@ -1800,17 +1886,40 @@ function _closeEvtSource(sessId) {
   }
 }
 
+// Flag an input as invalid (startRun empty-field validation, v1.1.11 F-A4).
+// Sets aria-invalid + an .input-invalid class and an inline outline fallback so
+// the signal is visible regardless of CSS, then clears both on the next
+// edit/focus so the field does not stay red.
+function _markFieldInvalid(el) {
+  if (!el) return;
+  el.setAttribute('aria-invalid', 'true');
+  el.classList.add('input-invalid');
+  el.style.outline = '2px solid var(--error, #f87171)';
+  const clear = () => {
+    el.removeAttribute('aria-invalid');
+    el.classList.remove('input-invalid');
+    el.style.outline = '';
+    el.removeEventListener('input', clear);
+    el.removeEventListener('focus', clear);
+  };
+  el.addEventListener('input', clear);
+  el.addEventListener('focus', clear);
+  try { el.focus(); } catch (_) {}
+}
+
 async function startRun(mode) {
   const flags = collectFlags(mode);
   const analysisType = State.pages[mode].analysisType;
   let payload;
   if (mode === 'project') {
-    const path = document.getElementById('project-path').value.trim();
-    if (!path) { alert('Please enter a project path.'); return; }
+    const pathEl = document.getElementById('project-path');
+    const path = (pathEl ? pathEl.value : '').trim();
+    if (!path) { _markFieldInvalid(pathEl); showToast('Please enter a project path.', 'warn'); return; }
     payload = { mode:'project', analysis_type:analysisType, project_path:path, flags };
   } else {
-    const idea = document.getElementById('idea-text').value.trim();
-    if (!idea) { alert('Please enter an idea or strategy description.'); return; }
+    const ideaEl = document.getElementById('idea-text');
+    const idea = (ideaEl ? ideaEl.value : '').trim();
+    if (!idea) { _markFieldInvalid(ideaEl); showToast('Please enter an idea or strategy description.', 'warn'); return; }
     payload = { mode:'idea', analysis_type:analysisType, idea, flags };
   }
 
@@ -1828,7 +1937,7 @@ async function startRun(mode) {
   if (State.activeView[mode] !== 'terminal') switchView(mode, 'terminal', null);
 
   const runBtn = document.getElementById(`btn-run-${mode}`);
-  runBtn.disabled = true;
+  if (runBtn) runBtn.disabled = true;
 
   try {
     const resp = await fetch('/api/run', {
@@ -1839,13 +1948,16 @@ async function startRun(mode) {
     if (data.error) throw new Error(data.error);
     if (!data.run_id) throw new Error('Server returned no run_id — cannot stream output.');
     sess.run_id = data.run_id;
-    runBtn.disabled = false;
+    // v1.1.11 (F-A1): keep the run button DISABLED while this run streams —
+    // re-enabling here let a second click spawn another pipeline and the
+    // _MAX_SESSIONS cap would then silently kill the oldest still-running
+    // session.  _setSessionStatus() re-enables it once this mode has no live
+    // session left.
     _appendLine(sess.id, `$ ${data.cmd}`, 'dim');
     _appendLine(sess.id, '', 'dim');
     _setSessionStatus(sess.id, 'running');
     _streamSession(sess.id);
   } catch (err) {
-    runBtn.disabled = false;
     _appendLine(sess.id, `[ERROR] ${err.message}`, 'err');
     _setSessionStatus(sess.id, 'error');
     _stopElapsedTimer(sess.id);
@@ -2019,6 +2131,12 @@ function _streamSession(sessId, _reconnectCount = 0) {
 async function killSession(mode) {
   const sess = _activeSession(mode);
   if (!sess) return;
+  // v1.1.11 (F-A10): confirm only when the backend pipeline is actually still
+  // running (avoid nagging on an already-finished session).
+  if ((sess.status === 'running' || sess.status === 'starting') &&
+      !confirm('Stop this run? The backend pipeline will be terminated.')) {
+    return;
+  }
   _closeEvtSource(sess.id);
   if (sess.run_id) await fetch(`/api/run/${sess.run_id}`, { method:'DELETE' }).catch(()=>{});
   _setSessionStatus(sess.id, 'cancelled');
@@ -2066,6 +2184,17 @@ async function loadDashboard() {
     renderCharts(data);
   } catch (err) {
     console.error('Dashboard error:', err);
+    // v1.1.11 (F-A2): surface the failure in-UI instead of leaving
+    // "Loading run history…" forever (mirrors openRunDetail's err.message).
+    const _wrap = document.getElementById('runs-table-wrap');
+    if (_wrap) {
+      _wrap.innerHTML =
+        `<div class="empty-state"><div class="em-icon">❌</div>Failed to load dashboard — ${escHtml(err.message)}</div>`;
+    }
+    ['stat-runs', 'stat-cost', 'stat-quality'].forEach(id => {
+      const cell = document.getElementById(id);
+      if (cell) cell.textContent = '—';
+    });
   }
   loadBudgetStatus();
   // v1.1.0: also refresh the run-insights widget so dashboard view is consistent.
@@ -2355,7 +2484,17 @@ async function openRunDetail(runId) {
   const overlay = document.getElementById('run-detail-modal');
   document.getElementById('modal-run-id').textContent = runId;
   document.getElementById('modal-body').innerHTML = '<div class="empty-state"><div class="em-icon">⏳</div>Loading…</div>';
+  // a11y (F-B2): remember the trigger so focus restores on close, move focus
+  // into the dialog, and bind a Tab trap once per panel.
+  State._modalLastFocused = document.activeElement;
   overlay.classList.add('open');
+  const _panel = overlay.querySelector('.modal-panel');
+  const _closeBtn = overlay.querySelector('.modal-close');
+  if (_closeBtn) _closeBtn.focus();
+  if (_panel && !_panel._a11yTrapBound) {
+    _panel._a11yTrapBound = true;
+    _panel.addEventListener('keydown', _trapModalTab);
+  }
 
   try {
     // Load detail and backtest chart in parallel
@@ -2733,12 +2872,32 @@ function _buildMonthlyHeatmap(monthlyReturns) {
   </div>`;
 }
 
+// a11y (F-B2): keep Tab focus inside the open run-detail dialog.  Bound once
+// per panel via the _a11yTrapBound guard in openRunDetail.
+function _trapModalTab(e) {
+  if (e.key !== 'Tab') return;
+  const panel = e.currentTarget;
+  const focusables = panel.querySelectorAll(
+    'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+  );
+  const visible = Array.prototype.filter.call(focusables, el => el.offsetParent !== null || el === panel);
+  if (!visible.length) { e.preventDefault(); panel.focus(); return; }
+  const first = visible[0], last = visible[visible.length - 1];
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+}
+
 function closeRunDetailModal(event) {
   // Close on overlay click (not on panel itself) or explicit null call
   if (event && event.target !== document.getElementById('run-detail-modal')) return;
   document.getElementById('run-detail-modal').classList.remove('open');
   if (State._detailChart) { State._detailChart.destroy(); State._detailChart = null; }
   if (State._detailDrawdownChart) { State._detailDrawdownChart.destroy(); State._detailDrawdownChart = null; }
+  // a11y (F-B2): restore focus to whatever opened the modal.
+  if (State._modalLastFocused && typeof State._modalLastFocused.focus === 'function') {
+    State._modalLastFocused.focus();
+  }
+  State._modalLastFocused = null;
 }
 
 // Close modal on Escape key
@@ -2870,7 +3029,7 @@ const SETTINGS_SCHEMA = [
     keys:['ENHANCED_BACKTEST_RUNNER','BACKTEST_REQUIRE_REAL_DATA',
           'BACKTEST_MIN_REAL_DATA_ROWS','BACKTEST_DATA_CACHE_TTL_HOURS',
           'BACKTEST_DATA_CACHE_DIR','BACKTEST_DATA_MAX_STALENESS_DAYS',
-          'BACKTEST_SYNTHETIC_SEED','BACKTEST_PREPARE_DATA_ONLY',
+          'BACKTEST_SYNTHETIC_SEED','BACKTEST_PARAM_SEED','BACKTEST_FETCH_HARD_TIMEOUT_SEC','BACKTEST_PREPARE_DATA_ONLY',
           'BACKTEST_PARALLEL_FETCH',
           'BACKTEST_PARAM_SEARCH','BACKTEST_BAYESIAN_N_TRIALS',
           'BACKTEST_SYMBOL','BACKTEST_DATA_SOURCE','BACKTEST_PERIOD','BACKTEST_INTERVAL',
@@ -2995,6 +3154,8 @@ const KEY_META = {
   BACKTEST_DATA_CACHE_DIR:           { label:'Data Cache Directory',        desc:{en:'Directory for cached OHLCV CSV files. Leave blank to use ~/.crucible/data_cache. Supports ~ expansion.', zh:'OHLCV CSV 快取目錄。留空使用 ~/.crucible/data_cache。支援 ~ 展開。'}, type:'text' },
   BACKTEST_DATA_MAX_STALENESS_DAYS:  { label:'Max Data Staleness (days)',   desc:{en:'When the most recent data row is older than this many days, the report appends a warning that metrics may not reflect the current regime. 0 disables the check. Default: 7.', zh:'最後一根 K 線距今超過幾天時，回測報告會多一條警告：目前 Sharpe / 回撤可能不反映當前市場狀態。0 = 關閉檢查。預設 7。'}, type:'number' },
   BACKTEST_SYNTHETIC_SEED:           { label:'Synthetic Seed',              desc:{en:'Seed for the GBM synthetic-data fallback (only used when BACKTEST_REQUIRE_REAL_DATA=0). An integer means reproducible; "random" picks a fresh seed each run. Default: 42 (preserves v1.0.x behaviour).', zh:'合成 GBM 資料的種子（僅在 BACKTEST_REQUIRE_REAL_DATA=0 時生效）。整數表示可重現；"random" 表示每次重新抽。預設 42（保留 v1.0.x 行為）。'}, type:'text' },
+  BACKTEST_PARAM_SEED:               { label:'Param Search Seed',           desc:{en:'Seed for the random-search parameter sweep RNG (used when optuna is unavailable, or when BACKTEST_PARAM_SEARCH=random). An integer makes best_params reproducible across re-runs of the same strategy; "random" uses an OS-time seed (legacy, not recommended — results drift). Default: 4242.', zh:'隨機參數搜尋 RNG 的種子（在 optuna 不可用、或 BACKTEST_PARAM_SEARCH=random 時使用）。整數可讓同一策略重跑時的 best_params 可重現；"random" 使用 OS 時間種子（舊行為，不建議——結果會漂移）。預設 4242。'}, type:'text' },
+  BACKTEST_FETCH_HARD_TIMEOUT_SEC:   { label:'Fetch Hard Timeout (s)',      desc:{en:'Hard wall-clock timeout (seconds) for each yfinance / Binance parallel-fetch worker. Caps the damage from a stalled or slowloris-style endpoint; a hit surfaces as a fetch failure rather than a hung pipeline. Default: 90.', zh:'每個 yfinance / Binance 平行抓取 worker 的硬性 wall-clock 逾時（秒）。限制停滯或 slowloris 式端點造成的傷害；逾時會被當成抓取失敗，而非讓管線卡死。預設 90。'}, type:'number' },
   BACKTEST_PREPARE_DATA_ONLY:        { label:'Prepare-Data Only (Dry Run)', desc:{en:'When on, the backtest pipeline exits immediately after preparing data — no strategy execution, no parameter sweep. Useful for confirming the data-fetch path is wired up. Default: off.', zh:'開啟時回測管線在準備資料完成後立即結束，不執行策略也不做參數掃描。用來確認資料路徑是否接通。預設關閉。'}, type:'boolean' },
   BACKTEST_PARALLEL_FETCH:           { label:'Parallel Real-Data Fetch',    desc:{en:'When on, the auto cascade fires yfinance and Binance concurrently and uses whichever returns valid data first. Off by default — sequential cascade is friendlier to provider rate limits and easier to debug.', zh:'開啟時 auto cascade 同時打 yfinance + Binance，誰先回傳有效資料就用誰。預設關閉，sequential cascade 對 provider rate limit 更友善、也較易除錯。'}, type:'boolean' },
   ENHANCED_GITHUB_REPO:              { label:'GitHub Repo URL',             desc:{en:'GitHub repository URL to analyse and inject as research context. Enable with --github-repo.', zh:'要分析並注入研究 context 的 GitHub repository URL。需搭配 --github-repo 開啟。'}, type:'text' },
@@ -3172,6 +3333,13 @@ async function loadSettings() {
   } catch (err) {
     console.error('Failed to load settings:', err);
     showToast('Failed to load settings — check server connection', 'error');
+    // v1.1.11 (F-A6): replace the "Loading settings…" placeholder so the page
+    // does not look hung; the header Reload button re-invokes loadSettings().
+    const _c = document.getElementById('settings-container');
+    if (_c) {
+      _c.innerHTML =
+        `<div class="empty-state"><div class="em-icon">❌</div>Failed to load settings — ${escHtml(err.message)}<br>Check the server connection and click Reload.</div>`;
+    }
   }
   loadWebhookHistory();
 }
@@ -3440,15 +3608,31 @@ function showToast(msg, type = 'success') {
     info:    { bg:'rgba(96,165,250,.15)', border:'rgba(96,165,250,.35)', text:'#60a5fa' },
   };
   const c = palette[type] || palette.info;
+  const region = document.getElementById('toast-region');
   const t = document.createElement('div');
-  t.style.cssText = `
-    position:fixed; bottom:24px; right:24px; z-index:9999;
-    padding:12px 20px; border-radius:8px; font-size:13px;
-    background:${c.bg}; border:1px solid ${c.border}; color:${c.text};
-    backdrop-filter:blur(8px); animation: fadeInUp .3s ease;
-  `;
-  t.textContent = msg;
-  document.body.appendChild(t);
+  // When the live region exists, the flex container handles positioning so the
+  // toast is static; otherwise fall back to fixed positioning.  (v1.1.11 F-B4)
+  t.style.cssText = region
+    ? `position:relative; pointer-events:auto; display:flex; align-items:center; gap:10px;
+       padding:12px 16px 12px 20px; border-radius:8px; font-size:13px;
+       background:${c.bg}; border:1px solid ${c.border}; color:${c.text};
+       backdrop-filter:blur(8px); animation: fadeInUp .3s ease;`
+    : `position:fixed; bottom:24px; right:24px; z-index:9999;
+       padding:12px 20px; border-radius:8px; font-size:13px;
+       background:${c.bg}; border:1px solid ${c.border}; color:${c.text};
+       backdrop-filter:blur(8px); animation: fadeInUp .3s ease;`;
+  const span = document.createElement('span');
+  span.textContent = msg;
+  t.appendChild(span);
+  const x = document.createElement('button');
+  x.type = 'button';
+  x.textContent = '×';
+  x.setAttribute('aria-label', 'Dismiss notification');
+  x.style.cssText = `background:none; border:none; color:inherit; cursor:pointer;
+    font-size:16px; line-height:1; padding:0 2px; opacity:.7;`;
+  x.onclick = () => t.remove();
+  t.appendChild(x);
+  (region || document.body).appendChild(t);
   setTimeout(() => t.remove(), 3500);
 }
 
@@ -3522,14 +3706,14 @@ async function _submitHitl(mode) {
   const text  = inputEl.value.trim();
   const runId = banner.dataset.runId;
 
-  banner.classList.remove('hitl-visible');
-  inputEl.value = '';
-
   if (!runId) {
     if (submitBtn) submitBtn.disabled = false;
     showToast('No active run to signal.', 'warn');
-    return;
+    return;  // keep the banner open and the typed text intact (v1.1.11 F-A5)
   }
+
+  banner.classList.remove('hitl-visible');
+  inputEl.value = '';
 
   try {
     const resp = await fetch(`/api/run/${encodeURIComponent(runId)}/signal`, {
@@ -3660,6 +3844,10 @@ async function runCompare() {
     return;
   }
 
+  // Discard-stale guard (v1.1.11 F-A3): only the most recent invocation may
+  // write the wrap — overlapping request pairs otherwise race to last-writer.
+  const _token = ++State._compareToken;
+
   wrap.innerHTML = '<div class="empty-state"><div class="em-icon">⏳</div>Loading both runs…</div>';
 
   try {
@@ -3667,10 +3855,12 @@ async function runCompare() {
       fetch(`/api/run/${encodeURIComponent(idA)}/detail`).then(r => { if (!r.ok) throw new Error(`Run A: ${r.status}`); return r.json(); }),
       fetch(`/api/run/${encodeURIComponent(idB)}/detail`).then(r => { if (!r.ok) throw new Error(`Run B: ${r.status}`); return r.json(); }),
     ]);
+    if (_token !== State._compareToken) return;  // a newer runCompare() superseded us
     if (rA.error) throw new Error('Run A: ' + rA.error);
     if (rB.error) throw new Error('Run B: ' + rB.error);
     wrap.innerHTML = renderComparePage(idA, idB, rA, rB);
   } catch (err) {
+    if (_token !== State._compareToken) return;
     wrap.innerHTML = `<div class="empty-state"><div class="em-icon">❌</div>${escHtml(err.message)}</div>`;
   }
 }
@@ -4125,7 +4315,8 @@ async function testWebhook() {
   // a static asset and is no longer template-rendered, so the value
   // must be threaded through the global rather than embedded inline.
   const url = window.WEBUI_URL || window.location.host;
-  document.getElementById('domain-badge').textContent = url.replace(/^https?:\/\//, '');
+  const _domainBadge = document.getElementById('domain-badge');
+  if (_domainBadge) _domainBadge.textContent = String(url).replace(/^https?:\/\//, '');
 
   const style = document.createElement('style');
   style.textContent = '@keyframes fadeInUp { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }';
@@ -4210,5 +4401,21 @@ async function testWebhook() {
     if (!related || !related.closest('[data-tooltip]')) {
       if (tipEl) tipEl.style.display = 'none';
     }
+  });
+  // a11y (F-B3): keyboard + touch parity — focusing a [data-tooltip] trigger
+  // shows the same help text (positioned relative to the element's box).
+  document.addEventListener('focusin', e => {
+    const t = e.target.closest('[data-tooltip]');
+    if (!t) return;
+    const tip = getTip();
+    tip.textContent = t.dataset.tooltip;
+    tip.style.display = 'block';
+    const r = t.getBoundingClientRect();
+    const w = tip.offsetWidth || 300, h = tip.offsetHeight || 80;
+    tip.style.left = Math.min(r.left, window.innerWidth - w - 16) + 'px';
+    tip.style.top  = Math.max(8, (r.bottom + 6 > window.innerHeight - h - 8) ? r.top - h - 6 : r.bottom + 6) + 'px';
+  });
+  document.addEventListener('focusout', e => {
+    if (e.target.closest('[data-tooltip]') && tipEl) tipEl.style.display = 'none';
   });
 })();

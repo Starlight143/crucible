@@ -72,6 +72,26 @@ except ImportError:  # pragma: no cover - script-mode fallback
     import _env  # type: ignore[no-redef]
 
 
+def _is_public_http_url(url: str) -> bool:
+    """SSRF predicate for the one-shot safe_get/safe_post helpers (v1.1.11).
+
+    Reuses the hardened predicate from the librarian HTTP client (rejects
+    private / link-local / multicast / userinfo-smuggled / IPv4-mapped-IPv6
+    targets).  Imported LAZILY here because ``web_research.http_clients``
+    imports this module at its top — a module-level import would be circular.
+    By the time these helpers are called both modules are fully initialised.
+    Fails CLOSED (treats the URL as unsafe) if the predicate cannot be loaded.
+    """
+    try:
+        from .web_research.http_clients import _is_public_http_url as _impl
+    except ImportError:  # pragma: no cover - flat-launcher fallback
+        try:
+            from web_research.http_clients import _is_public_http_url as _impl  # type: ignore[no-redef]
+        except ImportError:
+            return False
+    return _impl(url)
+
+
 def _env_int(name: str, default: int) -> int:
     # Do not clamp to >=1 here: callers that require positive values clamp
     # independently. Allowing 0 preserves "no-limit" / disabled overrides
@@ -294,8 +314,16 @@ def safe_get(
     resolved_timeout = cfg.resolved_timeout() if timeout is None else timeout
     resolved_max_bytes = cfg.resolved_max_bytes() if max_bytes is None else max_bytes
 
+    if not _is_public_http_url(url):
+        LOGGER.warning("safe_get: refusing non-public/SSRF-unsafe URL: %s", str(url)[:80])
+        return None
+
     def _do_get() -> Any:
-        resp = httpx.get(url, headers=headers or {}, timeout=resolved_timeout, follow_redirects=True)
+        # follow_redirects=False (v1.1.11): auto-following would bypass the
+        # _is_public_http_url precheck (e.g. a public URL 302-redirecting to
+        # http://169.254.169.254/ AWS IMDS).  Callers needing redirect support
+        # must use http_clients.safe_http_json/_text which re-checks every hop.
+        resp = httpx.get(url, headers=headers or {}, timeout=resolved_timeout, follow_redirects=False)
         resp.raise_for_status()
         # Always apply max_bytes guard; for JSON, parse the (possibly truncated) bytes
         # directly so the size cap is consistently enforced.
@@ -349,13 +377,20 @@ def safe_post(
     # Explicit None-check: timeout=0 means "no timeout", not "use default".
     resolved_timeout = cfg.resolved_timeout() if timeout is None else timeout
 
+    if not _is_public_http_url(url):
+        LOGGER.warning("safe_post: refusing non-public/SSRF-unsafe URL: %s", str(url)[:80])
+        return None
+
     def _do_post() -> Any:
+        # follow_redirects=False (v1.1.11) — see safe_get rationale
+        # (redirect-to-IMDS SSRF).  http_clients._request_with_safe_redirects
+        # is the redirect-aware, per-hop-revalidated path for callers needing it.
         resp = httpx.post(
             url,
             json=payload,
             headers=headers or {},
             timeout=resolved_timeout,
-            follow_redirects=True,
+            follow_redirects=False,
         )
         resp.raise_for_status()
         return resp.json() if as_json else resp.text

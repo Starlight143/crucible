@@ -32,7 +32,7 @@ import dance other helpers need.
 from __future__ import annotations
 
 import os
-from typing import Union
+from typing import Optional, Union
 
 __all__ = ["fsync_dir", "atomic_write_text"]
 
@@ -67,6 +67,7 @@ def atomic_write_text(
     encoding: str = "utf-8",
     *,
     fsync_parent: bool = True,
+    newline: Optional[str] = None,
 ) -> None:
     """Write *content* to *path* atomically via a sibling ``.tmp`` file.
 
@@ -79,7 +80,7 @@ def atomic_write_text(
     target = os.fspath(path)
     tmp_path = target + ".tmp"
     try:
-        with open(tmp_path, "w", encoding=encoding) as _fh:
+        with open(tmp_path, "w", encoding=encoding, newline=newline) as _fh:
             _fh.write(content)
         os.replace(tmp_path, target)
     except Exception:

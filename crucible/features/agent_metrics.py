@@ -108,17 +108,15 @@ class AgentMetricsReport:
 
     def save_json(self, path: str) -> None:
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        _tmp = path + ".tmp"
         try:
-            with open(_tmp, "w", encoding="utf-8") as fh:
-                json.dump(self.to_dict(), fh, indent=2, ensure_ascii=False)
-            os.replace(_tmp, path)
-        except OSError:
-            try:
-                os.unlink(_tmp)
-            except OSError:
-                pass
-            raise
+            from .._atomic_io import atomic_write_text
+        except ImportError:  # flat-launcher mode
+            from _atomic_io import atomic_write_text  # type: ignore[no-redef]
+        # v1.1.11: shared atomic writer (parent-dir fsync, CLAUDE.md §13.1).
+        atomic_write_text(
+            path,
+            json.dumps(self.to_dict(), indent=2, ensure_ascii=False),
+        )
 
     def summary_text(self) -> str:
         lines = [

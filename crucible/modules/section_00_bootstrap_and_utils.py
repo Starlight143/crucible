@@ -1938,22 +1938,23 @@ def _write_direction_debate_debug_dump(
             normalized = os.path.normcase(os.path.abspath(candidate_dir))
             if normalized not in candidate_dirs:
                 candidate_dirs.append(normalized)
+        try:
+            from .._atomic_io import atomic_write_text
+        except ImportError:  # flat-launcher mode
+            from _atomic_io import atomic_write_text  # type: ignore[no-redef]
         for candidate_dir in candidate_dirs:
-            _tmp_path = None
             try:
                 os.makedirs(candidate_dir, exist_ok=True)
                 path = os.path.join(candidate_dir, filename)
-                _tmp_path = path + ".tmp"
-                with open(_tmp_path, "w", encoding="utf-8") as fh:
-                    json.dump(payload, fh, ensure_ascii=False, indent=2, default=str)
-                os.replace(_tmp_path, path)
+                # atomic_write_text handles the .tmp write + os.replace + tmp
+                # cleanup-on-failure internally, and fsyncs the parent dir
+                # (CLAUDE.md §13.1, v1.1.11).
+                atomic_write_text(
+                    path,
+                    json.dumps(payload, ensure_ascii=False, indent=2, default=str),
+                )
                 return path
             except Exception:
-                try:
-                    if _tmp_path is not None:
-                        os.unlink(_tmp_path)
-                except Exception:
-                    pass
                 continue
         return None
     except Exception:

@@ -2357,6 +2357,20 @@ def run_direction_debate(
                 if not _candidate_dir and _weak:
                     _candidate_dir = str(_weak[0])
                 _decision_taken = False
+                # v1.1.11: capture the pre-clamp confidence band BEFORE the
+                # mutation below forces it to "low", so ``final_score`` reflects
+                # the debate's actual pre-degrade conviction rather than a
+                # hardcoded 0.  DirectionDecision has no numeric score field
+                # (only a low|medium|high band), so this confidence->int proxy
+                # is the most meaningful numeric available at this point.
+                _preclamp_conf_raw = ""
+                if _preclamp is not None:
+                    _preclamp_conf_raw = str(
+                        getattr(_preclamp, "confidence", "") or ""
+                    ).strip().lower()
+                _preclamp_score = {"high": 75, "medium": 50, "low": 25}.get(
+                    _preclamp_conf_raw, 0
+                )
                 if _preclamp is not None and _candidate_dir:
                     # Cap confidence to "low" so the rest of the
                     # pipeline (gate controller, codegen scope chooser,
@@ -2382,7 +2396,7 @@ def run_direction_debate(
                         "degraded_proceed" if _decision_taken else "force_none"
                     ),
                     consecutive_force_none_count=int(_total_iter),
-                    final_score=0,
+                    final_score=int(_preclamp_score),
                     gate_reason=(
                         "consecutive force-none iterations exhausted "
                         "with structural failure (supported_fields empty)"
