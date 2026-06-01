@@ -18,6 +18,7 @@ import sys
 import string
 import subprocess
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -893,6 +894,32 @@ _OPENROUTER_USAGE_RECORDS: contextvars.ContextVar[List[Dict[str, Any]]] = contex
     "openrouter_usage_records", default=None  # type: ignore[assignment]
 )
 
+# ── v1.1.12 — Authoritative OpenRouter billed-cost ledger ────────────────────
+# The per-stage cost path is lossy: ``_record_cost`` accumulates LLM usage into
+# the ``_OPENROUTER_USAGE_CONTEXT`` ContextVar, reads it once per stage, then
+# ``clear_openrouter_usage()``s it.  Several ``crew.kickoff()`` call sites
+# (section_01 reformat crews, section_02 direction-seed plan, section_04
+# problem-breakdown / smart-queries, section_06 api-version analysis, the
+# external Critic) have NO matching ``_record_cost``, so their real OpenRouter
+# cost is mis-attributed to an adjacent stage — or dropped entirely when a
+# ``clear`` runs first — and the headline ``total_cost_usd`` silently diverges
+# from the OpenRouter billing dashboard.  The summary also blends actual
+# (``openrouter_api``) and locally-estimated rows into one total while labelling
+# it "actual billing".
+#
+# This ledger fixes the discrepancy at its only correct chokepoint: the HTTP
+# interceptor.  ``_capture_openrouter_usage_from_http_response`` appends one row
+# here for EVERY billed OpenRouter response, carrying the exact ``usage.cost``
+# OpenRouter returned, exactly once (idempotency-guarded), independent of stage
+# attribution.  ``get_openrouter_billed_total()`` therefore equals the exact
+# Σ(usage.cost) across the whole run — the number the operator sees on the
+# dashboard.  It is a plain module global guarded by a ``Lock`` (NOT a
+# ContextVar) so writes from any thread/context are visible to the reader, and
+# it is reset ONLY at run start (``reset_openrouter_billed_ledger()``), never by
+# the per-stage ``clear_openrouter_usage()``.
+_OPENROUTER_BILLED_LEDGER: List[Dict[str, Any]] = []
+_OPENROUTER_BILLED_LEDGER_LOCK = threading.Lock()
+
 
 @dataclass
 class OpenRouterUsageData:
@@ -1118,6 +1145,13 @@ def _capture_openrouter_usage_from_http_response(response: Any) -> bool:
         if getattr(response, "status_code", 0) >= 400:
             return False
 
+        # v1.1.12 — idempotency guard: never capture the same HTTP response
+        # twice.  Prevents the dormant interceptor+callback double-count and any
+        # accidental re-invocation from inflating either the usage context or
+        # the authoritative billed-cost ledger.
+        if getattr(response, "_crucible_or_usage_captured", False):
+            return False
+
         request = getattr(response, "request", None)
         request_url = getattr(request, "url", None)
         provider = None
@@ -1147,6 +1181,26 @@ def _capture_openrouter_usage_from_http_response(response: Any) -> bool:
 
         model_id = str(payload.get("model", "") or "")
         set_openrouter_usage(usage, model_id=model_id, accumulate=True, provider=provider)
+
+        # v1.1.12 — feed the authoritative billed-cost ledger straight from this
+        # interceptor chokepoint: exactly one row per billed OpenRouter response,
+        # carrying the precise ``usage.cost`` OpenRouter returned, independent of
+        # the lossy per-stage ``_record_cost`` attribution.  Gate on the
+        # OpenRouter provider; ``_append_openrouter_billed_entry`` itself rejects
+        # zero / non-finite costs, so estimated / cost-less rows (e.g. Alibaba
+        # coding plan, which forces cost to 0) never enter the ledger.
+        if provider == LLM_PROVIDER_OPENROUTER:
+            _append_openrouter_billed_entry(
+                model_id=_canonicalize_usage_model_id(model_id, provider),
+                total_cost_usd=usage.get("cost", 0.0) or 0.0,
+                input_tokens=usage.get("prompt_tokens", 0) or 0,
+                output_tokens=usage.get("completion_tokens", 0) or 0,
+            )
+
+        try:
+            setattr(response, "_crucible_or_usage_captured", True)
+        except Exception:
+            pass
         return True
     except Exception:
         return False
@@ -1322,8 +1376,93 @@ def get_usage_records() -> List[OpenRouterUsageData]:
 
 
 def clear_openrouter_usage() -> None:
+    # NB: deliberately does NOT touch the authoritative billed-cost ledger.
+    # That ledger must survive every per-stage clear and is reset only at run
+    # start via ``reset_openrouter_billed_ledger()``.
     _OPENROUTER_USAGE_CONTEXT.set({})
     _OPENROUTER_USAGE_RECORDS.set([])
+
+
+def _append_openrouter_billed_entry(
+    *,
+    model_id: str = "",
+    total_cost_usd: float = 0.0,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+) -> None:
+    """Append one authoritative billed-cost row (exact OpenRouter ``usage.cost``).
+
+    Called from the HTTP interceptor for every billed OpenRouter response.  The
+    ledger is the single source of truth for the per-run USD total; it is never
+    cleared by ``clear_openrouter_usage()`` — only by
+    ``reset_openrouter_billed_ledger()`` at run start.
+
+    Rejects NaN / ±inf / non-positive costs so a malformed payload can never
+    poison the sum (``not (x > 0)`` rejects NaN and ``-inf``; ``x == inf`` is
+    rejected explicitly).
+    """
+    try:
+        cost_val = float(total_cost_usd)
+    except (TypeError, ValueError):
+        return
+    if not (cost_val > 0.0) or cost_val == float("inf"):
+        return
+    try:
+        in_tok = max(0, int(input_tokens or 0))
+    except (TypeError, ValueError):
+        in_tok = 0
+    try:
+        out_tok = max(0, int(output_tokens or 0))
+    except (TypeError, ValueError):
+        out_tok = 0
+    entry = {
+        "model_id": str(model_id or ""),
+        "total_cost_usd": cost_val,
+        "input_tokens": in_tok,
+        "output_tokens": out_tok,
+    }
+    with _OPENROUTER_BILLED_LEDGER_LOCK:
+        _OPENROUTER_BILLED_LEDGER.append(entry)
+
+
+def reset_openrouter_billed_ledger() -> None:
+    """Clear the authoritative billed-cost ledger (call once at run start).
+
+    Clears in place (``list.clear()``) rather than rebinding so the reference
+    shared across section modules (``module_runtime`` / ``globals().update``)
+    stays valid.
+    """
+    with _OPENROUTER_BILLED_LEDGER_LOCK:
+        _OPENROUTER_BILLED_LEDGER.clear()
+
+
+def get_openrouter_billed_ledger() -> List[Dict[str, Any]]:
+    """Return a snapshot copy of the authoritative billed-cost ledger rows."""
+    with _OPENROUTER_BILLED_LEDGER_LOCK:
+        return [dict(row) for row in _OPENROUTER_BILLED_LEDGER]
+
+
+def get_openrouter_billed_count() -> int:
+    """Return how many billed OpenRouter responses were captured this run."""
+    with _OPENROUTER_BILLED_LEDGER_LOCK:
+        return len(_OPENROUTER_BILLED_LEDGER)
+
+
+def get_openrouter_billed_total() -> float:
+    """Return the exact Σ(usage.cost) across every billed OpenRouter response.
+
+    This is the authoritative per-run USD total — it equals what the operator
+    is billed on the OpenRouter dashboard, because every billed response feeds
+    exactly one ledger row carrying its returned ``usage.cost``.
+    """
+    with _OPENROUTER_BILLED_LEDGER_LOCK:
+        total = 0.0
+        for row in _OPENROUTER_BILLED_LEDGER:
+            try:
+                total += float(row.get("total_cost_usd", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                continue
+        return total
 
 
 def _get_model_pricing(model_id: str) -> Tuple[float, float]:

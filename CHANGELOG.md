@@ -5,6 +5,66 @@ Versioning follows [Semantic Versioning](https://semver.org/). The first public 
 
 ---
 
+## [v1.1.12] — 2026-06-01
+
+Cost-accuracy release: the headline `total_cost_usd` (the `--cost-report` console
+output and `run_meta.json` → WebUI dashboard) no longer diverges from the
+OpenRouter billing dashboard.  A four-agent read-only audit traced the gap to the
+per-stage attribution path, not the capture itself.  All changes are additive —
+no env-var default flipped, no public schema or CLI flag changed, and runs that
+never bill OpenRouter (Alibaba coding-plan, fully-estimated) are byte-for-byte
+unchanged.
+
+### Added
+- **Authoritative OpenRouter billed-cost ledger** (`section_00`) — the HTTP
+  interceptor now feeds a lock-guarded, append-only module-global ledger with one
+  row per billed response carrying the exact `usage.cost` OpenRouter returned, so
+  `get_openrouter_billed_total()` equals the precise Σ(usage.cost) for the run.
+  It is a plain global (NOT a ContextVar, so cross-thread writes are visible),
+  reset only at run start (`reset_openrouter_billed_ledger()`), never by the
+  per-stage `clear_openrouter_usage()`.
+- **`tests/test_v1_1_12_cost_reconciliation.py`** — 16 pins: exact-sum, survives a
+  per-stage clear, rejects 0/NaN/±inf/non-OpenRouter rows, per-response
+  idempotency, thread-safety, reconciliation + breakdown scaling, and
+  orphan-kickoff recovery.
+
+### Fixed
+- **Headline `total_cost_usd` under-reported and blended estimates behind an
+  "actual billing" label** — it was rebuilt from the lossy `_record_cost`
+  accumulate→read→clear dance.  Several `crew.kickoff()` sites (section_01 reformat
+  crews, section_02 direction-seed plan, section_04 problem-breakdown /
+  smart-queries, section_06 api-version, the external Critic) have no matching
+  `_record_cost`, so their real cost was mis-attributed to an adjacent stage — or
+  dropped when a `clear` ran first — and the summed total mixed actual with
+  locally-estimated rows.  `section_07._reconcile_cost_summary_with_billing` now
+  promotes the billed-ledger sum to the headline whenever real billing was
+  captured (scaling the input/output/cache breakdown to match) and surfaces the
+  old per-stage figure as `total_cost_usd_attributed` for reconciliation.
+- **Latent interceptor double-count** —
+  `_capture_openrouter_usage_from_http_response` is now idempotent per HTTP
+  response (sentinel guard), so the interceptor + langchain-callback pair can
+  never bill one response twice.
+
+### Validation
+- pytest: **3 275 passed, 2 skipped** under `-p no:cacheprovider` (+16 in
+  `tests/test_v1_1_12_cost_reconciliation.py`; the 126 existing cost tests
+  unchanged).  Two skips unchanged (`SyntheticGoldenRun` optional `run_meta.json`,
+  HTTP/2 gated on the `h2` package).
+- `crucible/smoke_test.py`: 5/5 OK; `run_crucible.py --self-check`: OK.
+- `pyproject.toml` and `crucible.__version__` bumped to `"1.1.12"` in lock-step so
+  `test_pyproject_version_matches_package_version` stays green.
+
+### Compatibility
+- Drop-in for v1.1.11 — `pip install -U` is safe.  No env-var default flipped, no
+  public API / CLI flag / ledger schema changed.  `AgentCostAccountant` and the
+  per-stage breakdown are untouched (still emitted for diagnostics); runs with no
+  captured OpenRouter billing keep the prior total exactly.  All v1.1.8–v1.1.11
+  invariants preserved (4-stream ledger, canonical JSON via `_V8FloatJSONEncoder`,
+  cross-process sidecar locks, two-sided permutation default, `_atomic_io`
+  helpers, degrade-not-die, `_try_build` lenient retry).
+
+---
+
 ## [v1.1.11] — 2026-05-28
 
 Audit-fix release: a ten-agent read-only audit of the frontend and backend

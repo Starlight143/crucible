@@ -219,6 +219,7 @@ def _get_print_labels(use_cjk: bool) -> Dict[str, str]:
 def _reset_pipeline_runtime_state() -> None:
     # Main can be called repeatedly inside one process via module_runtime; clear prior run state.
     clear_openrouter_usage()
+    reset_openrouter_billed_ledger()  # v1.1.12 — authoritative billed-cost ledger (per-run)
     reset_cost_accountant()
     reset_circuit_breakers()
     clear_last_librarian_debug()
@@ -226,6 +227,57 @@ def _reset_pipeline_runtime_state() -> None:
     reset_local_llm_cache()
     reset_api_version_cache()
     clear_log_context()
+
+
+def _reconcile_cost_summary_with_billing(summary: Any) -> Any:
+    """Override the headline ``total_cost_usd`` with the authoritative
+    OpenRouter billed-cost ledger (v1.1.12).
+
+    The accountant total is reconstructed from the lossy per-stage
+    ``_record_cost`` dance (several ``crew.kickoff()`` sites have no matching
+    ``_record_cost``) and blends actual ``openrouter_api`` rows with
+    locally-estimated ones while labelling the whole thing "actual billing".
+    When the billed-cost ledger captured real OpenRouter ``usage.cost`` values
+    this run, its sum is the exact amount OpenRouter billed, so we promote it to
+    the headline ``total_cost_usd`` and scale the input/output/cache breakdown to
+    match.  The pre-existing per-stage figure is preserved as
+    ``total_cost_usd_attributed`` for diagnostics / reconciliation.
+
+    Returns ``summary`` unchanged when no actual OpenRouter billing was captured
+    (Alibaba coding-plan runs, fully-estimated runs, or unit tests that never
+    feed the interceptor), so prior behaviour is preserved bit-for-bit.
+    """
+    if not isinstance(summary, dict):
+        return summary
+    try:
+        billed_total = float(get_openrouter_billed_total())
+        billed_count = int(get_openrouter_billed_count())
+    except Exception:
+        # Names unavailable (e.g. helper invoked before namespace wiring) or any
+        # other failure: never let cost reconciliation break the run.
+        return summary
+    if billed_count <= 0 or not (billed_total > 0.0):
+        return summary
+    reconciled = dict(summary)
+    try:
+        attributed = float(reconciled.get("total_cost_usd", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        attributed = 0.0
+    # Scale the per-direction breakdown to the authoritative total so the parts
+    # still sum to the headline; skip when there is nothing to scale against.
+    if attributed > 0.0:
+        scale = billed_total / attributed
+        for _key in ("input_cost_usd", "output_cost_usd", "cache_cost_usd"):
+            try:
+                reconciled[_key] = float(reconciled.get(_key, 0.0) or 0.0) * scale
+            except (TypeError, ValueError):
+                pass
+    reconciled["total_cost_usd"] = billed_total
+    reconciled["total_cost_usd_billed"] = billed_total
+    reconciled["total_cost_usd_attributed"] = attributed
+    reconciled["billed_request_count"] = billed_count
+    reconciled["cost_source"] = "openrouter_api"
+    return reconciled
 
 
 def _sync_librarian_debug_snapshot(run_snapshot: "RunSnapshot") -> None:
@@ -1716,7 +1768,7 @@ def main() -> None:
                             run_snapshot.outputs["gate_decision"] = _model_to_dict(gate_decision)
                             _sync_librarian_debug_snapshot(run_snapshot)
                             run_snapshot.finished_at = datetime.now().isoformat()
-                            run_snapshot.cost_summary = get_cost_accountant().get_summary()
+                            run_snapshot.cost_summary = _reconcile_cost_summary_with_billing(get_cost_accountant().get_summary())
                             _update_budget_state(budget_policy, run_snapshot)
                             _snapshot_record_stage(
                                 run_snapshot,
@@ -1736,7 +1788,7 @@ def main() -> None:
                                 language_hint=language_hint,
                             )
                             if args.cost_report:
-                                cost_summary = get_cost_accountant().get_summary()
+                                cost_summary = _reconcile_cost_summary_with_billing(get_cost_accountant().get_summary())
                                 print("\n=== COST REPORT ===")
                                 print(to_json_str(cost_summary))
                             sys.exit(2)
@@ -1871,7 +1923,7 @@ def main() -> None:
         )
         _sync_librarian_debug_snapshot(run_snapshot)
         run_snapshot.finished_at = datetime.now().isoformat()
-        run_snapshot.cost_summary = get_cost_accountant().get_summary()
+        run_snapshot.cost_summary = _reconcile_cost_summary_with_billing(get_cost_accountant().get_summary())
         _update_budget_state(budget_policy, run_snapshot)
         run_status = "completed"
         run_failure_type = FailureType.NONE
@@ -1915,7 +1967,7 @@ def main() -> None:
 
         # Print cost report if requested
         if args.cost_report:
-            cost_summary = get_cost_accountant().get_summary()
+            cost_summary = _reconcile_cost_summary_with_billing(get_cost_accountant().get_summary())
             cost_source = cost_summary.get("cost_source", "estimated")
             print("\n=== COST REPORT ===")
 
@@ -1993,7 +2045,7 @@ def main() -> None:
         try:
             _sync_librarian_debug_snapshot(run_snapshot)
             run_snapshot.finished_at = datetime.now().isoformat()
-            run_snapshot.cost_summary = get_cost_accountant().get_summary()
+            run_snapshot.cost_summary = _reconcile_cost_summary_with_billing(get_cost_accountant().get_summary())
             _update_budget_state(budget_policy, run_snapshot)
             _snapshot_record_stage(
                 run_snapshot,
@@ -2366,7 +2418,7 @@ def save_project_output(
             cost_summary_payload = cs_attr
     if cost_summary_payload is None:
         try:
-            live_summary = get_cost_accountant().get_summary()
+            live_summary = _reconcile_cost_summary_with_billing(get_cost_accountant().get_summary())
             if (
                 isinstance(live_summary, dict)
                 and int(live_summary.get("total_executions") or 0) > 0
