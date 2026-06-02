@@ -122,6 +122,10 @@ celery>=5.0
 python-telegram-bot>=20.0
 discord.py>=2.0
 
+# --- Optional — Tavily web search provider ----------------------------------
+# Install if using LIBRARIAN_EXTRA_PROVIDERS=...,tavily
+tavily-python>=0.3
+
 # notion_export.py: Notion API integration
 # (uses stdlib urllib — no extra dep required)
 
