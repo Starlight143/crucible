@@ -8,7 +8,7 @@ silo (the v1.1.7 behaviour).
 Query classes (CLAUDE.md plan):
 
 * ``general``  — broad web search.  Order: websearch (DDG html→lite)
-  → searxng → wikipedia (definitional baseline).
+  → tavily → searxng → wikipedia (definitional baseline).
 * ``code``     — code / repository search.  Order: github → websearch
   with ``site:github.com`` (grep_app removed from v1.1.10 defaults — Vercel
   Bot Protection serves a JS PoW challenge to unauthenticated clients; it is
@@ -59,7 +59,7 @@ LOGGER = get_logger(__name__)
 # ``LIBRARIAN_EXTRA_PROVIDERS`` (extras list) — providers NOT in those
 # lists are silently dropped from the chain.
 _DEFAULT_CHAIN_BY_CLASS: Dict[str, List[str]] = {
-    "general": ["websearch", "searxng", "wikipedia"],
+    "general": ["websearch", "tavily", "searxng", "wikipedia"],
     # v1.1.10 removed grep_app from the default provider list (Vercel Bot
     # Protection serves a JS PoW challenge to unauthenticated HTTP clients).
     # It is intentionally absent from the default chain here; operators who
@@ -91,6 +91,7 @@ _EXTRA_PROVIDERS = frozenset(
         "crossref",
         "wikipedia",
         "searxng",
+        "tavily",
     ]
 )
 
