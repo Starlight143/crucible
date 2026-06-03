@@ -1015,40 +1015,20 @@ class LocalJSONLBackend:
         return list(_STREAM_FILENAMES.keys())
 
 
-# ── Cloudflare backend stub (planned for v1.2+) ──────────────────────────────
-
-class CloudflareBackend:
-    """Stub for the future Cloudflare Workers + D1 + R2 backend.
-
-    Construction always raises ``NotImplementedError`` in v1.1.0.  The class
-    and its docstring exist so that:
-
-    1. The architectural seam is visible — anyone scanning ``backends.py``
-       sees exactly where the cloud variant will plug in.
-    2. The HTTP contract is documented in this module's top docstring; the
-       Worker can be implemented against that contract without coordination.
-    3. Setting ``CRUCIBLE_RUN_INSIGHTS_BACKEND=cloudflare`` fails immediately
-       at startup with a clear pointer rather than silently falling back to
-       local storage (which would let an operator believe they are uploading
-       to the cloud while data sits on disk).
-    """
-
-    def __init__(self, *, api_url: str, api_token: str, **_kw: Any) -> None:
-        raise NotImplementedError(
-            "CloudflareBackend is planned for v1.2.0. "
-            "See crucible/features/run_insights/backends.py module docstring "
-            "for the D1 / R2 / Workers contract. "
-            "v1.1.0 supports CRUCIBLE_RUN_INSIGHTS_BACKEND=local only."
-        )
-
+# ── Cloud backends (v1.2.0) ───────────────────────────────────────────────────
 
 class DualWriteBackend:
-    """Stub for a future "local + cloud" dual-write backend.
+    """Local durable JSONL + asynchronous cloud sync (v1.2.0).
 
-    Same fail-fast pattern as :class:`CloudflareBackend`.  When implemented
-    in v1.2.0+, this backend will write to ``LocalJSONLBackend`` synchronously
-    (durability guarantee) and enqueue async batches to ``CloudflareBackend``
-    (cloud sync).  A cloud-side failure must never block the local write.
+    :meth:`write_event` persists to a :class:`LocalJSONLBackend` synchronously
+    (the durability guarantee, with fsync) and then wakes a background daemon
+    that batches un-synced events to the Cloudflare Worker.  The network is
+    **never** touched on the calling thread, so a slow / down cloud never
+    blocks the pipeline.  Local data is never lost to the cloud being behind:
+    :meth:`prune_stream` refuses to trim below the un-synced high-water mark.
+
+    Reads, blobs, and the on-disk layout are delegated to the local backend
+    unchanged.  The cloud sync machinery lives in :mod:`.cloud_sync`.
     """
 
     def __init__(
@@ -1058,16 +1038,147 @@ class DualWriteBackend:
         api_url: str,
         api_token: str,
         inline_max_bytes: int = 4096,
+        timeout_seconds: float = 10.0,
+        max_retries: int = 3,
+        flush_seconds: float = 30.0,
+        batch_size: int = 100,
+        auto_start: bool = True,
         **_kw: Any,
     ) -> None:
-        # Keyword-only signature documents the exact construction
-        # ``make_backend`` already performs (root/api_url/api_token/
-        # inline_max_bytes) so the future v1.2.0 implementation has a
-        # contract to fill in.  Still fail-fast until implemented (v1.1.11).
-        raise NotImplementedError(
-            "DualWriteBackend is planned for v1.2.0. "
-            "v1.1.0 supports CRUCIBLE_RUN_INSIGHTS_BACKEND=local only."
+        if not api_url or not api_token:
+            raise ValueError(
+                "CRUCIBLE_RUN_INSIGHTS_BACKEND=dual/cloudflare requires both "
+                "CRUCIBLE_RUN_INSIGHTS_API_URL and CRUCIBLE_RUN_INSIGHTS_API_TOKEN"
+            )
+        # Lazy import keeps the cloud-sync module (and its urllib machinery) out
+        # of the import graph for local-only operators.
+        try:
+            from .cloud_sync import CloudSyncClient, CloudSyncWorker, _CURSOR_FILENAME
+        except ImportError:  # pragma: no cover — flat-launcher fallback
+            from features.run_insights.cloud_sync import (  # type: ignore[no-redef]
+                CloudSyncClient,
+                CloudSyncWorker,
+                _CURSOR_FILENAME,
+            )
+
+        self._local = LocalJSONLBackend(root, inline_max_bytes=inline_max_bytes)
+        # Surface the local init-failure flag so the recorder factory can fall
+        # back to ``_NullRecorder`` exactly as it does for the local backend.
+        self._init_failed = getattr(self._local, "_init_failed", False)
+        self._closed = False
+        self._auto_start = bool(auto_start)
+
+        client = CloudSyncClient(
+            api_url=api_url,
+            api_token=api_token,
+            timeout_seconds=timeout_seconds,
         )
+        self._sync = CloudSyncWorker(
+            local_backend=self._local,
+            client=client,
+            cursor_path=self._local.root / _CURSOR_FILENAME,
+            flush_seconds=flush_seconds,
+            max_retries=max_retries,
+            batch_size=batch_size,
+        )
+
+    # -- write path (never blocks on the network) -------------------------------
+    def write_event(self, stream: str, event: Mapping[str, Any]) -> str:
+        if self._closed:
+            return ""
+        content_id = self._local.write_event(stream, event)
+        if content_id:
+            if self._auto_start:
+                self._sync.start()  # lazy: first real write spins up the daemon
+            self._sync.notify()
+        return content_id
+
+    def write_blob(self, content_id: str, payload: bytes) -> str:
+        return self._local.write_blob(content_id, payload)
+
+    def read_blob(self, content_id: str) -> Optional[bytes]:
+        return self._local.read_blob(content_id)
+
+    def read_events(
+        self,
+        stream: str,
+        *,
+        since: Optional[str] = None,
+        cursor: Optional[str] = None,
+        limit: int = 100,
+    ) -> Tuple[List[dict], Optional[str]]:
+        return self._local.read_events(stream, since=since, cursor=cursor, limit=limit)
+
+    # -- prune respects the un-synced high-water mark ---------------------------
+    def prune_stream(self, stream: str, max_entries: int) -> int:
+        if self._closed or max_entries < 0:
+            return 0
+        try:
+            unsynced = self._sync.unsynced_count(stream)
+        except Exception:  # noqa: BLE001
+            # Be conservative on error: never shrink below the configured cap.
+            unsynced = max_entries
+        if unsynced > max_entries:
+            self._sync.warn_backlog_once(stream, unsynced)
+        effective = max(int(max_entries), int(unsynced))
+        return self._local.prune_stream(stream, effective)
+
+    # -- lifecycle --------------------------------------------------------------
+    def flush(self) -> None:
+        self._local.flush()
+        try:
+            self._sync.request_flush_now()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            self._sync.flush_and_stop()
+        except Exception:  # noqa: BLE001
+            pass
+        self._local.close()
+
+    # -- introspection ----------------------------------------------------------
+    @property
+    def root(self) -> Path:
+        return self._local.root
+
+    def list_streams(self) -> List[str]:
+        return self._local.list_streams()
+
+
+class CloudflareBackend(DualWriteBackend):
+    """Cloud-primary backend (v1.2.0).
+
+    A local durable copy is always maintained (required so writes never block
+    on the network), so the write / sync path is **identical** to
+    :class:`DualWriteBackend`.  The only difference is the read path:
+    :meth:`read_events` queries the Worker and falls back to the local ledger
+    only when the cloud is unreachable, so a fresh machine can see the global
+    ledger.  Operators who want purely-local reads should use
+    ``CRUCIBLE_RUN_INSIGHTS_BACKEND=dual``.
+    """
+
+    def read_events(
+        self,
+        stream: str,
+        *,
+        since: Optional[str] = None,
+        cursor: Optional[str] = None,
+        limit: int = 100,
+    ) -> Tuple[List[dict], Optional[str]]:
+        try:
+            events, nxt = self._sync.client.get_events(
+                stream, since=since, cursor=cursor, limit=limit
+            )
+            if events is not None:  # None ⇒ cloud unreachable / non-2xx
+                return events, nxt
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.debug("cloudflare read_events fell back to local: %s", exc)
+        return self._local.read_events(stream, since=since, cursor=cursor, limit=limit)
 
 
 # ── Backend factory ──────────────────────────────────────────────────────────
@@ -1079,30 +1190,44 @@ def make_backend(
     inline_max_bytes: int = 4096,
     api_url: str = "",
     api_token: str = "",
+    timeout_seconds: float = 10.0,
+    max_retries: int = 3,
+    flush_seconds: float = 30.0,
+    batch_size: int = 100,
 ) -> StorageBackend:
     """Construct the backend named by *backend* (``local``/``cloudflare``/``dual``).
 
     * ``local``: returns :class:`LocalJSONLBackend`.
-    * ``cloudflare`` / ``dual``: raises ``NotImplementedError`` via the stubs.
+    * ``dual``: returns :class:`DualWriteBackend` (local durable + async cloud
+      sync).  Requires *api_url* + *api_token*.
+    * ``cloudflare``: returns :class:`CloudflareBackend` (same write/sync as
+      ``dual`` with cloud-primary reads).  Requires *api_url* + *api_token*.
 
-    Unrecognised values raise ``ValueError`` (no silent fallback to local —
-    a typo in ``CRUCIBLE_RUN_INSIGHTS_BACKEND`` must be loud, not buried).
+    ``dual`` / ``cloudflare`` with a missing url/token raise ``ValueError``
+    (loud config error — the recorder factory translates that into a graceful
+    local-only fallback so recording is never silently dropped).  Unrecognised
+    values raise ``ValueError`` (a typo in ``CRUCIBLE_RUN_INSIGHTS_BACKEND``
+    must be loud, not buried).
     """
     name = (backend or "local").strip().lower()
     if name == "local":
         return LocalJSONLBackend(root, inline_max_bytes=inline_max_bytes)
-    if name == "cloudflare":
+    if name in ("cloudflare", "dual"):
         if not api_url or not api_token:
-            raise NotImplementedError(
-                "CRUCIBLE_RUN_INSIGHTS_BACKEND=cloudflare requires both "
-                "CRUCIBLE_RUN_INSIGHTS_API_URL and CRUCIBLE_RUN_INSIGHTS_API_TOKEN "
-                "to be set, AND the backend itself is not yet implemented in v1.1.0."
+            raise ValueError(
+                f"CRUCIBLE_RUN_INSIGHTS_BACKEND={name} requires both "
+                "CRUCIBLE_RUN_INSIGHTS_API_URL and CRUCIBLE_RUN_INSIGHTS_API_TOKEN"
             )
-        return CloudflareBackend(api_url=api_url, api_token=api_token)  # type: ignore[return-value]
-    if name == "dual":
-        return DualWriteBackend(  # type: ignore[return-value]
-            root=root, api_url=api_url, api_token=api_token,
+        cls = CloudflareBackend if name == "cloudflare" else DualWriteBackend
+        return cls(  # type: ignore[return-value]
+            root=root,
+            api_url=api_url,
+            api_token=api_token,
             inline_max_bytes=inline_max_bytes,
+            timeout_seconds=timeout_seconds,
+            max_retries=max_retries,
+            flush_seconds=flush_seconds,
+            batch_size=batch_size,
         )
     raise ValueError(
         f"unknown CRUCIBLE_RUN_INSIGHTS_BACKEND={backend!r}; "

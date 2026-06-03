@@ -199,13 +199,19 @@ class TestFFWarnFlagDecoupled:
         assert "_warned_unknown_decision" in gv_src
         assert "_warned_unknown_reason" not in gv_src
 
-    def test_dual_write_backend_keyword_only_signature(self):
+    def test_dual_write_backend_keyword_only_signature(self, tmp_path):
         from crucible.features.run_insights.backends import DualWriteBackend, make_backend
         params = inspect.signature(DualWriteBackend.__init__).parameters
         for kw in ("root", "api_url", "api_token", "inline_max_bytes"):
             assert kw in params
-        with pytest.raises(NotImplementedError):
-            make_backend("dual", root="x", api_url="http://h", api_token="t")
+        # v1.2.0: dual is implemented — constructs instead of raising.  Use a
+        # tmp root so no stray directory is created in the CWD.
+        backend = make_backend("dual", root=tmp_path / "x",
+                               api_url="https://h.workers.dev", api_token="t")
+        try:
+            assert isinstance(backend, DualWriteBackend)
+        finally:
+            backend.close()
 
 
 # ───────────────────────────── F-G: web research + infra ────────────────────

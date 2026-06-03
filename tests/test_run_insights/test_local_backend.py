@@ -163,26 +163,38 @@ def test_make_backend_local(tmp_path: Path):
     assert isinstance(backend, LocalJSONLBackend)
 
 
-def test_make_backend_cloudflare_stub_raises(tmp_path: Path):
-    import pytest as _p
-    with _p.raises(NotImplementedError):
-        make_backend(
-            "cloudflare",
-            root=tmp_path / "x",
-            api_url="https://example.workers.dev",
-            api_token="dummy",
-        )
+def test_make_backend_cloudflare_constructs(tmp_path: Path):
+    # v1.2.0: cloudflare is implemented — make_backend now returns a
+    # CloudflareBackend (cloud-primary reads) instead of raising.
+    from crucible.features.run_insights.backends import CloudflareBackend
+    backend = make_backend(
+        "cloudflare",
+        root=tmp_path / "x",
+        api_url="https://example.workers.dev",
+        api_token="dummy",
+    )
+    try:
+        assert isinstance(backend, CloudflareBackend)
+    finally:
+        backend.close()
 
 
 def test_make_backend_cloudflare_missing_url_token_raises(tmp_path: Path):
-    with pytest.raises(NotImplementedError):
+    # v1.2.0: missing url/token is a loud config error (ValueError); the
+    # recorder factory translates it into a graceful local-only fallback.
+    with pytest.raises(ValueError):
         make_backend("cloudflare", root=tmp_path / "x")
 
 
-def test_make_backend_dual_stub_raises(tmp_path: Path):
-    with pytest.raises(NotImplementedError):
-        make_backend("dual", root=tmp_path / "x",
-                     api_url="x", api_token="y")
+def test_make_backend_dual_constructs(tmp_path: Path):
+    # v1.2.0: dual is implemented — make_backend returns a DualWriteBackend.
+    from crucible.features.run_insights.backends import DualWriteBackend
+    backend = make_backend("dual", root=tmp_path / "x",
+                           api_url="https://h.workers.dev", api_token="y")
+    try:
+        assert isinstance(backend, DualWriteBackend)
+    finally:
+        backend.close()
 
 
 def test_make_backend_unknown_raises(tmp_path: Path):

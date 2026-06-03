@@ -1059,29 +1059,66 @@ def _build_default_recorder() -> Any:
     # Anchor the local backend's root: if it's a bare directory name, place
     # it under the repo root (parent of the ``crucible`` package), not the
     # current working directory of whatever spawned the process.
+    # Anchor a relative ledger root under the repo root (not the spawning
+    # process CWD) for EVERY backend — dual/cloudflare keep a local durable
+    # copy and must anchor identically to the local backend.
+    root_path = root
+    if not os.path.isabs(root):
+        # crucible/features/run_insights/recorder.py → repo root is 3 up
+        here = os.path.dirname(os.path.abspath(__file__))
+        repo_root = os.path.dirname(os.path.dirname(os.path.dirname(here)))
+        root_path = os.path.join(repo_root, root)
+
     if backend_name == "local":
-        root_path = root
-        if not os.path.isabs(root):
-            # crucible/features/run_insights/recorder.py → repo root is 3 up
-            here = os.path.dirname(os.path.abspath(__file__))
-            repo_root = os.path.dirname(os.path.dirname(os.path.dirname(here)))
-            root_path = os.path.join(repo_root, root)
         backend = make_backend(
-            backend_name,
+            "local",
             root=root_path,
             inline_max_bytes=inline_max,
         )
+    elif backend_name in ("dual", "cloudflare"):
+        if not api_url or not api_token:
+            # Misconfigured cloud backend — degrade to a durable local-only
+            # ledger rather than dropping recording entirely.  Loud, not
+            # silent: the operator gets a clear one-line warning.
+            LOGGER.warning(
+                "run_insights: BACKEND=%s but CRUCIBLE_RUN_INSIGHTS_API_URL / "
+                "_API_TOKEN are not both set; falling back to a local-only "
+                "ledger (no cloud sync).",
+                backend_name,
+            )
+            backend = make_backend("local", root=root_path, inline_max_bytes=inline_max)
+        else:
+            api_timeout = env_int(
+                "CRUCIBLE_RUN_INSIGHTS_API_TIMEOUT_SECONDS", 10,
+                clamp_min=1, clamp_max=300,
+            )
+            api_retries = env_int(
+                "CRUCIBLE_RUN_INSIGHTS_API_MAX_RETRIES", 3,
+                clamp_min=0, clamp_max=10,
+            )
+            api_flush = env_int(
+                "CRUCIBLE_RUN_INSIGHTS_API_BATCH_FLUSH_SECONDS", 30,
+                clamp_min=1, clamp_max=3600,
+            )
+            api_batch = env_int(
+                "CRUCIBLE_RUN_INSIGHTS_API_BATCH_SIZE", 100,
+                clamp_min=1, clamp_max=500,
+            )
+            backend = make_backend(
+                backend_name,
+                root=root_path,
+                inline_max_bytes=inline_max,
+                api_url=api_url,
+                api_token=api_token,
+                timeout_seconds=api_timeout,
+                max_retries=api_retries,
+                flush_seconds=api_flush,
+                batch_size=api_batch,
+            )
     else:
-        # Cloudflare / dual stubs — surface NotImplementedError without
-        # taking the recorder down.  Operator setting an unimplemented
-        # backend gets a clear error at construction time.
-        backend = make_backend(
-            backend_name,
-            root=root,
-            inline_max_bytes=inline_max,
-            api_url=api_url,
-            api_token=api_token,
-        )
+        # Unknown backend name → make_backend raises ValueError (loud); the
+        # outer get_recorder() try/except substitutes _NullRecorder.
+        backend = make_backend(backend_name, root=root_path, inline_max_bytes=inline_max)
 
     # v1.1.0 fourth-pass (F-6): if the backend signalled init failure
     # (e.g. read-only filesystem, permission denied, root is a
