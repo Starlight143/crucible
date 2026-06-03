@@ -1,0 +1,46 @@
+# Crucible Run Insights — Cloudflare Worker (v1.2.0 cloud backend, Phase 0)
+#
+# Cloud half of the Run Insights ledger.  The Python client
+# (DualWriteBackend, Phase 1) writes locally for durability and
+# asynchronously batches events to this Worker.  The contract — D1 schema,
+# R2 object layout, HTTP API, and the canonical-JSON algorithm — is FROZEN
+# in:
+#     crucible/features/run_insights/backends.py   (module docstring)
+# and the canonical-JSON byte-parity is pinned on BOTH sides by:
+#     cloudflare/insights-worker/test/canonical.test.js   (this project)
+#     tests/test_run_insights/test_js_canonical_parity.py (Python repo)
+# Changing the algorithm on one side without the other silently breaks
+# cloud-side content_id dedup.  Run `npm test` here AND pytest there.
+
+name = "crucible-insights"
+main = "src/index.js"
+compatibility_date = "2024-09-23"
+
+[vars]
+# Inline payload cutoff — MUST equal the client's
+# CRUCIBLE_RUN_INSIGHTS_INLINE_MAX_BYTES (default 4096).  Events whose full
+# JSON exceeds this are spilled to R2; smaller events are stored inline in D1.
+INLINE_MAX_BYTES = "4096"
+# Largest number of events accepted per POST /v1/insights/batch.  Each event
+# that spills to R2 costs one subrequest; the Workers free plan caps
+# subrequests at 50 per invocation (1000 on paid).  Keep batches small enough
+# that (R2 spills + 1 D1 batch) stays under your plan's limit.
+MAX_BATCH_SIZE = "100"
+
+# D1 — indexed metadata store.  Create with `npm run db:create`, then paste
+# the printed database_id below.  Apply schema with `npm run db:migrate:remote`.
+[[d1_databases]]
+binding = "DB"
+database_name = "crucible_insights"
+database_id = "REPLACE_WITH_d1_database_id"
+migrations_dir = "migrations"
+
+# R2 — blob store for payloads above INLINE_MAX_BYTES.  Create with
+# `npx wrangler r2 bucket create crucible-insights-blobs`.
+[[r2_buckets]]
+binding = "BLOBS"
+bucket_name = "crucible-insights-blobs"
+
+# Secret (NOT stored here — set with `npx wrangler secret put`):
+#     CRUCIBLE_RUN_INSIGHTS_API_TOKEN
+# For local `wrangler dev`, copy .dev.vars.example to .dev.vars (gitignored).

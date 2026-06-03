@@ -1,0 +1,5 @@
+# Copy this file to `.dev.vars` for local `wrangler dev`.  `.dev.vars` is
+# gitignored.  The value MUST match the token the Python client sends as
+# CRUCIBLE_RUN_INSIGHTS_API_TOKEN (and what you set in production via
+# `wrangler secret put CRUCIBLE_RUN_INSIGHTS_API_TOKEN`).
+CRUCIBLE_RUN_INSIGHTS_API_TOKEN=dev-local-token

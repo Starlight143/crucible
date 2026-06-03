@@ -1,0 +1,23 @@
+{
+  "name": "crucible-insights-worker",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Cloudflare Worker + D1 + R2 cloud backend for the Crucible Run Insights ledger (v1.2.0, Phase 0).",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "test": "node --test \"test/**/*.test.js\"",
+    "smoke": "node scripts/smoke.mjs",
+    "db:create": "wrangler d1 create crucible_insights",
+    "db:migrate:local": "wrangler d1 migrations apply crucible_insights --local",
+    "db:migrate:remote": "wrangler d1 migrations apply crucible_insights --remote",
+    "tail": "wrangler tail"
+  },
+  "devDependencies": {
+    "wrangler": "^3.80.0"
+  }
+}
