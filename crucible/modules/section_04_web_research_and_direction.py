@@ -40,6 +40,7 @@ if __package__ == "crucible.modules":
         search_crossref as _v118_search_crossref,
         search_openalex as _v118_search_openalex,
         search_searxng as _v118_search_searxng,
+        search_tavily as _v118_search_tavily,
         search_wikipedia as _v118_search_wikipedia,
     )
     from ..web_research.search_cache import SearchCache as _V118_SearchCache
@@ -76,6 +77,7 @@ else:  # pragma: no cover - direct script fallback
         search_crossref as _v118_search_crossref,
         search_openalex as _v118_search_openalex,
         search_searxng as _v118_search_searxng,
+        search_tavily as _v118_search_tavily,
         search_wikipedia as _v118_search_wikipedia,
     )
     from web_research.search_cache import SearchCache as _V118_SearchCache  # type: ignore[no-redef]
@@ -3682,6 +3684,16 @@ def _collect_librarian_search_materials(
                         )
                     elif provider_name == "searxng":
                         _query_results = _v118_search_searxng(
+                            query,
+                            limit=LIBRARIAN_MAX_RESULTS_PER_QUERY,
+                            timeout_seconds=float(LIBRARIAN_HTTP_TIMEOUT_SECONDS),
+                        )
+                    elif provider_name == "tavily":
+                        # v1.1.13 — opt-in Tavily Search API provider.  Routes
+                        # through web_research.providers.search_tavily, which
+                        # uses the SSRF-checked safe_http_json helper and
+                        # honours LIBRARIAN_HTTP_TIMEOUT_SECONDS.
+                        _query_results = _v118_search_tavily(
                             query,
                             limit=LIBRARIAN_MAX_RESULTS_PER_QUERY,
                             timeout_seconds=float(LIBRARIAN_HTTP_TIMEOUT_SECONDS),

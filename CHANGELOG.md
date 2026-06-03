@@ -5,6 +5,62 @@ Versioning follows [Semantic Versioning](https://semver.org/). The first public 
 
 ---
 
+## [v1.1.13] — 2026-06-03
+
+Optional Tavily web-search provider, added as a clean in-house reimplementation
+instead of merging two automated third-party bot PRs (#5, #6). Tavily is an
+opt-in `general`-class fallback that sits between DuckDuckGo and SearXNG. Default
+is OFF — it activates only when `TAVILY_API_KEY` holds a real value **and**
+`tavily` is added to `LIBRARIAN_EXTRA_PROVIDERS`; otherwise behaviour is
+unchanged bit-for-bit. All changes are additive — no env default flipped, no
+public schema or CLI flag changed.
+
+### Added
+- **Tavily Search provider** (`crucible/web_research/providers/tavily.py`) —
+  follows the package's unified `search_<provider>` contract (up to `limit`
+  `ResearchCitation`s, `[]` on any error, never raises for routine failures).
+  Unlike the rejected bot PRs it adds **zero new dependencies**: the request is a
+  `POST` through the existing SSRF-checked `safe_http_json` helper (per-host
+  circuit breaker + manual-redirect validation), and
+  `LIBRARIAN_HTTP_TIMEOUT_SECONDS` is forwarded so a hung call cannot blow the
+  stage budget. The key is resolved with the same placeholder hygiene as
+  `_resolve_context7_token` (`replace_*`/`your_*`/`xxxx*`/`placeholder*`/
+  `changeme*` → treated as unset, so a copied `.env.example` never sends a
+  sentinel to the live API).
+- **`TAVILY_API_KEY`** env key with full Settings sync — uncommented (filterable)
+  placeholder in `.env.example`, `librarian_auth` group membership in
+  `SETTINGS_SCHEMA`, and a bilingual `type:'password'` `KEY_META` entry, so the
+  value is masked by the backend `_mask_secret_env` (the key matches the
+  `api.?key` secret pattern) and rendered as a password field. Registered in
+  `providers.PROVIDERS`, `fallback._EXTRA_PROVIDERS`, and the section_04
+  dispatcher (both tri-modal import blocks).
+- **`tests/test_v1_1_13_provider_tavily.py`** — 36 pins: behaviour contract,
+  key-placeholder filtering, result parsing / URL-scheme filtering, POST request
+  shape + forwarded timeout + bounded body + stable circuit-breaker name,
+  no-SDK / no-new-dependency structural guards, registry + fallback-chain +
+  opt-in-filtering wiring, section_04 dispatch/import pins, and the 3-layer
+  Settings sync.
+
+### Changed
+- **`general` fallback-chain ordering** is now `websearch → tavily → searxng →
+  wikipedia`. `tavily` is filtered out of the resolved chain unless explicitly
+  enabled, so with default extras the effective chain is unchanged. The existing
+  exact-match `test_v118_fallback_chain` general-chain assertion still holds.
+
+### Validation
+- `python -m pytest tests/ -q` → **3 311 passed, 2 skipped** (+36 from the new
+  file; prior v1.1.12 baseline 3 275 / 2). `smoke_test.py` 5/5; pipeline
+  `--self-check` OK.
+- `crucible.__version__` / `pyproject.toml` lock-step bumped to 1.1.13.
+
+### Compatibility
+- Drop-in for v1.1.12. No new runtime dependency. With Tavily not enabled (the
+  default), the librarian dispatch, fallback chain, and citation pool are
+  byte-for-byte identical to v1.1.12. Removing `tavily` from
+  `LIBRARIAN_EXTRA_PROVIDERS` fully disables it at any time.
+
+---
+
 ## [v1.1.12] — 2026-06-01
 
 Cost-accuracy release: the headline `total_cost_usd` (the `--cost-report` console

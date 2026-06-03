@@ -45,6 +45,7 @@ except ImportError:  # pragma: no cover - flat-launcher fallback
 from .crossref import search_crossref
 from .openalex import search_openalex
 from .searxng import search_searxng
+from .tavily import search_tavily
 from .wikipedia import search_wikipedia
 
 
@@ -56,6 +57,7 @@ PROVIDERS: Dict[str, SearchFunction] = {
     "crossref": search_crossref,
     "wikipedia": search_wikipedia,
     "searxng": search_searxng,
+    "tavily": search_tavily,
 }
 
 
@@ -81,5 +83,6 @@ __all__ = [
     "search_crossref",
     "search_openalex",
     "search_searxng",
+    "search_tavily",
     "search_wikipedia",
 ]

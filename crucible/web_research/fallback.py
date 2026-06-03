@@ -8,7 +8,10 @@ silo (the v1.1.7 behaviour).
 Query classes (CLAUDE.md plan):
 
 * ``general``  — broad web search.  Order: websearch (DDG html→lite)
-  → searxng → wikipedia (definitional baseline).
+  → tavily → searxng → wikipedia (definitional baseline).  ``tavily`` is
+  opt-in (requires TAVILY_API_KEY + ``tavily`` in LIBRARIAN_EXTRA_PROVIDERS);
+  it is filtered out of the chain whenever it is not enabled, so the default
+  order collapses back to websearch → searxng → wikipedia.
 * ``code``     — code / repository search.  Order: github → websearch
   with ``site:github.com`` (grep_app removed from v1.1.10 defaults — Vercel
   Bot Protection serves a JS PoW challenge to unauthenticated clients; it is
@@ -59,7 +62,11 @@ LOGGER = get_logger(__name__)
 # ``LIBRARIAN_EXTRA_PROVIDERS`` (extras list) — providers NOT in those
 # lists are silently dropped from the chain.
 _DEFAULT_CHAIN_BY_CLASS: Dict[str, List[str]] = {
-    "general": ["websearch", "searxng", "wikipedia"],
+    # v1.1.13: ``tavily`` sits between websearch and searxng — a higher-quality
+    # general fallback than public SearXNG instances.  It is opt-in, so
+    # ``build_chain_for_query`` drops it from the chain unless the operator
+    # adds ``tavily`` to LIBRARIAN_EXTRA_PROVIDERS (and sets TAVILY_API_KEY).
+    "general": ["websearch", "tavily", "searxng", "wikipedia"],
     # v1.1.10 removed grep_app from the default provider list (Vercel Bot
     # Protection serves a JS PoW challenge to unauthenticated HTTP clients).
     # It is intentionally absent from the default chain here; operators who
@@ -91,6 +98,7 @@ _EXTRA_PROVIDERS = frozenset(
         "crossref",
         "wikipedia",
         "searxng",
+        "tavily",
     ]
 )
 
