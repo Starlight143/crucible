@@ -102,15 +102,19 @@ async function main() {
   let body = await r.json();
   check('POST batch (gzip) → ingested 3', body.ingested === 3, JSON.stringify(body));
 
-  // 7) large payload → R2 spill, then read back the full event
+  // 7) large payload (> inline limit) → stored (R2 spill if R2 is bound, else
+  //    inline in D1), then read back the full event losslessly either way.
   const big = await stamp(baseEvent({ payload: { blob: 'x'.repeat(6000) } }));
   res = await postEvent(big);
-  check('POST large payload → ok', res.body.ok === true);
+  check('POST large payload → ok', res.body.ok === true, JSON.stringify(res.body));
   r = await fetch(`${BASE}/v1/insights/events/${encodeURIComponent(big.content_id)}`, {
     headers: authHeaders,
   });
   body = await r.json();
-  check('GET big event has payload_r2_key', !!body.payload_r2_key);
+  check(
+    'GET big event stored (inline or R2)',
+    !!(body.payload_inline || body.payload_r2_key)
+  );
   check(
     'GET big event reconstructs full payload',
     body.event && body.event.payload && body.event.payload.blob?.length === 6000

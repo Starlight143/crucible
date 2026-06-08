@@ -28,6 +28,7 @@ truthy coercion), matching the project's env-bool whitelist rule.
 """
 from __future__ import annotations
 
+import atexit
 import os
 import threading
 from typing import Any, Dict, List, Mapping, Optional, Tuple
@@ -1215,6 +1216,32 @@ if hasattr(os, "register_at_fork"):
         os.register_at_fork(after_in_child=_reset_recorder_after_fork)
     except Exception:  # noqa: BLE001 — register_at_fork can fail on rare interp builds
         pass
+
+
+def _flush_recorder_at_exit() -> None:
+    """``atexit`` hook: drain the cloud-sync tail on a clean interpreter exit.
+
+    The background cloud-sync worker is a *daemon* thread, so without this the
+    final batch of a run would not upload until the *next* run resumed from the
+    persisted cursor.  Closing the process-global recorder triggers
+    :meth:`backends.DualWriteBackend.close` →
+    :meth:`cloud_sync.CloudSyncWorker.flush_and_stop`, a bounded best-effort
+    final flush.  Local-only / no-op recorders close cheaply with nothing to
+    send, and a forked child has already had ``_RECORDER`` reset to ``None`` by
+    :func:`_reset_recorder_after_fork`, so it no-ops there.  Never raises —
+    ``atexit`` handlers must stay silent during shutdown, and any un-synced
+    events remain durable in the local ledger regardless.
+    """
+    rec = _RECORDER
+    if rec is None:
+        return
+    try:
+        rec.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
+atexit.register(_flush_recorder_at_exit)
 
 
 __all__ = [

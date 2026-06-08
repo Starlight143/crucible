@@ -5,6 +5,137 @@ Versioning follows [Semantic Versioning](https://semver.org/). The first public 
 
 ---
 
+## [v1.2.0] — Unreleased
+
+Cloud backend for the Run Insights ledger — a **Cloudflare Worker + D1** mirror
+of the local JSONL ledger (**R2 optional**, see below). The local ledger stays
+the **source of truth**
+(synchronous fsync on the hot path); a background daemon asynchronously batches
+un-synced events to the Worker, which dedups on `content_id`
+(`INSERT OR IGNORE`) so at-least-once delivery becomes effectively-once storage.
+Cloud failure only delays sync — it never blocks the pipeline and never drops
+local data. Default is unchanged (`CRUCIBLE_RUN_INSIGHTS_BACKEND=local`); the
+cloud path is inert unless an operator opts in with `dual`/`cloudflare` plus an
+API URL + token. All changes are additive.
+
+> **Not yet released.** Staged locally pending a real-world soak;
+> `crucible.__version__` / `pyproject.toml` remain `1.1.13`. This entry documents
+> the work-in-progress so the history is not lost.
+
+### Added — Cloudflare Worker (Phase 0, `cloudflare/insights-worker/`)
+- Self-contained Worker (`wrangler.toml`, `package.json` — the only
+  devDependency is `wrangler`, Node ≥ 20) backed by a **D1** database
+  (`crucible_insights`, indexed metadata + the full event JSON stored inline).
+  **R2 is optional** and ships commented-out: the Worker auto-detects the `BLOBS`
+  binding — present ⇒ events above `INLINE_MAX_BYTES` (4096) spill to
+  `crucible-insights-blobs`; absent (**the default — so deploy needs no credit
+  card**) ⇒ every event stores inline in D1, with an event above a safe per-value
+  ceiling (`D1_VALUE_CEILING`, ~950 KB) rejected so it never breaks the batch (it
+  stays in the durable local ledger).
+- `migrations/0001_init.sql` — the frozen `insight_events` schema (`content_id`
+  `PRIMARY KEY`) plus four query indexes, idempotent (`IF NOT EXISTS`).
+- `src/canonical.js` — the **frozen** `canonicalJson` + `contentId` algorithm,
+  byte-identical to the Python side; parity is pinned on both sides
+  (`test/canonical.test.js`: 17 fixtures + 3 cross-language `sha256` anchors, and
+  `tests/test_run_insights/test_js_canonical_parity.py`).
+- `src/auth.js` (constant-time Bearer check, fail-closed when no token is
+  configured), `src/ingest.js` (validate → recompute `content_id` tamper-check →
+  inline-or-R2 routing → `INSERT OR IGNORE`, storing the **full** event JSON
+  losslessly), and `src/index.js` (router: unauthed `GET /` + `/health`;
+  Bearer-gated `POST /v1/insights/events|batch` with gzip, `GET
+  /v1/insights/events` with a stable `(ts, content_id)` cursor,
+  `…/events/:content_id`, and `…/runs/:run_id/summary`). All D1 queries are
+  parameterised via `.bind()` — no string-built SQL.
+- `scripts/smoke.mjs` — a zero-dependency end-to-end check (auth, ingest, dedup,
+  tamper rejection, gzip batch, large-payload store + read-back, query, summary)
+  and a `README.md` deploy guide.
+
+### Added — Python cloud client (Phase 1)
+- `crucible/features/run_insights/cloud_sync.py` — `CloudSyncClient`
+  (`http(s)`-only, redirects **not** followed, bearer token never logged, gzip
+  `post_batch`, `health`, `get_events`/`get_event`) and `CloudSyncWorker` (a
+  daemon that drains the local ledger, persists a per-stream `(ts, content_id)`
+  cursor for crash-safe resume, and exposes an exact `unsynced_count`).
+- `backends.py` — real `DualWriteBackend` (writes persist locally and nudge the
+  daemon; the hot path **never** posts to the cloud) and `CloudflareBackend`
+  (cloud-primary reads with local fallback). `prune_stream` refuses to trim below
+  the un-synced high-water mark, so events are never deleted before upload.
+  `make_backend` gained `timeout_seconds` / `max_retries` / `flush_seconds` /
+  `batch_size`; `dual`/`cloudflare` without an API URL + token now raise
+  `ValueError`.
+- `recorder.py` — the factory reads the new tuning env vars and **degrades to a
+  local backend with a one-time warning** if `dual`/`cloudflare` is selected
+  without an API URL/token (a misconfigured ledger must never break a run).
+- Six `CRUCIBLE_RUN_INSIGHTS_API_*` env keys (`_URL`, `_TOKEN`,
+  `_TIMEOUT_SECONDS`, `_MAX_RETRIES`, `_BATCH_FLUSH_SECONDS`, `_BATCH_SIZE`) with
+  full 3-layer Settings sync (uncommented in `.env.example`; `run_insights` group
+  in `SETTINGS_SCHEMA`; bilingual `KEY_META`, with `_TOKEN` masked as a
+  password). `CRUCIBLE_RUN_INSIGHTS_BACKEND` options are now
+  `local`/`dual`/`cloudflare`.
+
+### Added — clean-exit final flush (Phase 1 follow-up)
+- The background sync daemon is a `daemon` thread, so the **last** batch of a run
+  previously waited for the *next* run's cursor-resume to upload.
+  `CloudSyncWorker.flush_and_stop` now performs a **bounded, single-attempt final
+  flush before** signalling stop — it must precede `_stop`, or `_flush_stream` /
+  `_post_with_retry` early-out on `if self._stop` and nothing flushes. The drain
+  holds the flush lock (no race with the daemon), uses `max_retries=0`, and is
+  wall-clock budgeted, so a clean exit stays responsive even when the cloud is
+  unreachable (anything un-synced stays durable locally and resumes next run).
+- `recorder.py` registers an `atexit` hook that closes the process-global
+  recorder on clean shutdown → `DualWriteBackend.close` → the final flush. It is
+  guarded against `None` / disabled / forked-child / no-op recorders and never
+  raises during shutdown.
+
+### Security — Worker request hardening
+- **Bounded body / gzip-bomb guard.** `index.js` reads the (optionally gzip'd)
+  request body through a streaming reader that aborts once the *decoded* size
+  exceeds `MAX_BATCH_BYTES` (default 8 MiB), returning HTTP 413 — a small gzip
+  bomb can no longer inflate to gigabytes and exhaust Worker memory. Applies to
+  the single-event and batch endpoints (`readBodyText` / `BodyTooLargeError`).
+  Defense-in-depth on the authenticated endpoints that also caps the blast radius
+  if the bearer token leaks.
+- Audited the full Cloudflare-facing surface: D1 queries fully parameterised (no
+  SQL injection); auth fail-closed + constant-time; `content_id` recomputed
+  server-side (tamper → 422); no CORS + Bearer-only (no CSRF); the Python client
+  refuses 3xx redirects and never logs the token (no token-exfil). No
+  unauthenticated write/DoS path beyond static liveness.
+
+### Tests
+- `tests/test_v1_2_0_cloud_backend.py` — **38** pins: HTTP client
+  (gzip/auth/`http(s)`-only/no-redirect/non-2xx → `None`), worker
+  flush/cursor/partial-failure/resume, the **never-block** write path and the
+  **prune-respects-unsynced** data-safety invariant, the clean-exit final flush
+  (drains + advances the cursor, single attempt on failure, swallows client
+  errors, no re-send on a second call, `close()` drains and is idempotent),
+  `make_backend` + recorder-factory degrade wiring, the 3-layer Settings sync,
+  and structural producer→consumer pins (CLAUDE.md §9.6).
+- Worker (`cloudflare/insights-worker/`, `node --test`) — **34** checks:
+  canonical/`content_id` parity (incl. cross-language anchors),
+  `test/ingest.test.js` (R2-optional routing: D1-only inline, oversized reject,
+  R2 spill when bound, tamper reject), and `test/body_limit.test.js` (bounded
+  reader: under/over cap, gzip-bomb rejected by decoded size).
+
+### Validation
+- `python -m pytest tests/test_v1_2_0_cloud_backend.py -q` → **38 passed**;
+  `tests/test_run_insights/` + cloud + `tests/test_v1_1_11_regressions.py` →
+  **270 passed**. (Full-suite figure deferred to the release run; the prior
+  Phase 1 full suite was 3 340 passed / 2 skipped and the +9 new tests are
+  additive.)
+- Worker: `npm test` → **34 checks** green. Deployed to a live account
+  (**D1-only**, no R2); `npm run smoke` → **12/12** green against the deployed
+  URL; a live ~9 MiB gzip-bomb returned **413** (DoS guard verified end-to-end);
+  D1 rows confirmed, then test data purged so the ledger starts clean.
+
+### Compatibility
+- Drop-in for v1.1.13. With the default `local` backend the entire cloud path is
+  dead code — no new runtime dependency is imported, the hot write path is
+  unchanged, and the daemon's normal retry behaviour is untouched (the new
+  `max_retries` parameter defaults to the configured value). Opt in by setting
+  `CRUCIBLE_RUN_INSIGHTS_BACKEND=dual` + `…_API_URL` + `…_API_TOKEN`.
+
+---
+
 ## [v1.1.13] — 2026-06-03
 
 Optional Tavily web-search provider, added as a clean in-house reimplementation

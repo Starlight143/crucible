@@ -8,6 +8,13 @@
 import { contentId } from './canonical.js';
 
 const INLINE_DEFAULT = 4096;
+// D1-only safety ceiling.  When no R2 bucket is bound (the default, no-credit-
+// card deployment), the full event JSON is stored inline in D1.  Cloudflare D1
+// caps a single column value at ~1 MB, so an event larger than this conservative
+// bound is rejected (kept in the durable local ledger, the source of truth)
+// rather than failing the whole D1 insert.  Real insight events are a few KB —
+// this is pure defense-in-depth.
+const D1_VALUE_CEILING = 950_000;
 const VALID_STREAMS = new Set(['output', 'error', 'debate', 'params']);
 const REQUIRED = [
   'stream',
@@ -31,8 +38,11 @@ const REQUIRED = [
 
 /**
  * Validate, canonicalise, and build the D1 insert for one event.
- * Performs the R2 put inline when the full event exceeds the inline limit.
- * @param {{ DB: any, BLOBS: any, INLINE_MAX_BYTES?: string }} env
+ * Storage routing (R2 is OPTIONAL):
+ *   • R2 bound (env.BLOBS) AND full event > INLINE_MAX_BYTES → spill to R2.
+ *   • otherwise → store the full JSON inline in D1 (rejected if it exceeds the
+ *     D1 per-value ceiling, so an oversized event never fails the whole batch).
+ * @param {{ DB: any, BLOBS?: any, INLINE_MAX_BYTES?: string }} env
  * @param {Record<string, unknown>} ev
  * @returns {Promise<PreparedEvent>}
  */
@@ -65,12 +75,18 @@ export async function prepareEvent(env, ev) {
 
   let payloadInline = null;
   let payloadR2Key = null;
-  if (fullBytes > inlineMax) {
+  if (env.BLOBS && fullBytes > inlineMax) {
+    // R2 configured → spill large payloads (unbounded size).
     payloadR2Key = `insights/${ev.run_id}/${cid}.json`;
     // R2 put is content-addressed → re-putting identical bytes is idempotent.
     await env.BLOBS.put(payloadR2Key, fullJson, {
       httpMetadata: { contentType: 'application/json' },
     });
+  } else if (fullBytes > D1_VALUE_CEILING) {
+    // D1-only (no R2) and too large to store inline safely.  Reject just this
+    // event so the rest of the batch still commits; it stays in the durable
+    // local ledger (the source of truth) and is simply not mirrored to D1.
+    return { ok: false, reason: 'payload_too_large_no_r2', bytes: fullBytes };
   } else {
     payloadInline = fullJson;
   }

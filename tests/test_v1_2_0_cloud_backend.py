@@ -126,6 +126,17 @@ class _FlakyClient:
         return False
 
 
+class _CountingFailClient:
+    """Counts post attempts; always fails (pins shutdown single-attempt drain)."""
+
+    def __init__(self):
+        self.calls = 0
+
+    def post_batch(self, events):
+        self.calls += 1
+        return False
+
+
 # ── CloudSyncClient ─────────────────────────────────────────────────────────
 
 class TestCloudSyncClient:
@@ -262,6 +273,49 @@ class TestCloudSyncWorker:
         # Cursor row pruned away → re-send the whole window (Worker dedups).
         assert CloudSyncWorker._after_cursor(events, "missing") == events
 
+    # -- shutdown final flush (v1.2.0 atexit drain) -----------------------------
+    def test_flush_and_stop_drains_and_advances(self, tmp_path):
+        client = _FakeClient()
+        local, worker = self._worker(tmp_path, client, batch_size=2)
+        for i in range(3):
+            _write(local, f"sha256:{i}", f"2026-01-01T00:00:00.00{i}Z")
+        worker.flush_and_stop()
+        posted = [e["content_id"] for batch in client.batches for e in batch]
+        assert posted == ["sha256:0", "sha256:1", "sha256:2"]
+        assert worker.unsynced_count("output") == 0
+        assert worker._cursor["output"]["content_id"] == "sha256:2"
+
+    def test_flush_and_stop_single_attempt_on_failure(self, tmp_path):
+        # The daemon retries (max_retries=3), but the shutdown drain must make
+        # exactly ONE attempt per pending stream so a clean exit stays snappy
+        # when the cloud is down.
+        client = _CountingFailClient()
+        local, worker = self._worker(tmp_path, client, max_retries=3)
+        _write(local, "sha256:1", "2026-01-01T00:00:00.001Z")
+        worker.flush_and_stop()
+        assert client.calls == 1
+        assert worker.unsynced_count("output") == 1  # untouched → resumes next run
+
+    def test_flush_and_stop_swallows_client_error(self, tmp_path):
+        class _BoomClient:
+            def post_batch(self, events):
+                raise RuntimeError("network down")
+
+        local, worker = self._worker(tmp_path, _BoomClient(), max_retries=2)
+        _write(local, "sha256:1", "2026-01-01T00:00:00.001Z")
+        worker.flush_and_stop()  # must not raise
+        assert worker.unsynced_count("output") == 1
+
+    def test_flush_and_stop_second_call_does_not_resend(self, tmp_path):
+        client = _FakeClient()
+        local, worker = self._worker(tmp_path, client)
+        _write(local, "sha256:1", "2026-01-01T00:00:00.001Z")
+        worker.flush_and_stop()
+        assert worker.unsynced_count("output") == 0
+        client.batches.clear()
+        worker.flush_and_stop()  # cursor already advanced → nothing to re-send
+        assert client.batches == []
+
 
 # ── DualWriteBackend ─────────────────────────────────────────────────────────
 
@@ -348,6 +402,38 @@ class TestDualWriteBackend:
             assert [e["content_id"] for e in events2] == ["sha256:local"]
         finally:
             backend.close()
+
+    def test_close_flushes_tail_to_cloud(self, tmp_path):
+        # The crux of the v1.2.0 atexit drain: events written with the daemon
+        # not started are still un-synced when close() runs; close() must drain
+        # them to the cloud rather than stranding them for the next run.
+        backend = DualWriteBackend(
+            root=tmp_path / "led", api_url="https://x.workers.dev",
+            api_token="t", auto_start=False,
+        )
+        fake = _FakeClient()
+        backend._sync.client = fake
+        backend.write_event("output", _event("sha256:1", "2026-01-01T00:00:00.001Z"))
+        backend.write_event("output", _event("sha256:2", "2026-01-01T00:00:00.002Z"))
+        assert fake.batches == []  # nothing synced yet (no daemon; hot path never posts)
+        backend.close()
+        posted = [e["content_id"] for batch in fake.batches for e in batch]
+        assert posted == ["sha256:1", "sha256:2"]
+
+    def test_close_is_idempotent_after_flush(self, tmp_path):
+        backend = DualWriteBackend(
+            root=tmp_path / "led", api_url="https://x.workers.dev",
+            api_token="t", auto_start=False,
+        )
+        fake = _FakeClient()
+        backend._sync.client = fake
+        backend.write_event("output", _event("sha256:1", "2026-01-01T00:00:00.001Z"))
+        backend.close()
+        first = [e["content_id"] for batch in fake.batches for e in batch]
+        backend.close()  # _closed guard → no second drain, no re-send
+        second = [e["content_id"] for batch in fake.batches for e in batch]
+        assert first == ["sha256:1"]
+        assert second == first
 
 
 # ── make_backend wiring ──────────────────────────────────────────────────────
@@ -468,3 +554,23 @@ class TestStructuralWiring:
     def test_prune_stream_respects_unsynced(self):
         src = inspect.getsource(DualWriteBackend.prune_stream)
         assert "unsynced_count" in src and "max(" in src
+
+    def test_flush_and_stop_final_flush_precedes_stop(self):
+        # The final drain MUST run before _stop is set, else _flush_stream and
+        # _post_with_retry early-out on `if self._stop` and nothing flushes.
+        src = inspect.getsource(CloudSyncWorker.flush_and_stop)
+        assert "_final_flush" in src
+        assert src.index("_final_flush") < src.index("self._stop = True")
+
+    def test_final_flush_is_single_attempt_and_locked(self):
+        src = inspect.getsource(CloudSyncWorker._final_flush)
+        assert "max_retries=0" in src  # one attempt per stream on shutdown
+        assert "_flush_lock" in src    # serialised against the daemon flush pass
+
+    def test_recorder_registers_atexit_flush(self):
+        from crucible.features.run_insights import recorder as rec
+        mod_src = inspect.getsource(rec)
+        assert "import atexit" in mod_src
+        assert "atexit.register(" in mod_src
+        fn_src = inspect.getsource(rec._flush_recorder_at_exit)
+        assert ".close()" in fn_src and "_RECORDER" in fn_src

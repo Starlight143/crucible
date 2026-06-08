@@ -17,29 +17,40 @@ main = "src/index.js"
 compatibility_date = "2024-09-23"
 
 [vars]
-# Inline payload cutoff — MUST equal the client's
-# CRUCIBLE_RUN_INSIGHTS_INLINE_MAX_BYTES (default 4096).  Events whose full
-# JSON exceeds this are spilled to R2; smaller events are stored inline in D1.
+# Inline payload cutoff — only relevant when the OPTIONAL R2 binding below is
+# enabled: events whose full JSON exceeds this spill to R2, smaller ones store
+# inline in D1.  With R2 disabled (the default) every event stores inline in D1
+# regardless, up to D1's per-value ceiling (see src/ingest.js: D1_VALUE_CEILING).
 INLINE_MAX_BYTES = "4096"
 # Largest number of events accepted per POST /v1/insights/batch.  Each event
 # that spills to R2 costs one subrequest; the Workers free plan caps
 # subrequests at 50 per invocation (1000 on paid).  Keep batches small enough
 # that (R2 spills + 1 D1 batch) stays under your plan's limit.
 MAX_BATCH_SIZE = "100"
+# Hard cap on the DECODED (post-gunzip) request-body size in bytes (default
+# 8 MiB).  Rejects gzip bombs / oversized batches with HTTP 413 before they can
+# exhaust Worker memory.  Raise only if you legitimately send very large batches.
+MAX_BATCH_BYTES = "8388608"
 
 # D1 — indexed metadata store.  Create with `npm run db:create`, then paste
 # the printed database_id below.  Apply schema with `npm run db:migrate:remote`.
 [[d1_databases]]
 binding = "DB"
 database_name = "crucible_insights"
-database_id = "REPLACE_WITH_d1_database_id"
+database_id = "876c0271-05bc-4990-b22a-e2f0fde518c2"
 migrations_dir = "migrations"
 
-# R2 — blob store for payloads above INLINE_MAX_BYTES.  Create with
-# `npx wrangler r2 bucket create crucible-insights-blobs`.
-[[r2_buckets]]
-binding = "BLOBS"
-bucket_name = "crucible-insights-blobs"
+# R2 — OPTIONAL blob store for payloads above INLINE_MAX_BYTES.  Disabled by
+# default so the Worker deploys on the no-credit-card free tier (Workers + D1
+# only); insight events are a few KB and store inline in D1.  R2 requires a
+# payment method on file even for its free allowance.  To enable unbounded
+# payload spillover later: add a card, run
+# `npx wrangler r2 bucket create crucible-insights-blobs`, then uncomment the
+# three lines below and redeploy.  The Worker auto-detects the BLOBS binding
+# (src/ingest.js): present ⇒ spill large events to R2, absent ⇒ inline in D1.
+# [[r2_buckets]]
+# binding = "BLOBS"
+# bucket_name = "crucible-insights-blobs"
 
 # Secret (NOT stored here — set with `npx wrangler secret put`):
 #     CRUCIBLE_RUN_INSIGHTS_API_TOKEN

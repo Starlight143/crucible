@@ -301,19 +301,63 @@ class CloudSyncWorker:
         self.notify()
 
     def flush_and_stop(self, timeout: float = 5.0) -> None:
-        """Signal the daemon to stop and join it.
+        """Best-effort final drain, then stop the daemon and join it.
 
-        Un-synced events remain in the durable local ledger and sync on the
-        next run (the cursor resumes), so this never needs to block on the
-        network.  Best-effort: a daemon mid-request is bounded by the per-
-        request HTTP timeout and then abandoned (it is a daemon thread).
+        Called on clean shutdown (``DualWriteBackend.close`` ← the recorder
+        ``atexit`` hook in ``recorder.py``).  A bounded, single-attempt final
+        flush runs *first* — while ``_stop`` is still ``False`` so
+        :meth:`_flush_stream` / :meth:`_post_with_retry` do not early-out — so
+        the last batch of a run reaches the cloud now instead of waiting for
+        the next run's cursor-resume.  The drain is time-budgeted and never
+        retries (at most one per-request HTTP timeout per stream), so a clean
+        exit stays responsive even when the cloud is unreachable.  Anything
+        still un-synced remains durable in the local ledger and syncs on the
+        next run, so this never needs to fully succeed and never raises.
         """
+        try:
+            self._final_flush(budget_seconds=max(0.0, float(timeout)))
+        except Exception as exc:  # noqa: BLE001 — shutdown must never raise
+            LOGGER.debug("cloud sync: final flush errored: %s", exc)
         with self._cv:
             self._stop = True
             self._cv.notify_all()
         t = self._thread
         if t is not None:
             t.join(timeout=timeout)
+
+    def _final_flush(self, *, budget_seconds: float) -> None:
+        """Single-attempt, time-budgeted drain of every stream in the caller's
+        thread.  Used only by :meth:`flush_and_stop` on shutdown.
+
+        Holds ``_flush_lock`` so it never races a concurrent daemon flush pass
+        (the daemon's :meth:`_flush_all` acquires the same lock non-blocking and
+        skips when it is held).  Unlike the daemon path it passes
+        ``max_retries=0`` and stops once the wall-clock budget is exhausted, so
+        it cannot hang the process on an unreachable cloud.  Every error is
+        swallowed — the local ledger is the source of truth.
+        """
+        # Bound the wait for the lock too: if the daemon is mid-flush it is
+        # already making progress, so let it, and let any tail resume on the
+        # next run rather than blocking exit.
+        if budget_seconds <= 0.0:
+            acquired = self._flush_lock.acquire(blocking=False)
+        else:
+            acquired = self._flush_lock.acquire(timeout=min(2.0, budget_seconds))
+        if not acquired:
+            return
+        try:
+            deadline = time.monotonic() + budget_seconds
+            for stream in _STREAMS:
+                if time.monotonic() >= deadline:
+                    break
+                try:
+                    self._flush_stream(stream, max_retries=0)
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.debug(
+                        "cloud sync: final flush %s failed: %s", stream, exc
+                    )
+        finally:
+            self._flush_lock.release()
 
     # -- run loop ---------------------------------------------------------------
     def _run(self) -> None:
@@ -396,7 +440,7 @@ class CloudSyncWorker:
         )
 
     # -- flush one stream -------------------------------------------------------
-    def _flush_stream(self, stream: str) -> None:
+    def _flush_stream(self, stream: str, max_retries: Optional[int] = None) -> None:
         pending = self._pending(stream)
         if not pending:
             return
@@ -405,7 +449,7 @@ class CloudSyncWorker:
             if self._stop:
                 break
             chunk = pending[i : i + self._batch_size]
-            if not self._post_with_retry(chunk):
+            if not self._post_with_retry(chunk, max_retries=max_retries):
                 with self._lock:
                     self._consecutive_failures += 1
                 self.warn_backlog_once(stream, len(pending) - sent)
@@ -419,8 +463,11 @@ class CloudSyncWorker:
                 self._consecutive_failures = 0
                 self._backlog_warned = False
 
-    def _post_with_retry(self, chunk: List[dict]) -> bool:
-        for attempt in range(self._max_retries + 1):
+    def _post_with_retry(
+        self, chunk: List[dict], max_retries: Optional[int] = None
+    ) -> bool:
+        mr = self._max_retries if max_retries is None else max(0, int(max_retries))
+        for attempt in range(mr + 1):
             if self._stop:
                 return False
             try:
@@ -428,7 +475,7 @@ class CloudSyncWorker:
                     return True
             except Exception as exc:  # noqa: BLE001
                 LOGGER.debug("cloud sync: post attempt %d failed: %s", attempt, exc)
-            if attempt < self._max_retries and not self._stop:
+            if attempt < mr and not self._stop:
                 time.sleep(min(2 ** attempt, 8))
         return False
 
