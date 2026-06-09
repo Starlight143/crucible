@@ -5,7 +5,7 @@ Versioning follows [Semantic Versioning](https://semver.org/). The first public 
 
 ---
 
-## [v1.2.0] — Unreleased
+## [v1.2.0] — 2026-06-09
 
 Cloud backend for the Run Insights ledger — a **Cloudflare Worker + D1** mirror
 of the local JSONL ledger (**R2 optional**, see below). The local ledger stays
@@ -17,10 +17,6 @@ Cloud failure only delays sync — it never blocks the pipeline and never drops
 local data. Default is unchanged (`CRUCIBLE_RUN_INSIGHTS_BACKEND=local`); the
 cloud path is inert unless an operator opts in with `dual`/`cloudflare` plus an
 API URL + token. All changes are additive.
-
-> **Not yet released.** Staged locally pending a real-world soak;
-> `crucible.__version__` / `pyproject.toml` remain `1.1.13`. This entry documents
-> the work-in-progress so the history is not lost.
 
 ### Added — Cloudflare Worker (Phase 0, `cloudflare/insights-worker/`)
 - Self-contained Worker (`wrangler.toml`, `package.json` — the only
@@ -119,9 +115,9 @@ API URL + token. All changes are additive.
 ### Validation
 - `python -m pytest tests/test_v1_2_0_cloud_backend.py -q` → **38 passed**;
   `tests/test_run_insights/` + cloud + `tests/test_v1_1_11_regressions.py` →
-  **270 passed**. (Full-suite figure deferred to the release run; the prior
-  Phase 1 full suite was 3 340 passed / 2 skipped and the +9 new tests are
-  additive.)
+  **270 passed**. Full suite (`python -m pytest tests -q -p no:cacheprovider`) →
+  **3 349 passed, 2 skipped** in 272.8 s — the 2 skips are the documented optional
+  ones (`SyntheticGoldenRun` missing `run_meta.json`; `h2` not installed).
 - Worker: `npm test` → **34 checks** green. Deployed to a live account
   (**D1-only**, no R2); `npm run smoke` → **12/12** green against the deployed
   URL; a live ~9 MiB gzip-bomb returned **413** (DoS guard verified end-to-end);
