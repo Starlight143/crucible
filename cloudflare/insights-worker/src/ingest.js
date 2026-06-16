@@ -4,8 +4,15 @@
 // prepareEvent() does everything EXCEPT executing the D1 statement: it returns
 // the bound statement so the caller can either run it directly (single event)
 // or hand many to env.DB.batch() (batch endpoint, one transaction).
+//
+// Phase A: the caller passes an `attribution` ({contributorId, trustState})
+// resolved SERVER-SIDE from the authenticated token — never from client input —
+// so every row records who contributed it and whether it is quarantined.  The
+// serialized JSON is also scanned for leaked secrets (validate.js) as a cloud-
+// side backstop to the client's own redaction.
 
 import { contentId } from './canonical.js';
+import { scanForSecrets } from './validate.js';
 
 const INLINE_DEFAULT = 4096;
 // D1-only safety ceiling.  When no R2 bucket is bound (the default, no-credit-
@@ -16,6 +23,7 @@ const INLINE_DEFAULT = 4096;
 // this is pure defense-in-depth.
 const D1_VALUE_CEILING = 950_000;
 const VALID_STREAMS = new Set(['output', 'error', 'debate', 'params']);
+const VALID_TRUST_STATES = new Set(['approved', 'staged']);
 const REQUIRED = [
   'stream',
   'ts',
@@ -25,6 +33,12 @@ const REQUIRED = [
   'kind',
   'schema_version',
 ];
+
+/**
+ * @typedef {Object} Attribution
+ * @property {string|null} [contributorId]  server-resolved contributor id (never client-supplied)
+ * @property {'approved'|'staged'} [trustState]  'approved' for owner/admin, 'staged' for third-party
+ */
 
 /**
  * @typedef {Object} PreparedEvent
@@ -42,11 +56,14 @@ const REQUIRED = [
  *   • R2 bound (env.BLOBS) AND full event > INLINE_MAX_BYTES → spill to R2.
  *   • otherwise → store the full JSON inline in D1 (rejected if it exceeds the
  *     D1 per-value ceiling, so an oversized event never fails the whole batch).
+ * The event is additionally stamped with the server-resolved attribution
+ * (contributor_id + trust_state); these are NEVER read from the event body.
  * @param {{ DB: any, BLOBS?: any, INLINE_MAX_BYTES?: string }} env
  * @param {Record<string, unknown>} ev
+ * @param {Attribution} [attribution]
  * @returns {Promise<PreparedEvent>}
  */
-export async function prepareEvent(env, ev) {
+export async function prepareEvent(env, ev, attribution = {}) {
   if (!ev || typeof ev !== 'object' || Array.isArray(ev)) {
     return { ok: false, reason: 'invalid_event' };
   }
@@ -73,6 +90,12 @@ export async function prepareEvent(env, ev) {
   const fullJson = JSON.stringify(ev);
   const fullBytes = new TextEncoder().encode(fullJson).length;
 
+  // Cloud-side secret backstop: never store a leaked credential.
+  const secret = scanForSecrets(fullJson);
+  if (secret) {
+    return { ok: false, reason: 'secret_detected' };
+  }
+
   let payloadInline = null;
   let payloadR2Key = null;
   if (env.BLOBS && fullBytes > inlineMax) {
@@ -96,12 +119,19 @@ export async function prepareEvent(env, ev) {
       ? ev.outcome
       : {};
 
+  // Server-side attribution (never trust the client for these).
+  const contributorId =
+    typeof attribution.contributorId === 'string' ? attribution.contributorId : null;
+  const trustState = VALID_TRUST_STATES.has(attribution.trustState)
+    ? attribution.trustState
+    : 'approved';
+
   const stmt = env.DB.prepare(
     `INSERT OR IGNORE INTO insight_events
        (content_id, stream, ts, run_id, project_name, mode, kind, stage,
         schema_version, payload_inline, payload_r2_key, env_fingerprint,
-        outcome_status, outcome_score)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        outcome_status, outcome_score, contributor_id, trust_state)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
   ).bind(
     cid,
     ev.stream,
@@ -118,7 +148,9 @@ export async function prepareEvent(env, ev) {
     typeof outcome.status === 'string' ? outcome.status : null,
     typeof outcome.score === 'number' && Number.isFinite(outcome.score)
       ? outcome.score
-      : null
+      : null,
+    contributorId,
+    trustState
   );
 
   return { ok: true, content_id: cid, r2: payloadR2Key, stmt };

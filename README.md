@@ -61,6 +61,32 @@ Then double-click `launch_webui.bat` (Windows) — the browser opens automatical
 - [**Alibaba Coding Plan**](https://help.aliyun.com/zh/model-studio/) — token-only cost tracking
 - **Or run [Ollama](https://ollama.ai) locally** — set `LLM_PROVIDER=ollama`; no key needed, zero ongoing cost
 
+<details>
+<summary><b>How do I get an API key?</b></summary>
+
+- **OpenRouter (recommended):** create an account at [openrouter.ai](https://openrouter.ai/) → **Keys** → **Create Key** → copy it → paste it into Crucible's Settings page (or set `OPENROUTER_API_KEY` in your `.env`). Add credit to use paid models; several models have free tiers.
+- **Alibaba Coding Plan:** sign up at [Model Studio](https://help.aliyun.com/zh/model-studio/), create an API key, paste it in Settings.
+- **Ollama (no key):** install [Ollama](https://ollama.ai), `ollama pull <model>`, set `LLM_PROVIDER=ollama` — fully local, no key, no per-token cost.
+
+Your provider key stays in your local `.env`; Crucible only ever sends it to the provider you chose.
+</details>
+
+<details>
+<summary><b>Optional: contribute to / read the shared cloud insight corpus</b></summary>
+
+Crucible can mirror its run-insight ledger to a shared, Cloudflare-backed corpus so contributors accumulate signal together. This is **opt-in and access is by request** — it is **not** required to run Crucible (the default backend keeps everything on your own disk).
+
+Request an **ingest** token (contribute your runs) or a **read** token (fetch the distilled summaries) via the [issue tracker](https://github.com/Starlight143/crucible/issues). You'll be given a token to put in `.env`:
+
+```bash
+CRUCIBLE_RUN_INSIGHTS_BACKEND=dual
+CRUCIBLE_RUN_INSIGHTS_API_URL=<the Worker URL you are given>
+CRUCIBLE_RUN_INSIGHTS_API_TOKEN=<your issued token>
+```
+
+Ingest tokens are write-only (you cannot read others' raw data); read tokens only ever see curated, distilled output.
+</details>
+
 That's it. Pick a mode, type your idea (or paste a project path), hit Run.
 
 <details>
