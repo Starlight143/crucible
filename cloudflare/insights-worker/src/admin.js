@@ -9,7 +9,7 @@
 
 import { sha256Hex } from './auth.js';
 
-const VALID_SCOPES = new Set(['ingest', 'read', 'admin']);
+const VALID_SCOPES = new Set(['ingest', 'read', 'admin', 'contributor']);
 
 /**
  * Lowercase hex of `nBytes` cryptographically-random bytes.
@@ -197,6 +197,97 @@ export async function rejectEvents(env, sel = {}) {
     .bind(...sel.contentIds)
     .run();
   return { ok: true, rejected: changes(res) };
+}
+
+/**
+ * Hard-delete events by content_id(s), run_id, or contributor_id — regardless of
+ * trust_state.  This is the ADMIN-only delete, distinct from rejectEvents (which
+ * only removes 'staged' rows): the operator can remove ANYTHING, including
+ * already-approved corpus rows.  When R2 is bound, the spilled payload objects
+ * for the matched rows are deleted first (best-effort) so no orphan blobs leak.
+ * Exactly one selector is honoured (content_ids, then run_id, then contributor).
+ * @param {{ DB: any, BLOBS?: any }} env
+ * @param {{ contentIds?: string[], runId?: string, contributorId?: string }} sel
+ */
+export async function deleteEvents(env, sel = {}) {
+  let where = null;
+  let binds = [];
+  if (Array.isArray(sel.contentIds) && sel.contentIds.length) {
+    where = `content_id IN (${sel.contentIds.map(() => '?').join(',')})`;
+    binds = sel.contentIds.slice();
+  } else if (typeof sel.runId === 'string' && sel.runId) {
+    where = 'run_id = ?';
+    binds = [sel.runId];
+  } else if (typeof sel.contributorId === 'string' && sel.contributorId) {
+    where = 'contributor_id = ?';
+    binds = [sel.contributorId];
+  } else {
+    return { ok: false, reason: 'nothing_specified' };
+  }
+
+  // Best-effort R2 cleanup for the matched rows (only relevant when BLOBS is
+  // bound; the default D1-only deployment stores everything inline in D1).
+  if (env.BLOBS) {
+    try {
+      const keysRes = await env.DB.prepare(
+        `SELECT payload_r2_key FROM insight_events
+           WHERE ${where} AND payload_r2_key IS NOT NULL`
+      )
+        .bind(...binds)
+        .all();
+      for (const row of (keysRes && keysRes.results) || []) {
+        if (row && row.payload_r2_key) {
+          try {
+            await env.BLOBS.delete(row.payload_r2_key);
+          } catch {
+            /* ignore individual blob delete failures */
+          }
+        }
+      }
+    } catch {
+      /* ignore — still delete the D1 rows below */
+    }
+  }
+
+  const res = await env.DB.prepare(`DELETE FROM insight_events WHERE ${where}`)
+    .bind(...binds)
+    .run();
+  return { ok: true, deleted: changes(res) };
+}
+
+/**
+ * Corpus-wide counts for the admin console: total + first/last ts and breakdowns
+ * by stream, trust_state, mode, and top contributors.  Unlike the contributor-
+ * facing corpus.js stats this spans ALL trust_states and exposes contributor_id.
+ * @param {{ DB: any }} env
+ */
+export async function eventStats(env) {
+  const totals = await env.DB.prepare(
+    'SELECT COUNT(*) AS total, MIN(ts) AS first_ts, MAX(ts) AS last_ts FROM insight_events'
+  ).first();
+  const group = async (col) => {
+    const res = await env.DB.prepare(
+      `SELECT ${col} AS k, COUNT(*) AS n FROM insight_events
+         GROUP BY ${col} ORDER BY n DESC LIMIT 200`
+    ).all();
+    return (res && res.results) || [];
+  };
+  const [byStream, byTrust, byMode, byContributor] = await Promise.all([
+    group('stream'),
+    group('trust_state'),
+    group('mode'),
+    group('contributor_id'),
+  ]);
+  return {
+    ok: true,
+    total: (totals && totals.total) || 0,
+    first_ts: (totals && totals.first_ts) || null,
+    last_ts: (totals && totals.last_ts) || null,
+    by_stream: byStream,
+    by_trust_state: byTrust,
+    by_mode: byMode,
+    by_contributor: byContributor,
+  };
 }
 
 /**

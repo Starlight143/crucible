@@ -2,33 +2,41 @@
 //
 // Implements the FROZEN HTTP API (backends.py module docstring) plus the Phase A
 // opening-up surface (see OPENING_UP.md):
-//   GET  /                                         liveness (no auth)
+//   GET  /                                         signup page (HTML, no auth)
+//   GET  /console                                  admin console (HTML, no auth; token entered client-side)
 //   GET  /health                                   liveness (no auth)
-//   POST /v1/insights/events                       flat body {event:{...}}   (ingest|admin)
-//   POST /v1/insights/batch                        gzip body {events:[...]}  (ingest|admin)
-//   GET  /v1/insights/distilled?kind=              distilled artifacts       (read|admin)
+//   GET  /oauth/github/start                       begin GitHub OAuth signup (no auth)
+//   GET  /oauth/github/callback                    finish OAuth → issue contributor token (no auth)
+//   POST /v1/insights/events                       flat body {event:{...}}   (ingest|contributor|admin)
+//   POST /v1/insights/batch                        gzip body {events:[...]}  (ingest|contributor|admin)
+//   GET  /v1/insights/distilled?kind=              distilled artifacts       (read|contributor|admin)
+//   GET  /v1/insights/corpus/stats                 aggregate corpus counts   (read|contributor|admin)
+//   GET  /v1/insights/corpus?...                   metadata rows, no payload (read|contributor|admin)
 //   GET  /v1/insights/events?...                   raw query                 (admin)
 //   GET  /v1/insights/events/:content_id           raw single               (admin)
 //   GET  /v1/insights/runs/:run_id/summary         run summary              (admin)
+//   GET  /v1/admin/stats                           corpus-wide counts        (admin)
 //   POST /v1/admin/tokens                          issue token              (admin)
 //   GET  /v1/admin/tokens                          list tokens              (admin)
 //   POST /v1/admin/tokens/:token_id/revoke         revoke token             (admin)
 //   GET  /v1/admin/staged?limit=&cursor=           list staged events       (admin)
 //   POST /v1/admin/events/promote                  staged → approved        (admin)
 //   POST /v1/admin/events/reject                   delete staged            (admin)
+//   POST /v1/admin/events/delete                   delete ANY events        (admin)
 //   GET  /v1/admin/contributors                    list contributors        (admin)
 //   POST /v1/admin/contributors/:id                set reputation/status    (admin)
 //   POST /v1/admin/distilled                       publish a distilled doc  (admin)
 //
 // Auth: authenticate() resolves the bearer to {contributorId, scope, tokenId,
-// dailyQuota}.  Scopes — ingest: POST events (lands trust_state='staged', daily
-// quota enforced); read: GET distilled only (raw is never exposed); admin:
-// everything.  Legacy single secret authenticates as admin (backward compatible).
+// dailyQuota}.  Scopes — ingest: POST events only (lands trust_state='staged');
+// read: GET distilled + corpus aggregates/metadata (raw payloads never exposed);
+// contributor: ingest + read, self-issued via GitHub OAuth, writes auto-approve;
+// admin: everything incl. delete.  Legacy single secret authenticates as admin.
 //
 // Idempotency: content_id PRIMARY KEY + INSERT OR IGNORE.  Server-to-server only;
 // no CORS by design (add explicitly if a browser dashboard is introduced).
 
-import { authenticate } from './auth.js';
+import { authenticate, timingSafeEqual } from './auth.js';
 import { prepareEvent } from './ingest.js';
 import { consumeQuota } from './quota.js';
 import {
@@ -38,11 +46,28 @@ import {
   listStaged,
   promoteEvents,
   rejectEvents,
+  deleteEvents,
+  eventStats,
   listContributors,
   setContributor,
   publishDistilled,
   getDistilled,
 } from './admin.js';
+import { corpusStats, corpusList } from './corpus.js';
+import {
+  buildAuthorizeUrl,
+  exchangeCode,
+  fetchUser,
+  contributorIdForGithub,
+  parseCookies,
+} from './oauth_github.js';
+import {
+  SIGNUP_HTML,
+  CONSOLE_HTML,
+  signupDisabledPage,
+  resultPage,
+  tokenResultPage,
+} from './pages.js';
 
 const SERVICE = 'crucible-insights-worker';
 const VERSION = '0.1.0';
@@ -52,6 +77,26 @@ function json(body, status = 200) {
     status,
     headers: { 'Content-Type': 'application/json; charset=utf-8' },
   });
+}
+
+function html(body, status = 200, setCookie) {
+  const headers = { 'Content-Type': 'text/html; charset=utf-8' };
+  if (setCookie) headers['Set-Cookie'] = setCookie;
+  return new Response(body, { status, headers });
+}
+
+// Short random hex for the OAuth CSRF state (single-use, carried in a cookie).
+function randHex(nBytes) {
+  const a = new Uint8Array(nBytes);
+  crypto.getRandomValues(a);
+  return Array.from(a)
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+const OAUTH_STATE_COOKIE = 'cruc_oauth_state';
+function stateCookie(value, maxAge) {
+  return `${OAUTH_STATE_COOKIE}=${value}; HttpOnly; Secure; SameSite=Lax; Path=/oauth; Max-Age=${maxAge}`;
 }
 
 // ── Opaque pagination cursor: base64url("<ts>\0<content_id>") ──
@@ -131,14 +176,135 @@ export async function readBodyText(req, maxBytes) {
   return text;
 }
 
+/**
+ * Finish the GitHub OAuth signup: verify the CSRF state cookie, exchange the
+ * code, read the GitHub identity, refuse banned accounts, then (re)issue a
+ * single 'contributor' token and show it once.  All failures render a friendly
+ * HTML page and always clear the state cookie.
+ * @param {Request} req
+ * @param {object} env
+ * @returns {Promise<Response>}
+ */
+async function handleGithubCallback(req, env) {
+  const url = new URL(req.url);
+  const clearCookie = stateCookie('', 0);
+  const fail = (status, title, msg) => html(resultPage(title, msg), status, clearCookie);
+
+  const clientId = env.GITHUB_OAUTH_CLIENT_ID;
+  const clientSecret = env.GITHUB_OAUTH_CLIENT_SECRET;
+  if (!clientId || !clientSecret) return html(signupDisabledPage(), 503);
+
+  const code = url.searchParams.get('code');
+  const state = url.searchParams.get('state');
+  const cookies = parseCookies(req.headers.get('Cookie'));
+  const expected = cookies[OAUTH_STATE_COOKIE] || '';
+  if (!code || !state || !expected || !timingSafeEqual(state, expected)) {
+    return fail(
+      400,
+      'Sign-in could not be verified',
+      'The sign-in state was missing or expired. Please return to the signup page and start again.'
+    );
+  }
+
+  const redirectUri = url.origin + '/oauth/github/callback';
+  const ex = await exchangeCode({ clientId, clientSecret, code, redirectUri });
+  if (!ex.ok) {
+    return fail(502, 'GitHub sign-in failed', 'Could not complete the GitHub handshake. Please try again.');
+  }
+  const gu = await fetchUser(ex.accessToken);
+  if (!gu.ok) {
+    return fail(502, 'GitHub sign-in failed', 'Could not read your GitHub identity. Please try again.');
+  }
+
+  const contributorId = contributorIdForGithub(gu.id);
+
+  // Banned contributors are refused before any token is minted.
+  let banned = null;
+  try {
+    banned = await env.DB.prepare('SELECT status FROM contributors WHERE contributor_id = ?')
+      .bind(contributorId)
+      .first();
+  } catch {
+    banned = null;
+  }
+  if (banned && banned.status === 'banned') {
+    return fail(
+      403,
+      'Access denied',
+      'This account is not permitted to contribute. Contact the operator if you believe this is a mistake.'
+    );
+  }
+
+  // Re-issue: revoke any existing active contributor token for this account so a
+  // repeat sign-in always yields one working token (raw tokens are shown once).
+  try {
+    await env.DB.prepare(
+      "UPDATE api_tokens SET status = 'revoked' WHERE contributor_id = ? AND status = 'active' AND scope = 'contributor'"
+    )
+      .bind(contributorId)
+      .run();
+  } catch {
+    /* non-fatal — issuance below still proceeds */
+  }
+
+  const q = parseInt(env.SIGNUP_DAILY_QUOTA || '2000', 10);
+  const dailyQuota = Number.isFinite(q) && q > 0 ? q : null;
+  const issued = await issueToken(env, {
+    contributorId,
+    label: `github:${gu.login}`,
+    scope: 'contributor',
+    dailyQuota,
+  });
+  if (!issued.ok) {
+    return fail(500, 'Could not issue a token', 'Something went wrong issuing your token. Please try again.');
+  }
+
+  // Record the contributor as active (best-effort; reputation untouched).
+  try {
+    await setContributor(env, contributorId, { status: 'active' });
+  } catch {
+    /* non-fatal */
+  }
+
+  return html(tokenResultPage(issued.token, url.origin, gu.login), 200, clearCookie);
+}
+
 export default {
   async fetch(req, env) {
     const url = new URL(req.url);
     const p = url.pathname;
 
-    // ── Liveness (no auth, no data) ──
-    if (req.method === 'GET' && (p === '/' || p === '/health')) {
+    // ── Liveness (no auth, no data).  The Python client pings /health. ──
+    if (req.method === 'GET' && p === '/health') {
       return json({ service: SERVICE, version: VERSION, status: 'ok' });
+    }
+
+    // ── Public HTML pages, served same-origin from the Worker (no CORS). ──
+    if (req.method === 'GET' && p === '/') {
+      return html(SIGNUP_HTML);
+    }
+    if (req.method === 'GET' && (p === '/console' || p === '/admin')) {
+      return html(CONSOLE_HTML);
+    }
+
+    // ── GitHub OAuth self-service signup (no bearer; CSRF-protected). ──
+    if (req.method === 'GET' && p === '/oauth/github/start') {
+      const clientId = env.GITHUB_OAUTH_CLIENT_ID;
+      if (!clientId || !env.GITHUB_OAUTH_CLIENT_SECRET) {
+        return html(signupDisabledPage(), 503);
+      }
+      const state = randHex(16);
+      const redirectUri = new URL(req.url).origin + '/oauth/github/callback';
+      return new Response(null, {
+        status: 302,
+        headers: {
+          Location: buildAuthorizeUrl({ clientId, redirectUri, state }),
+          'Set-Cookie': stateCookie(state, 600),
+        },
+      });
+    }
+    if (req.method === 'GET' && p === '/oauth/github/callback') {
+      return handleGithubCallback(req, env);
     }
 
     // ── Auth gate for everything under /v1 ──
@@ -147,17 +313,23 @@ export default {
       return new Response('unauthorized', { status: 401 });
     }
 
-    // Scope helpers (enforced per-route below).
+    // Scope helpers (enforced per-route below).  'contributor' = ingest + read.
     const isAdmin = auth.scope === 'admin';
-    const canIngest = auth.scope === 'ingest' || isAdmin;
-    const canRead = auth.scope === 'read' || isAdmin;
+    const canIngest =
+      auth.scope === 'ingest' || auth.scope === 'contributor' || isAdmin;
+    const canRead =
+      auth.scope === 'read' || auth.scope === 'contributor' || isAdmin;
     const forbidden = (need) =>
       json({ error: 'forbidden', required: need, scope: auth.scope }, 403);
-    // Server-side attribution: owner/admin data is trusted; everyone else is
-    // quarantined.  Never derived from the request body.
+    // Server-side attribution (NEVER derived from the request body).  Owner/admin
+    // and OAuth-vetted contributors land 'approved' — the operator chose
+    // auto-accept-if-well-formed, with bad rows removed via admin delete.  The
+    // legacy single-purpose 'ingest' scope still quarantines to 'staged'.
+    const trustState =
+      isAdmin || auth.scope === 'contributor' ? 'approved' : 'staged';
     const attribution = {
       contributorId: auth.contributorId,
-      trustState: isAdmin ? 'approved' : 'staged',
+      trustState,
     };
 
     try {
@@ -229,6 +401,21 @@ export default {
         const r = await rejectEvents(env, { contentIds: pb.body?.content_ids });
         return json(r, r.ok ? 200 : 422);
       }
+      if (req.method === 'POST' && p === '/v1/admin/events/delete') {
+        if (!isAdmin) return forbidden('admin');
+        const pb = await parseBody();
+        if (!pb.ok) return pb.res;
+        const r = await deleteEvents(env, {
+          contentIds: pb.body?.content_ids,
+          runId: pb.body?.run_id,
+          contributorId: pb.body?.contributor_id,
+        });
+        return json(r, r.ok ? 200 : 422);
+      }
+      if (req.method === 'GET' && p === '/v1/admin/stats') {
+        if (!isAdmin) return forbidden('admin');
+        return json(await eventStats(env));
+      }
       if (req.method === 'GET' && p === '/v1/admin/contributors') {
         if (!isAdmin) return forbidden('admin');
         return json(await listContributors(env));
@@ -267,7 +454,9 @@ export default {
           }
           return json({ error: 'invalid_json' }, 400);
         }
-        const r = await prepareEvent(env, parsed?.event, attribution);
+        const r = await prepareEvent(env, parsed?.event, attribution, {
+          strict: !isAdmin,
+        });
         if (!r.ok) {
           return json({ ok: false, reason: r.reason, expected: r.expected }, 422);
         }
@@ -312,7 +501,7 @@ export default {
         const accepted = [];
         const rejected = [];
         for (const ev of events) {
-          const r = await prepareEvent(env, ev, attribution);
+          const r = await prepareEvent(env, ev, attribution, { strict: !isAdmin });
           if (r.ok) {
             stmts.push(r.stmt);
             accepted.push(r.content_id);
@@ -333,11 +522,30 @@ export default {
         return json({ ingested: accepted.length, rejected });
       }
 
-      // GET /v1/insights/distilled — distilled artifacts (read|admin); never raw
+      // GET /v1/insights/distilled — distilled artifacts (read|contributor|admin)
       if (req.method === 'GET' && p === '/v1/insights/distilled') {
         if (!canRead) return forbidden('read');
         return json(
           await getDistilled(env, { kind: url.searchParams.get('kind') || undefined })
+        );
+      }
+
+      // GET /v1/insights/corpus/stats — aggregate corpus shape (read|contributor|admin)
+      if (req.method === 'GET' && p === '/v1/insights/corpus/stats') {
+        if (!canRead) return forbidden('read');
+        return json(await corpusStats(env));
+      }
+      // GET /v1/insights/corpus — metadata rows only, NO payloads / identity
+      if (req.method === 'GET' && p === '/v1/insights/corpus') {
+        if (!canRead) return forbidden('read');
+        return json(
+          await corpusList(env, {
+            stream: url.searchParams.get('stream') || undefined,
+            mode: url.searchParams.get('mode') || undefined,
+            runId: url.searchParams.get('run_id') || undefined,
+            cursor: url.searchParams.get('cursor') || undefined,
+            limit: url.searchParams.get('limit') || undefined,
+          })
         );
       }
 
@@ -403,6 +611,8 @@ export default {
         if (!isAdmin) return forbidden('admin');
         const stream = url.searchParams.get('stream');
         const runId = url.searchParams.get('run_id');
+        const trustStateFilter = url.searchParams.get('trust_state');
+        const contributorFilter = url.searchParams.get('contributor_id');
         const since = url.searchParams.get('since');
         const cursorRaw = url.searchParams.get('cursor');
         const cur = cursorRaw ? decodeCursor(cursorRaw) : null;
@@ -419,6 +629,14 @@ export default {
         if (runId) {
           where.push('run_id = ?');
           binds.push(runId);
+        }
+        if (trustStateFilter) {
+          where.push('trust_state = ?');
+          binds.push(trustStateFilter);
+        }
+        if (contributorFilter) {
+          where.push('contributor_id = ?');
+          binds.push(contributorFilter);
         }
         if (since) {
           where.push('ts > ?');

@@ -13,6 +13,7 @@
 
 import { contentId } from './canonical.js';
 import { scanForSecrets } from './validate.js';
+import { checkEventShape } from './event_shape.js';
 
 const INLINE_DEFAULT = 4096;
 // D1-only safety ceiling.  When no R2 bucket is bound (the default, no-credit-
@@ -61,9 +62,10 @@ const REQUIRED = [
  * @param {{ DB: any, BLOBS?: any, INLINE_MAX_BYTES?: string }} env
  * @param {Record<string, unknown>} ev
  * @param {Attribution} [attribution]
+ * @param {{ strict?: boolean }} [opts]  strict=true → also run checkEventShape (untrusted writers)
  * @returns {Promise<PreparedEvent>}
  */
-export async function prepareEvent(env, ev, attribution = {}) {
+export async function prepareEvent(env, ev, attribution = {}, opts = {}) {
   if (!ev || typeof ev !== 'object' || Array.isArray(ev)) {
     return { ok: false, reason: 'invalid_event' };
   }
@@ -74,6 +76,15 @@ export async function prepareEvent(env, ev, attribution = {}) {
   }
   if (!VALID_STREAMS.has(ev.stream)) {
     return { ok: false, reason: `bad_stream:${ev.stream}` };
+  }
+
+  // Untrusted (non-admin) uploads must additionally match the EXACT shape that
+  // Crucible emits (see event_shape.js).  The owner/admin path passes
+  // opts.strict=false so a future EventKind/mode never self-locks the operator's
+  // own dual-write (CLAUDE.md §9.6 producer→consumer self-lock trap).
+  if (opts.strict) {
+    const shape = checkEventShape(ev);
+    if (!shape.ok) return shape;
   }
 
   // Tamper-evidence: recompute the content_id from the canonical bytes.  Never

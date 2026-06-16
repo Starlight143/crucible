@@ -31,6 +31,10 @@ MAX_BATCH_SIZE = "100"
 # 8 MiB).  Rejects gzip bombs / oversized batches with HTTP 413 before they can
 # exhaust Worker memory.  Raise only if you legitimately send very large batches.
 MAX_BATCH_BYTES = "8388608"
+# Daily write quota stamped on each token minted by the self-service GitHub
+# signup flow (contributor scope).  Bounds free-tier cost / abuse from any single
+# contributor.  Manually-issued tokens set their own quota at issuance time.
+SIGNUP_DAILY_QUOTA = "2000"
 
 # D1 — indexed metadata store.  Create with `npm run db:create`, then paste
 # the printed database_id below.  Apply schema with `npm run db:migrate:remote`.
@@ -52,6 +56,14 @@ migrations_dir = "migrations"
 # binding = "BLOBS"
 # bucket_name = "crucible-insights-blobs"
 
-# Secret (NOT stored here — set with `npx wrangler secret put`):
-#     CRUCIBLE_RUN_INSIGHTS_API_TOKEN
+# Secrets (NOT stored here — set each with `npx wrangler secret put <NAME>`):
+#   GITHUB_OAUTH_CLIENT_ID      GitHub OAuth App client id  — enables /oauth/github/*
+#   GITHUB_OAUTH_CLIENT_SECRET  GitHub OAuth App client secret
+#       The self-service signup page (GET /) and the OAuth routes stay disabled
+#       (HTTP 503 "signup not configured") until BOTH are set.  Create the OAuth
+#       App at https://github.com/settings/developers with the callback URL
+#       https://<your-worker-host>/oauth/github/callback  (see OPENING_UP.md).
+#   CRUCIBLE_RUN_INSIGHTS_API_TOKEN  (optional/legacy) single shared admin secret.
+#       Phase A issues per-contributor tokens via the api_tokens table instead;
+#       this is only honoured as an implicit admin token when present.
 # For local `wrangler dev`, copy .dev.vars.example to .dev.vars (gitignored).
