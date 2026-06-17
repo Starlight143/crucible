@@ -5,6 +5,50 @@ Versioning follows [Semantic Versioning](https://semver.org/). The first public 
 
 ---
 
+## [v1.2.2] — 2026-06-17
+
+Fixes a direction-debate extraction failure where the Judge model emitted the
+`DirectionDecision.options` payload in a shape strict validation rejected. This
+caused repeated `_extract_pydantic_from_result` lenient-retry debug spam and
+burned the reformat/salvage LLM budget on every affected run. Defensive and
+additive only — well-formed payloads are untouched and there are no schema, env,
+CLI, or API changes.
+
+### Fixed
+- **`DirectionDecision.options` shape coercion.** A new
+  `model_validator(mode="before")` on `DirectionDecision`
+  (`crucible/modules/section_03_models_and_context.py`) normalises two
+  recoverable LLM deviations *before* field validation, so every construction
+  path benefits at once (primary extraction, salvage, reformat, crewAI
+  `output_pydantic`, and cache deserialisation):
+  1. `options` emitted as a **mapping keyed by direction letter**
+     (`{"A": {...}, …}`) instead of the declared list → unwrapped to a list,
+     backfilling each item's `key` from the mapping key only when it is absent.
+  2. `options` emitted as a **list whose items omit `key`** → `key` injected by
+     position (index 0 → `"A"`).
+  The validator never overwrites a `key` the model already supplied, leaves
+  non-dict items in place for the schema to reject with a clear error, and
+  defers final A–G completeness to the existing `_normalize_direction_decision`.
+  A malformed or partial payload therefore degrades to the prior behaviour
+  (extraction returns `None` and the existing fallbacks run) rather than
+  producing a wrong decision.
+
+### Tests
+- `tests/test_direction_decision_options_coercion.py` (15 checks): both failure
+  shapes, dict-keyed values with and without `key`, list-missing-`key` keyed by
+  position, the never-overwrite and byte-for-byte-untouched guarantees for
+  well-formed input, non-dict rejection, and the full `extract_direction_decision`
+  path no longer emitting the lenient-retry debug line.
+
+### Validation
+- `python -m pytest tests -q -p no:cacheprovider` → **3364 passed, 2 skipped**.
+  `smoke_test.py` and `run_crucible.py --self-check` OK.
+
+### Compatibility
+- Fully additive. Behaviour for well-formed payloads is byte-for-byte identical;
+  the only change is that two previously-unparseable `options` shapes now parse
+  instead of falling through to the fallback path.
+
 ## [v1.2.1] — 2026-06-17
 
 Multi-contributor **self-service opening-up** for the Run Insights cloud backend

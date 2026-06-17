@@ -461,6 +461,66 @@ class DirectionDecision(BaseModel):
     confidence: str = Field(..., description='Confidence level "low" | "medium" | "high"')
     verify_plan: List[str] = Field(..., description="Concrete validation plan items, up to five")
 
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_options_shape(cls, data: Any) -> Any:
+        """Repair two recoverable LLM deviations in ``options`` before field validation.
+
+        Reasoning-class models routinely emit the seven direction options in a
+        shape that is trivially recoverable yet would otherwise fail strict
+        validation — burning the reformat / salvage retry budget and spamming
+        ``_extract_pydantic_from_result`` debug lines:
+
+        1. **Mapping keyed by direction letter** — ``{"A": {...}, "B": {...}}`` —
+           instead of the declared ``List[DirectionOption]``.  The mapping values
+           usually already carry their own ``key``; when one does not, the mapping
+           key supplies it.
+        2. **List whose items omit the required ``key``**, relying on positional
+           order (index 0 -> "A", 1 -> "B", ...) to convey the direction letter.
+
+        Both are normalised to the canonical list-of-dicts shape so strict
+        validation succeeds.  Well-formed payloads (already a list whose every
+        item carries a ``key``) pass through untouched: this validator only ever
+        *unwraps* a mapping or *fills in* a missing ``key`` — it never overwrites
+        a ``key`` the model already provided, and it leaves non-dict items in
+        place for the schema to reject with a clear error.  Downstream
+        :func:`_normalize_direction_decision` still has the final say on whether
+        the recovered keys form a clean A-G set, so a mis-ordered or partial
+        payload degrades to today's behaviour (extraction returns ``None`` and
+        the existing fallbacks run) rather than producing a wrong decision.
+        """
+        if not isinstance(data, dict):
+            return data
+        options = data.get("options")
+        if options is None:
+            return data
+
+        def _missing_key(item: Any) -> bool:
+            return isinstance(item, dict) and not str(item.get("key", "") or "").strip()
+
+        rebuilt: Optional[List[Any]] = None
+        if isinstance(options, dict):
+            # Shape 1: mapping keyed by direction letter -> list of values,
+            # backfilling ``key`` from the mapping key when the value omits it.
+            rebuilt = [
+                {**value, "key": str(map_key).strip()} if _missing_key(value) else value
+                for map_key, value in options.items()
+            ]
+        elif isinstance(options, list) and any(_missing_key(item) for item in options):
+            # Shape 2: list whose items omit ``key`` -> inject by position
+            # (index 0 -> "A").  Indices past "Z" are left untouched so the
+            # schema surfaces the genuine error instead of an invented key.
+            rebuilt = [
+                {**item, "key": chr(ord("A") + idx)}
+                if (_missing_key(item) and 0 <= idx < 26)
+                else item
+                for idx, item in enumerate(options)
+            ]
+
+        if rebuilt is not None:
+            data = {**data, "options": rebuilt}
+        return data
+
 
 class DirectionDebateArtifacts(BaseModel):
     comparator_report: Optional["DirectionComparatorReport"] = Field(
