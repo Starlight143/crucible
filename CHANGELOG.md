@@ -5,6 +5,84 @@ Versioning follows [Semantic Versioning](https://semver.org/). The first public 
 
 ---
 
+## [v1.2.1] — 2026-06-17
+
+Multi-contributor **self-service opening-up** for the Run Insights cloud backend
+(Phase A): per-contributor tokens, a self-service GitHub-OAuth signup that issues
+a `contributor` token, a strict event-format gate on untrusted uploads, an
+aggregate/metadata-only contributor read surface, an operator delete + stats
+surface, and the signup + admin pages served directly from the Worker. All
+additive — the default `local` backend and any existing single-admin-token
+deployment are unchanged, and the operator's own dual-write path is unaffected
+(admin writes bypass the new enum gate so a future `EventKind` can never
+self-lock the operator).
+
+### Added — contributor scope + self-service signup (Worker)
+- **`contributor` scope** (= ingest + read). `migrations/0007_contributor_scope.sql`
+  rebuilds the `api_tokens` `CHECK` to add it, preserving every existing row.
+  Contributor uploads that pass the format gate **auto-approve**
+  (`trust_state='approved'`); the single-purpose `ingest` scope still quarantines
+  to `staged`.
+- **GitHub-OAuth self-service signup** (`src/oauth_github.js` + `GET
+  /oauth/github/start` + `GET /oauth/github/callback`): CSRF `state` cookie,
+  authorization-code exchange, a stable `contributor_id = gh_<numeric-id>`,
+  banned-account refusal, and revoke-then-reissue of a single `contributor` token
+  shown exactly once. Disabled (HTTP 503) until the operator sets the
+  `GITHUB_OAUTH_CLIENT_ID` / `GITHUB_OAUTH_CLIENT_SECRET` Worker secrets.
+- **Pages served from the Worker** (`src/pages.js`, same-origin ⇒ no CORS): `GET
+  /` signup landing (GitHub sign-in) and `GET /console` operator admin console
+  (corpus counts, a filterable records browser, multi-select delete, and bulk
+  delete). The admin token is entered client-side and kept only in
+  `sessionStorage`.
+
+### Added — ingest gate, contributor reads, admin tools (Worker)
+- **Strict event-format gate** (`src/event_shape.js`) on every **non-admin**
+  write: `mode`, `kind`, `kind`↔`stream` consistency, ISO-8601 `ts`, integer
+  `schema_version`, and `outcome` shape are validated against the values Crucible
+  actually emits (pinned to `schema.py`). Admin/owner writes **bypass** the enum
+  allowlist so a future `EventKind`/mode can never self-lock the operator's
+  dual-write.
+- **Contributor read surface** (`src/corpus.js`): `GET /v1/insights/corpus/stats`
+  (totals + by stream/mode/outcome + top projects) and `GET /v1/insights/corpus`
+  (paginated index columns). Both are **approved-only** and never expose raw
+  payloads or contributor identity; raw `GET /v1/insights/events` stays
+  admin-only.
+- **Operator tools** (`src/admin.js`): `POST /v1/admin/events/delete` removes ANY
+  row (by `content_ids` | `run_id` | `contributor_id`, any `trust_state`, with
+  best-effort R2 cleanup) — distinct from the staged-only reject — and `GET
+  /v1/admin/stats` returns corpus-wide counts (by stream/trust_state/mode/
+  contributor).
+
+### Changed
+- `src/ingest.js` `prepareEvent` gained an `opts.strict` flag; the router
+  (`src/index.js`) passes `strict = !isAdmin`, stamps contributor writes
+  `approved`, and treats `contributor` as both ingest and read for scope checks.
+- `GET /` now serves the signup page (HTML); liveness is `GET /health` only (the
+  Python client already polls `/health`).
+- `wrangler.toml`: added the `SIGNUP_DAILY_QUOTA` var and documented the two
+  GitHub OAuth Worker secrets.
+
+### Tests
+- Worker (`node --test`) → **127** checks: new `test/event_shape.test.js` (gate +
+  structural pins against the nine `schema.py` EventKinds),
+  `test/contributor_scope.test.js` (full access-control matrix incl. the admin
+  gate-bypass), `test/delete.test.js`, `test/corpus.test.js`, and
+  `test/oauth.test.js` (helpers with an injectable fetch).
+
+### Validation
+- `npm test` → **127/127** green; `wrangler deploy --dry-run` bundles cleanly.
+- Deployed to a live account (D1-only, no R2) with migration 0007 applied
+  **before** the deploy. Live end-to-end verified: GitHub sign-in → contributor
+  token → write (format-gated, auto-approved) → read aggregates; raw read and
+  delete correctly return 403; signup returns 503 until the OAuth secrets are
+  set. Smoke data was purged so the corpus stays clean.
+
+### Compatibility
+- Drop-in for v1.2.0. No new dependency; the `local` default is unchanged. A
+  pre-Phase-A single-admin-token deployment keeps working (legacy secret →
+  admin), and existing `ingest`/`read` tokens are unaffected. Apply migration
+  0007 **before** deploying the new Worker (the rebuilt `api_tokens` `CHECK`).
+
 ## [v1.2.0] — 2026-06-09
 
 Cloud backend for the Run Insights ledger — a **Cloudflare Worker + D1** mirror

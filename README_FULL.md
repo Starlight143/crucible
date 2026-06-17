@@ -500,13 +500,13 @@ Copy [.env.example](/.env.example) to `.env` first, then fill in the required va
 | `CRUCIBLE_RUN_INSIGHTS_RECORD_DEBATE` | `1` | Record `direction_debate_rejection` events when Stage 0 force-nones or parse-fails after all fallbacks. |
 | `CRUCIBLE_RUN_INSIGHTS_RECORD_PARAMS` | `auto` | `auto` = record in Quant mode only (matches the "Quant records runtime parameters, non-Quant does not" requirement); set `1` to force-on / `0` to force-off. Typos fall back to `auto` (never truthy-coerce). |
 | `CRUCIBLE_RUN_INSIGHTS_REDACT` | `1` | Redact sensitive fields (`api_key`, `token`, `secret`, `webhook_url`, `auth`, etc.) recursively before write. Set `0` for raw payloads. |
-| `CRUCIBLE_RUN_INSIGHTS_BACKEND` | `local` | Storage backend: `local` (JSONL streams under `.crucible_insights/`). `cloudflare` / `dual` are reserved names — the protocol seam is in place but the implementations raise `NotImplementedError`. |
+| `CRUCIBLE_RUN_INSIGHTS_BACKEND` | `local` | Storage backend: `local` (JSONL streams under `.crucible_insights/`, the default and the source of truth), `dual` (write locally **and** asynchronously mirror to a Cloudflare Worker + D1 backend you deploy), or `cloudflare` (read cloud-first with local fallback). `dual` / `cloudflare` require `CRUCIBLE_RUN_INSIGHTS_API_URL` + `_API_TOKEN`. See **Cloud backend & shared corpus** below. |
 | `CRUCIBLE_RUN_INSIGHTS_DIR` | `.crucible_insights` | Ledger root directory (relative paths anchor to `PROJECT_ROOT`). |
 | `CRUCIBLE_RUN_INSIGHTS_INLINE_MAX_BYTES` | `4096` | Payloads larger than this are spilled to `blobs/<content_id>.json` and referenced by `payload_blob` hash. |
 | `CRUCIBLE_RUN_INSIGHTS_MAX_ENTRIES_PER_STREAM` | `2000` | FIFO cap per stream — older entries pruned via atomic temp-file swap once the limit is reached. |
 | `CRUCIBLE_RUN_ID` | — | Auto-injected by the WebUI when spawning a pipeline subprocess; binds `run_correlation.set_run_id()` so all telemetry, logs, and ledger entries share the same correlation id. Direct CLI invocations auto-generate a UUID4. |
 
-Additional reserved keys for the planned retrieval + LLM skill distillation layer appear in `.env.example` but are not yet honoured: `CRUCIBLE_RUN_INSIGHTS_API_URL`, `CRUCIBLE_RUN_INSIGHTS_API_TOKEN`, `CRUCIBLE_RUN_INSIGHTS_RETRIEVAL_*`, `CRUCIBLE_RUN_INSIGHTS_INJECT_*`, `CRUCIBLE_RUN_INSIGHTS_DISTILLATION_*`.
+The cloud-sync keys `CRUCIBLE_RUN_INSIGHTS_API_URL` / `CRUCIBLE_RUN_INSIGHTS_API_TOKEN` (plus `_TIMEOUT_SECONDS` / `_MAX_RETRIES` / `_BATCH_FLUSH_SECONDS` / `_BATCH_SIZE`) are honoured by the `dual` / `cloudflare` backends. Keys for the planned retrieval + LLM skill-distillation layer remain reserved and not yet honoured: `CRUCIBLE_RUN_INSIGHTS_RETRIEVAL_*`, `CRUCIBLE_RUN_INSIGHTS_INJECT_*`, `CRUCIBLE_RUN_INSIGHTS_DISTILLATION_*`.
 
 ### Direction Debate / Gate
 
@@ -1294,7 +1294,16 @@ Each event carries a content-addressable `content_id = "sha256:" + sha256(canoni
 - Export the whole ledger with `python -m crucible.features.run_insights.export ./insights.tar.gz` — produces a tarball with `manifest.json`, per-stream sha256 hashes, and all blobs.
 - Set `CRUCIBLE_RUN_INSIGHTS_ENABLED=0` to fully disable; recorder returns `_NullRecorder` and every emit point becomes a no-op.
 
-**Future capability:** The storage layer is a `StorageBackend` protocol with the Cloudflare Workers + D1 + R2 contract frozen in `backends.py` docstrings (D1 schema with `content_id` as PRIMARY KEY, R2 path layout `insights/<run_id>/<content_id>.json`, identical canonical-JSON algorithm in JavaScript). Switching `CRUCIBLE_RUN_INSIGHTS_BACKEND=cloudflare` (or `dual` for safe migration) will route writes to the Worker without any local code changes once the cloud backend ships.
+**Cloud backend & shared corpus (optional).** The storage layer is a `StorageBackend` protocol; alongside the default `local` backend, Crucible ships a **Cloudflare Worker + D1** backend (`cloudflare/insights-worker/`, R2 optional) you can deploy yourself. Set `CRUCIBLE_RUN_INSIGHTS_BACKEND=dual` to keep the local JSONL ledger as the source of truth while a background daemon asynchronously mirrors events to the Worker (deduplicated on `content_id`); `cloudflare` reads cloud-first with local fallback. The canonical-JSON / `content_id` algorithm is byte-identical in Python and JavaScript, so a locally-written event and its cloud copy share the same id.
+
+The Worker also supports a **multi-contributor shared corpus**. An operator who deploys it can let others contribute through per-contributor, individually-revocable tokens (only a SHA-256 hash is stored server-side):
+
+- **Self-service signup** — with GitHub OAuth configured, contributors sign in with GitHub on the Worker's signup page and receive a `contributor` token (write + read).
+- **Format-gated, attributed writes** — every non-operator upload must match Crucible's own event schema (validated server-side) and is scanned for leaked secrets; well-formed uploads are stamped with the contributor's id. The operator's own writes are trusted and bypass the enum gate.
+- **Aggregate-only contributor reads** — `contributor` / `read` tokens fetch corpus **aggregates and metadata** (counts, per-project / mode / outcome stats, index columns), never raw run payloads.
+- **Operator console** — a built-in admin page (and a zero-dependency CLI) lists / issues / revokes tokens, shows corpus counts, and deletes records.
+
+Scopes are `ingest` (write-only), `read` (aggregates / distilled only), `contributor` (write + read), and `admin` (everything, including delete). The Worker source, D1 schema, and deploy guide live in `cloudflare/insights-worker/` (see its `README.md`).
 
 ---
 

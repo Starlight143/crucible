@@ -503,13 +503,13 @@ graph TD
 | `CRUCIBLE_RUN_INSIGHTS_RECORD_DEBATE` | `1` | Stage 0 force-none 或所有 fallback 後仍 parse 失敗時,記錄 `direction_debate_rejection` 事件。 |
 | `CRUCIBLE_RUN_INSIGHTS_RECORD_PARAMS` | `auto` | `auto` = 僅 Quant 模式記錄(對應「Quant 記錄運行參數、非 Quant 不記錄」需求);`1` 強制開、`0` 強制關。拼錯的值 fallback 回 `auto`(不會被 truthy-coerce)。 |
 | `CRUCIBLE_RUN_INSIGHTS_REDACT` | `1` | 寫入前對敏感欄位(`api_key`、`token`、`secret`、`webhook_url`、`auth` 等)做遞迴遮蔽。設 `0` 寫入原始 payload。 |
-| `CRUCIBLE_RUN_INSIGHTS_BACKEND` | `local` | 儲存後端:`local`(`.crucible_insights/` 下的 JSONL streams)。`cloudflare` / `dual` 為保留名稱 — protocol seam 已就位,但實作會 raise `NotImplementedError`。 |
+| `CRUCIBLE_RUN_INSIGHTS_BACKEND` | `local` | 儲存後端:`local`(`.crucible_insights/` 下的 JSONL streams,預設且為 source of truth)、`dual`(本地寫入**並**非同步鏡像到你自行部署的 Cloudflare Worker + D1 後端)、或 `cloudflare`(雲端優先讀取、本地 fallback)。`dual` / `cloudflare` 需要 `CRUCIBLE_RUN_INSIGHTS_API_URL` + `_API_TOKEN`。詳見下方 **雲端後端與共享語料**。 |
 | `CRUCIBLE_RUN_INSIGHTS_DIR` | `.crucible_insights` | Ledger 根目錄(相對路徑會錨定到 `PROJECT_ROOT`)。 |
 | `CRUCIBLE_RUN_INSIGHTS_INLINE_MAX_BYTES` | `4096` | 大於此值的 payload 寫到 `blobs/<content_id>.json`,事件以 `payload_blob` hash 引用。 |
 | `CRUCIBLE_RUN_INSIGHTS_MAX_ENTRIES_PER_STREAM` | `2000` | 每條 stream 的 FIFO 上限,超過時以原子 temp-file swap 刪除最舊項目。 |
 | `CRUCIBLE_RUN_ID` | — | WebUI spawn pipeline subprocess 時自動注入,綁定 `run_correlation.set_run_id()` 使 telemetry / logs / ledger 共用同一 run_id。直接從 CLI 執行時會自動產生 UUID4。 |
 
-`.env.example` 內另保留給規劃中的 retrieval + LLM skill distillation 層的 key 目前尚未生效:`CRUCIBLE_RUN_INSIGHTS_API_URL`、`CRUCIBLE_RUN_INSIGHTS_API_TOKEN`、`CRUCIBLE_RUN_INSIGHTS_RETRIEVAL_*`、`CRUCIBLE_RUN_INSIGHTS_INJECT_*`、`CRUCIBLE_RUN_INSIGHTS_DISTILLATION_*`。
+雲端同步 key `CRUCIBLE_RUN_INSIGHTS_API_URL` / `CRUCIBLE_RUN_INSIGHTS_API_TOKEN`(以及 `_TIMEOUT_SECONDS` / `_MAX_RETRIES` / `_BATCH_FLUSH_SECONDS` / `_BATCH_SIZE`)已由 `dual` / `cloudflare` 後端實際使用。規劃中的 retrieval + LLM skill distillation 層的 key 仍為保留、尚未生效:`CRUCIBLE_RUN_INSIGHTS_RETRIEVAL_*`、`CRUCIBLE_RUN_INSIGHTS_INJECT_*`、`CRUCIBLE_RUN_INSIGHTS_DISTILLATION_*`。
 
 ### Direction Debate / Gate 相關
 
@@ -1297,7 +1297,16 @@ Dashboard **Budget Bar** 顯示今日花費、月度累計、可選每日上限(
 - 用 `python -m crucible.features.run_insights.export ./insights.tar.gz` 匯出整個 ledger — 產生含 `manifest.json`、每條 stream 的 sha256、與所有 blob 的 tarball。
 - 設 `CRUCIBLE_RUN_INSIGHTS_ENABLED=0` 完全停用;recorder 回 `_NullRecorder`、所有 emit 點變 no-op。
 
-**未來能力:**儲存層是 `StorageBackend` protocol,Cloudflare Workers + D1 + R2 契約已凍結在 `backends.py` 的 docstring(D1 schema 以 `content_id` 為 PRIMARY KEY、R2 路徑佈局 `insights/<run_id>/<content_id>.json`、相同的 canonical-JSON 演算法 JavaScript 版本)。雲端後端上線後,切換 `CRUCIBLE_RUN_INSIGHTS_BACKEND=cloudflare`(或 `dual` 做安全遷移)即可把寫入導向 Worker,本地端不需改任何程式碼。
+**雲端後端與共享語料(選用)。**儲存層是 `StorageBackend` protocol;除了預設的 `local` 後端,Crucible 另附一個可自行部署的 **Cloudflare Worker + D1** 後端(`cloudflare/insights-worker/`,R2 選用)。設 `CRUCIBLE_RUN_INSIGHTS_BACKEND=dual` 可讓本地 JSONL 帳本維持為 source of truth,同時由背景 daemon 非同步把事件鏡像到 Worker(以 `content_id` 去重);`cloudflare` 則雲端優先讀取、本地 fallback。canonical-JSON / `content_id` 演算法在 Python 與 JavaScript 兩側 byte-identical,所以本地寫入的事件與其雲端副本共用同一個 id。
+
+Worker 也支援**多貢獻者共享語料**。部署者可讓其他人以「每人一把、可個別撤銷」的 token 貢獻(伺服器端只存 SHA-256 雜湊):
+
+- **自助註冊** — 設好 GitHub OAuth 後,貢獻者在 Worker 的註冊頁用 GitHub 登入即可取得 `contributor` token(可寫可讀)。
+- **格式閘 + 來源標記寫入** — 每筆非操作員的上傳都必須符合 Crucible 自身的事件 schema(伺服器端驗證)並通過洩漏密鑰掃描;合格者標記貢獻者 id。操作員自己的寫入為受信任、繞過 enum 閘。
+- **貢獻者只讀彙總** — `contributor` / `read` token 只能取得語料的**彙總與中繼資料**(筆數、各 project / mode / outcome 統計、索引欄位),永遠讀不到原始 run payload。
+- **操作員主控台** — 內建 admin 頁(與一支零依賴 CLI)可列出 / 發放 / 撤銷 token、顯示語料筆數、刪除紀錄。
+
+Scope 有 `ingest`(只寫)、`read`(只讀彙總 / 蒸餾)、`contributor`(可寫可讀)、`admin`(全部,含刪除)。Worker 原始碼、D1 schema 與部署指南見原始碼樹的 `cloudflare/insights-worker/`(含其 `README.md`)。
 
 ---
 
