@@ -2784,12 +2784,13 @@ def _create_openrouter_llm(
         inject_openrouter_usage_extra_body(llm_kwargs)
 
     if enable_cost_tracking:
-        callback_handler = get_openrouter_callback_handler()
-        if callback_handler is not None:
-            llm_kwargs["callbacks"] = [callback_handler]
-        http_interceptor = get_openrouter_http_interceptor()
-        if http_interceptor is not None:
-            llm_kwargs["interceptor"] = http_interceptor
+        # v1.2.3 — register the LiteLLM success callback (the single cost/usage
+        # capture chokepoint).  The previous crewai ``interceptor=`` / langchain
+        # ``callbacks=`` kwargs were silently dropped by crewai.LLM (those params
+        # don't exist on crewai 1.14.x) and never fired, so the authoritative
+        # billed-cost ledger stayed empty and cost/tokens fell back to the lossy,
+        # double-counting CrewAI usage-metrics path.
+        ensure_litellm_usage_logger_registered()
 
     llm = LLM(**llm_kwargs)
     try:

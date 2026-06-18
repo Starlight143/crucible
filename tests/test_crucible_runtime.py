@@ -402,11 +402,20 @@ class TestCrucibleCrewRuntime(unittest.TestCase):
         )
 
     def test_staged_codegen_cost_aggregates_all_substage_usage_records(self) -> None:
+        # v1.2.3 — codegen substage cost is now captured per-call via the CrewAI
+        # ``LLMCallCompletedEvent`` listener (``_on_crewai_llm_call_completed`` →
+        # ``_record_llm_usage``), not the old ``_record_codegen_usage_slice``
+        # ContextVar aggregation (now a no-op).  Each substage LLM call becomes its
+        # own accountant row, so the run-total still reflects every substage.
+        from types import SimpleNamespace
+
         from crucible.module_runtime import get_runtime
 
         runtime = get_runtime()
         runtime.clear_openrouter_usage()
         runtime.reset_cost_accountant()
+        runtime.reset_openrouter_billed_ledger()
+        runtime.reset_llm_usage_dedup()
 
         sentinel_bundle = runtime.CodeBundle(
             project_type="quant",
@@ -414,28 +423,17 @@ class TestCrucibleCrewRuntime(unittest.TestCase):
         )
 
         def _fake_pipeline(*args, **kwargs):
-            runtime.set_openrouter_usage(
-                {
-                    "prompt_tokens": 100,
-                    "completion_tokens": 40,
-                    "total_tokens": 140,
-                    "cost": 0.0014,
-                },
-                model_id="openai/gpt-5.4",
-                accumulate=False,
-                provider="openrouter",
-            )
-            runtime.set_openrouter_usage(
-                {
-                    "prompt_tokens": 60,
-                    "completion_tokens": 20,
-                    "total_tokens": 80,
-                    "cost": 0.0008,
-                },
-                model_id="openai/gpt-5.4-mini",
-                accumulate=False,
-                provider="openrouter",
-            )
+            # Two substage LLM calls, as CrewAI would emit them on its event bus.
+            runtime._on_crewai_llm_call_completed(None, SimpleNamespace(
+                usage={"prompt_tokens": 100, "completion_tokens": 40,
+                       "total_tokens": 140, "cost": 0.0014},
+                model="openrouter/openai/gpt-5.4",
+                response_id="gen-cg-1", call_id="c1", event_id="e1"))
+            runtime._on_crewai_llm_call_completed(None, SimpleNamespace(
+                usage={"prompt_tokens": 60, "completion_tokens": 20,
+                       "total_tokens": 80, "cost": 0.0008},
+                model="openrouter/openai/gpt-5.4-mini",
+                response_id="gen-cg-2", call_id="c2", event_id="e2"))
             return {"pipeline": "staged_codegen", "batch_count": 2}, sentinel_bundle
 
         globals_dict = runtime.run_codegen_stage.__globals__
@@ -462,11 +460,14 @@ class TestCrucibleCrewRuntime(unittest.TestCase):
         summary = runtime.get_cost_accountant().get_summary()
         self.assertEqual(summary["total_tokens"], 220)
         self.assertAlmostEqual(summary["total_cost_usd"], 0.0022, places=12)
-        self.assertEqual(summary["total_executions"], 1)
+        # Per-call capture -> one row per substage call (was a single merged row).
+        self.assertEqual(summary["total_executions"], 2)
         self.assertTrue(summary["models_used"])
         self.assertIn("openai/gpt-5.4", summary["models_used"])
-        self.assertEqual(runtime.get_last_openrouter_usage().total_tokens, 0)
-        self.assertEqual(runtime.get_usage_records(), [])
+        # Authoritative billed ledger captured both calls' exact cost + tokens.
+        self.assertEqual(runtime.get_openrouter_billed_count(), 2)
+        self.assertAlmostEqual(runtime.get_openrouter_billed_total(), 0.0022, places=12)
+        self.assertEqual(runtime.get_openrouter_billed_tokens()["total_tokens"], 220)
 
     def test_staged_codegen_success_cost_uses_pipeline_prompt_tokens(self) -> None:
         from crucible.module_runtime import get_runtime

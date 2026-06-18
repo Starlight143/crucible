@@ -894,29 +894,22 @@ _OPENROUTER_USAGE_RECORDS: contextvars.ContextVar[List[Dict[str, Any]]] = contex
     "openrouter_usage_records", default=None  # type: ignore[assignment]
 )
 
-# ── v1.1.12 — Authoritative OpenRouter billed-cost ledger ────────────────────
-# The per-stage cost path is lossy: ``_record_cost`` accumulates LLM usage into
-# the ``_OPENROUTER_USAGE_CONTEXT`` ContextVar, reads it once per stage, then
-# ``clear_openrouter_usage()``s it.  Several ``crew.kickoff()`` call sites
-# (section_01 reformat crews, section_02 direction-seed plan, section_04
-# problem-breakdown / smart-queries, section_06 api-version analysis, the
-# external Critic) have NO matching ``_record_cost``, so their real OpenRouter
-# cost is mis-attributed to an adjacent stage — or dropped entirely when a
-# ``clear`` runs first — and the headline ``total_cost_usd`` silently diverges
-# from the OpenRouter billing dashboard.  The summary also blends actual
-# (``openrouter_api``) and locally-estimated rows into one total while labelling
-# it "actual billing".
+# ── Authoritative OpenRouter billed-cost ledger (v1.1.12; fed via LiteLLM in v1.2.3) ─
+# One row per billed OpenRouter response, carrying the exact ``usage.cost`` and
+# token counts OpenRouter returned, appended exactly once (response-id dedup).
+# ``get_openrouter_billed_total()`` / ``get_openrouter_billed_tokens()`` therefore
+# equal the exact Σ across the whole run — the USD and token numbers the operator
+# sees on the dashboard — and ``section_07._reconcile_cost_summary_with_billing``
+# promotes both to the headline.  It is a plain module global guarded by a
+# ``Lock`` (NOT a ContextVar) so writes from any thread/context are visible to the
+# reader, and it is reset ONLY at run start (``reset_openrouter_billed_ledger()``).
 #
-# This ledger fixes the discrepancy at its only correct chokepoint: the HTTP
-# interceptor.  ``_capture_openrouter_usage_from_http_response`` appends one row
-# here for EVERY billed OpenRouter response, carrying the exact ``usage.cost``
-# OpenRouter returned, exactly once (idempotency-guarded), independent of stage
-# attribution.  ``get_openrouter_billed_total()`` therefore equals the exact
-# Σ(usage.cost) across the whole run — the number the operator sees on the
-# dashboard.  It is a plain module global guarded by a ``Lock`` (NOT a
-# ContextVar) so writes from any thread/context are visible to the reader, and
-# it is reset ONLY at run start (``reset_openrouter_billed_ledger()``), never by
-# the per-stage ``clear_openrouter_usage()``.
+# v1.2.3: the feeder is now the LiteLLM success callback
+# (``_record_litellm_success`` → ``_append_openrouter_billed_entry``), the one
+# chokepoint CrewAI actually routes through.  The previous CrewAI HTTP
+# ``BaseInterceptor`` feeder never fired in real runs — crewai 1.14.x ``LLM``
+# silently drops the ``interceptor=`` kwarg — so this ledger stayed empty and the
+# headline fell back to the lossy, multi-x-inflated CrewAI usage-metrics path.
 _OPENROUTER_BILLED_LEDGER: List[Dict[str, Any]] = []
 _OPENROUTER_BILLED_LEDGER_LOCK = threading.Lock()
 
@@ -1138,74 +1131,6 @@ def _host_to_usage_provider(host: str) -> Optional[str]:
     return None
 
 
-def _capture_openrouter_usage_from_http_response(response: Any) -> bool:
-    try:
-        if response is None or getattr(response, "status_code", 0) < 200:
-            return False
-        if getattr(response, "status_code", 0) >= 400:
-            return False
-
-        # v1.1.12 — idempotency guard: never capture the same HTTP response
-        # twice.  Prevents the dormant interceptor+callback double-count and any
-        # accidental re-invocation from inflating either the usage context or
-        # the authoritative billed-cost ledger.
-        if getattr(response, "_crucible_or_usage_captured", False):
-            return False
-
-        request = getattr(response, "request", None)
-        request_url = getattr(request, "url", None)
-        provider = None
-        if request_url is not None:
-            host = (getattr(request_url, "host", "") or "").lower()
-            provider = _host_to_usage_provider(host)
-            if host and provider is None:
-                return False
-
-        content_type = ""
-        headers = getattr(response, "headers", None)
-        if headers is not None:
-            try:
-                content_type = str(headers.get("content-type", "") or "").lower()
-            except Exception:
-                content_type = ""
-        if content_type and "json" not in content_type:
-            return False
-
-        payload = response.json()
-        if not isinstance(payload, dict):
-            return False
-
-        usage = _normalize_openrouter_usage_payload(payload.get("usage"))
-        if usage is None:
-            return False
-
-        model_id = str(payload.get("model", "") or "")
-        set_openrouter_usage(usage, model_id=model_id, accumulate=True, provider=provider)
-
-        # v1.1.12 — feed the authoritative billed-cost ledger straight from this
-        # interceptor chokepoint: exactly one row per billed OpenRouter response,
-        # carrying the precise ``usage.cost`` OpenRouter returned, independent of
-        # the lossy per-stage ``_record_cost`` attribution.  Gate on the
-        # OpenRouter provider; ``_append_openrouter_billed_entry`` itself rejects
-        # zero / non-finite costs, so estimated / cost-less rows (e.g. Alibaba
-        # coding plan, which forces cost to 0) never enter the ledger.
-        if provider == LLM_PROVIDER_OPENROUTER:
-            _append_openrouter_billed_entry(
-                model_id=_canonicalize_usage_model_id(model_id, provider),
-                total_cost_usd=usage.get("cost", 0.0) or 0.0,
-                input_tokens=usage.get("prompt_tokens", 0) or 0,
-                output_tokens=usage.get("completion_tokens", 0) or 0,
-            )
-
-        try:
-            setattr(response, "_crucible_or_usage_captured", True)
-        except Exception:
-            pass
-        return True
-    except Exception:
-        return False
-
-
 def set_openrouter_usage(
     usage: Dict[str, Any],
     model_id: str = "",
@@ -1389,13 +1314,16 @@ def _append_openrouter_billed_entry(
     total_cost_usd: float = 0.0,
     input_tokens: int = 0,
     output_tokens: int = 0,
+    cached_tokens: int = 0,
+    reasoning_tokens: int = 0,
 ) -> None:
     """Append one authoritative billed-cost row (exact OpenRouter ``usage.cost``).
 
-    Called from the HTTP interceptor for every billed OpenRouter response.  The
-    ledger is the single source of truth for the per-run USD total; it is never
-    cleared by ``clear_openrouter_usage()`` — only by
-    ``reset_openrouter_billed_ledger()`` at run start.
+    Fed from the LiteLLM success callback (``_record_litellm_success``) for every
+    billed OpenRouter response.  The ledger is the single source of truth for the
+    per-run USD and token totals; it is never cleared by
+    ``clear_openrouter_usage()`` — only by ``reset_openrouter_billed_ledger()``
+    at run start.
 
     Rejects NaN / ±inf / non-positive costs so a malformed payload can never
     poison the sum (``not (x > 0)`` rejects NaN and ``-inf``; ``x == inf`` is
@@ -1407,19 +1335,20 @@ def _append_openrouter_billed_entry(
         return
     if not (cost_val > 0.0) or cost_val == float("inf"):
         return
-    try:
-        in_tok = max(0, int(input_tokens or 0))
-    except (TypeError, ValueError):
-        in_tok = 0
-    try:
-        out_tok = max(0, int(output_tokens or 0))
-    except (TypeError, ValueError):
-        out_tok = 0
+
+    def _nonneg_int(value: Any) -> int:
+        try:
+            return max(0, int(value or 0))
+        except (TypeError, ValueError):
+            return 0
+
     entry = {
         "model_id": str(model_id or ""),
         "total_cost_usd": cost_val,
-        "input_tokens": in_tok,
-        "output_tokens": out_tok,
+        "input_tokens": _nonneg_int(input_tokens),
+        "output_tokens": _nonneg_int(output_tokens),
+        "cached_tokens": _nonneg_int(cached_tokens),
+        "reasoning_tokens": _nonneg_int(reasoning_tokens),
     }
     with _OPENROUTER_BILLED_LEDGER_LOCK:
         _OPENROUTER_BILLED_LEDGER.append(entry)
@@ -1463,6 +1392,32 @@ def get_openrouter_billed_total() -> float:
             except (TypeError, ValueError):
                 continue
         return total
+
+
+def get_openrouter_billed_tokens() -> Dict[str, int]:
+    """Return the authoritative per-run token totals from the billed-cost ledger.
+
+    Keys: ``input_tokens`` / ``output_tokens`` / ``cached_tokens`` /
+    ``reasoning_tokens`` / ``total_tokens`` (``input + output``).  Every billed
+    OpenRouter response contributes exactly one row, so these equal the exact
+    token counts the operator sees on the dashboard — the authoritative override
+    the cost summary uses for the headline ``total_tokens``.
+    """
+    totals = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cached_tokens": 0,
+        "reasoning_tokens": 0,
+    }
+    with _OPENROUTER_BILLED_LEDGER_LOCK:
+        for row in _OPENROUTER_BILLED_LEDGER:
+            for key in totals:
+                try:
+                    totals[key] += max(0, int(row.get(key, 0) or 0))
+                except (TypeError, ValueError):
+                    continue
+    totals["total_tokens"] = totals["input_tokens"] + totals["output_tokens"]
+    return totals
 
 
 def _get_model_pricing(model_id: str) -> Tuple[float, float]:
@@ -1512,124 +1467,523 @@ def _get_model_pricing(model_id: str) -> Tuple[float, float]:
     return (0.0, 0.0)
 
 
-def extract_and_set_usage_from_crew(crew: Any, model_id: str = "") -> None:
+# ── v1.2.3 — LiteLLM-native cost/usage capture (single source of truth) ──────
+# CrewAI delegates every LLM call to ``litellm.completion`` and LiteLLM exposes a
+# stable, framework-version-independent callback that carries BOTH token usage
+# and billed cost.  We register one ``CustomLogger`` as the SOLE recorder.
+#
+# Why this replaced the prior machinery (the operator-visible bug): the old
+# CrewAI ``BaseInterceptor`` + langchain ``BaseCallbackHandler`` were handed to
+# ``crewai.LLM(...)`` via ``interceptor=`` / ``callbacks=`` kwargs that
+# crewai 1.14.x silently drops (those params do not exist on its ``LLM``), so
+# real runs NEVER captured a single response.  Cost/tokens then fell back to the
+# CrewAI usage-metrics path (``extract_and_set_usage_from_crew``), whose
+# ContextVar skip-guard fails across CrewAI worker threads and re-counted
+# ``crew.calculate_usage_metrics()`` (cumulative across retries) — the multi-x
+# inflation on both USD and tokens.  The LiteLLM callback fires once per
+# completion in the call's own thread/context, so it cannot double-count and does
+# not depend on any CrewAI/langchain hook plumbing.
+
+# Per-run de-duplication keyed by response id: LiteLLM calls ``log_success_event``
+# once per completion, but we guard so a stream+success double-fire (or any
+# re-invocation) can never bill one response twice.
+_LLM_USAGE_SEEN_KEYS: Set[str] = set()
+_LLM_USAGE_SEEN_LOCK = threading.Lock()
+
+# Best-effort (stage, agent) attribution for the per-stage / per-agent breakdown.
+# Set by the orchestration around each crew kickoff
+# (resilience.kickoff_crew_with_retry).  Missing attribution is harmless: the row
+# lands under ``unattributed`` and the headline totals stay exact regardless.
+_COST_ATTRIBUTION_DEFAULT: Tuple[str, str] = ("unattributed", "llm")
+_COST_ATTRIBUTION: contextvars.ContextVar[Tuple[str, str]] = contextvars.ContextVar(
+    "crucible_cost_attribution", default=_COST_ATTRIBUTION_DEFAULT
+)
+
+
+def set_cost_attribution(stage: str, agent: str = "") -> Any:
+    """Stamp the (stage, agent) tag the LiteLLM callback writes onto each row.
+
+    Returns the ``contextvars.Token`` so the caller can restore the prior value
+    with :func:`reset_cost_attribution`.
+    """
+    stage_clean = str(stage or "").strip() or "unattributed"
+    agent_clean = str(agent or "").strip() or "llm"
+    return _COST_ATTRIBUTION.set((stage_clean, agent_clean))
+
+
+def reset_cost_attribution(token: Any) -> None:
+    if token is None:
+        return
     try:
-        existing = _OPENROUTER_USAGE_CONTEXT.get({})
-        resolved_provider = _resolve_usage_provider()
-        if _usage_context_matches_provider(existing, resolved_provider) and existing.get("cost_source") in (
-            "openrouter_api",
-            "openrouter_tokens_with_pricing",
-        ) and (existing.get("total_cost_usd", 0.0) or 0.0) > 0:
-            return
+        _COST_ATTRIBUTION.reset(token)
+    except (ValueError, LookupError):
+        # Token created in a different context (e.g. a crew worker thread).
+        _COST_ATTRIBUTION.set(_COST_ATTRIBUTION_DEFAULT)
 
-        usage_metrics = crew.calculate_usage_metrics()
-        if usage_metrics is None:
-            return
 
-        prompt_tokens = getattr(usage_metrics, "prompt_tokens", 0) or 0
-        completion_tokens = getattr(usage_metrics, "completion_tokens", 0) or 0
-        # Explicit None-only guard: use the API-reported total when present
-        # (including total_tokens=0 for empty/no-cost responses).  The previous
-        # `_raw_total > 0` condition re-introduced the falsy-zero bug — it
-        # treated total_tokens=0 as absent and fell back to prompt+completion,
-        # inconsistent with set_openrouter_usage which uses `is not None` only.
-        _raw_total = getattr(usage_metrics, "total_tokens", None)
-        total_tokens = (
-            _raw_total if _raw_total is not None
-            else (prompt_tokens + completion_tokens)
+def reset_llm_usage_dedup() -> None:
+    """Clear the per-run response-dedup set (call once at run start)."""
+    with _LLM_USAGE_SEEN_LOCK:
+        _LLM_USAGE_SEEN_KEYS.clear()
+
+
+def _cost_is_finite_positive(value: Any) -> bool:
+    """True iff ``value`` is a finite, strictly-positive float (NaN/inf safe)."""
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return False
+    # ``v == v`` rejects NaN; the explicit inf check rejects +inf.
+    return v > 0.0 and v != float("inf") and v == v
+
+
+def _usage_obj_to_dict(usage: Any) -> Dict[str, Any]:
+    """Coerce a LiteLLM ``Usage`` (pydantic) / dict / namespace into a plain dict."""
+    if usage is None:
+        return {}
+    if isinstance(usage, dict):
+        return dict(usage)
+    for attr in ("model_dump", "dict"):
+        fn = getattr(usage, attr, None)
+        if callable(fn):
+            try:
+                dumped = fn()
+                if isinstance(dumped, dict):
+                    return dumped
+            except Exception:
+                pass
+    out: Dict[str, Any] = {}
+    for key in (
+        "prompt_tokens",
+        "completion_tokens",
+        "total_tokens",
+        "prompt_tokens_details",
+        "completion_tokens_details",
+        "cost",
+    ):
+        val = getattr(usage, key, None)
+        if val is None:
+            continue
+        if key.endswith("_details") and not isinstance(val, dict):
+            val = _usage_obj_to_dict(val)
+        out[key] = val
+    return out
+
+
+def _resolve_litellm_call_provider(kwargs: Dict[str, Any], response_obj: Any) -> str:
+    """Best-effort provider resolution from the LiteLLM call kwargs / response."""
+    try:
+        litellm_params = kwargs.get("litellm_params") or {}
+        api_base = litellm_params.get("api_base") or kwargs.get("api_base") or ""
+        host_provider = _host_to_usage_provider(str(api_base or ""))
+        if host_provider:
+            return host_provider
+    except Exception:
+        pass
+    try:
+        model = str(kwargs.get("model") or getattr(response_obj, "model", "") or "").lower()
+        if "openrouter" in model:
+            return LLM_PROVIDER_OPENROUTER
+        if "dashscope" in model or "coding-intl" in model:
+            return LLM_PROVIDER_ALIBABA_CODING_PLAN
+    except Exception:
+        pass
+    return _resolve_usage_provider()
+
+
+def _resolve_litellm_cost(
+    kwargs: Dict[str, Any],
+    response_obj: Any,
+    usage: Dict[str, Any],
+    provider: str,
+) -> Tuple[float, str]:
+    """Return ``(total_cost_usd, cost_source)`` for one completion.
+
+    Priority: OpenRouter authoritative ``usage.cost`` (sent via
+    ``usage: {include: true}``) → LiteLLM ``response_cost`` threaded into the
+    logging ``kwargs`` → ``litellm.completion_cost(response_obj)``.  Alibaba
+    coding-plan is token-only (cost forced to 0).
+    """
+    if provider == LLM_PROVIDER_ALIBABA_CODING_PLAN:
+        return 0.0, "alibaba_coding_plan_tokens_only"
+    raw_cost = usage.get("cost")
+    if _cost_is_finite_positive(raw_cost):
+        return float(raw_cost), "openrouter_api"
+    rc = kwargs.get("response_cost")
+    if _cost_is_finite_positive(rc):
+        return float(rc), "litellm_computed"
+    try:
+        import litellm
+
+        computed = litellm.completion_cost(completion_response=response_obj)
+        if _cost_is_finite_positive(computed):
+            return float(computed), "litellm_computed"
+    except Exception:
+        pass
+    return 0.0, "estimated"
+
+
+def _extract_usage_counts(usage: Dict[str, Any]) -> Tuple[int, int, int, int, int]:
+    """Return ``(prompt, completion, total, cached, reasoning)`` from a usage dict.
+
+    Robust to BOTH the nested OpenAI/OpenRouter shape
+    (``prompt_tokens_details.cached_tokens`` / ``completion_tokens_details.reasoning_tokens``)
+    AND CrewAI's flattened shape (``cached_prompt_tokens`` / ``reasoning_tokens``),
+    so the same recorder serves the CrewAI event listener and the LiteLLM
+    callback without divergence.
+    """
+    prompt = int(usage.get("prompt_tokens", usage.get("input_tokens", 0)) or 0)
+    completion = int(usage.get("completion_tokens", usage.get("output_tokens", 0)) or 0)
+    _raw_total = usage.get("total_tokens")
+    total = int(_raw_total if _raw_total is not None else (prompt + completion))
+    prompt_details = usage.get("prompt_tokens_details") or {}
+    if not isinstance(prompt_details, dict):
+        prompt_details = _usage_obj_to_dict(prompt_details)
+    completion_details = usage.get("completion_tokens_details") or {}
+    if not isinstance(completion_details, dict):
+        completion_details = _usage_obj_to_dict(completion_details)
+    cached = int(
+        prompt_details.get(
+            "cached_tokens",
+            usage.get("cached_prompt_tokens", usage.get("cached_tokens", 0)) or 0,
         )
-        cached_tokens = getattr(usage_metrics, "cached_prompt_tokens", 0) or 0
+        or 0
+    )
+    reasoning = int(
+        completion_details.get(
+            "reasoning_tokens",
+            usage.get("reasoning_tokens", usage.get("native_tokens_reasoning", 0)) or 0,
+        )
+        or 0
+    )
+    return prompt, completion, total, cached, reasoning
 
-        if total_tokens == 0:
+
+def _record_llm_usage(
+    *,
+    response_id: Any,
+    model: Any,
+    usage: Any,
+    response_cost: Any = None,
+    response_obj: Any = None,
+) -> None:
+    """THE single cost/usage recording chokepoint (v1.2.3).
+
+    Shared by the CrewAI ``LLMCallCompletedEvent`` listener (the PRIMARY capture —
+    crucible's LLM is CrewAI's native ``OpenAICompletion`` provider, which uses the
+    OpenAI SDK directly and never routes through LiteLLM) and the LiteLLM success
+    callback (a fallback for any direct-LiteLLM path).
+
+    Anti-double-count contract:
+    * **One stable dedup key per call** (``response_id`` = the provider generation
+      id).  A call observed by BOTH paths (e.g. a LiteLLM-backed provider) shares
+      the same id, so it is recorded exactly once.  A call with no usable id is
+      SKIPPED rather than risk an un-dedupable double count.
+    * All recording funnels through here — no other code path calls
+      ``get_cost_accountant().record`` for live LLM cost (pinned by a structural
+      test), so a future additive change cannot silently introduce a second
+      counting path.
+
+    Best-effort: never raises (cost accounting must not crash a run).
+    """
+    try:
+        if not isinstance(usage, dict) or not usage:
+            return
+        dedup_key = str(response_id or "").strip()
+        if not dedup_key:
+            # No stable id → cannot guarantee dedup → skip (undercount-safe) rather
+            # than risk the double-counting the whole subsystem was rewritten to kill.
+            return
+        with _LLM_USAGE_SEEN_LOCK:
+            if dedup_key in _LLM_USAGE_SEEN_KEYS:
+                return
+            _LLM_USAGE_SEEN_KEYS.add(dedup_key)
+
+        prompt_tokens, completion_tokens, total_tokens, cached_tokens, reasoning_tokens = (
+            _extract_usage_counts(usage)
+        )
+        # Skip control calls that did no measurable work.
+        if total_tokens <= 0:
             return
 
-        model_id = _canonicalize_usage_model_id(model_id, resolved_provider)
-        if resolved_provider == LLM_PROVIDER_ALIBABA_CODING_PLAN:
-            _token_only_cost_source = "alibaba_coding_plan_tokens_only"
-            ctx_data = {
-                "input_tokens": int(prompt_tokens),
-                "output_tokens": int(completion_tokens),
-                "total_tokens": int(total_tokens),
-                "cached_tokens": int(cached_tokens),
-                "reasoning_tokens": 0,
-                "input_cost_usd": 0.0,
-                "output_cost_usd": 0.0,
-                "cache_cost_usd": 0.0,
-                "total_cost_usd": 0.0,
-                "model_id": str(model_id),
-                "cost_source": _token_only_cost_source,
-                "llm_provider": resolved_provider,
-            }
-            records = list(_OPENROUTER_USAGE_RECORDS.get([]))
-            records.append(dict(ctx_data))
-            _OPENROUTER_USAGE_RECORDS.set(records)
-            _OPENROUTER_USAGE_CONTEXT.set(ctx_data)
-            return
+        # Reuse the existing provider/cost resolvers via a minimal kwargs shim so
+        # the event path and the LiteLLM path share identical resolution logic.
+        shim_kwargs: Dict[str, Any] = {"model": model}
+        if response_cost is not None:
+            shim_kwargs["response_cost"] = response_cost
+        provider = _resolve_litellm_call_provider(shim_kwargs, response_obj)
+        model_id = _canonicalize_usage_model_id(str(model or ""), provider)
+        total_cost, cost_source = _resolve_litellm_cost(shim_kwargs, response_obj, usage, provider)
 
-        input_price, output_price = _get_model_pricing(model_id)
-        pricing_known = input_price > 0 or output_price > 0
-        input_cost = prompt_tokens * input_price if pricing_known else 0.0
-        output_cost = completion_tokens * output_price if pricing_known else 0.0
-        cache_savings = (
-            _estimate_cache_savings(
-                prompt_tokens=int(prompt_tokens),
+        # No authoritative/computed cost → fall back to the local pricing table so
+        # USD is a labelled estimate (``openrouter_tokens_with_pricing``) rather
+        # than silently 0.  Authoritative ``usage.cost`` (openrouter_api) always
+        # wins above and keeps the billed-ledger headline exact.
+        if (
+            provider == LLM_PROVIDER_OPENROUTER
+            and cost_source == "estimated"
+            and not (total_cost > 0)
+        ):
+            input_price, output_price = _get_model_pricing(model_id)
+            if input_price > 0 or output_price > 0:
+                est_in = prompt_tokens * input_price
+                est_out = completion_tokens * output_price
+                est_save = _estimate_cache_savings(
+                    prompt_tokens=int(prompt_tokens),
+                    cached_tokens=int(cached_tokens),
+                    input_cost=float(est_in),
+                    input_price=float(input_price),
+                )
+                total_cost = max(0.0, float(est_in + est_out - est_save))
+                cost_source = "openrouter_tokens_with_pricing"
+
+        # Split the total cost across input/output proportionally to tokens.
+        input_cost = 0.0
+        output_cost = 0.0
+        if total_cost > 0:
+            denom = prompt_tokens + completion_tokens
+            if denom > 0:
+                input_cost = total_cost * (prompt_tokens / denom)
+                output_cost = total_cost - input_cost
+            else:
+                input_cost = total_cost
+        cache_cost = _estimate_cache_savings(
+            prompt_tokens=int(prompt_tokens),
+            cached_tokens=int(cached_tokens),
+            input_cost=float(input_cost),
+        )
+
+        stage, agent = _COST_ATTRIBUTION.get(_COST_ATTRIBUTION_DEFAULT)
+
+        get_cost_accountant().record(
+            agent_name=agent,
+            stage=stage,
+            input_tokens=prompt_tokens,
+            output_tokens=completion_tokens,
+            success=True,
+            cache_hit=cached_tokens > 0,
+            outcome="success",
+            cached_tokens=cached_tokens,
+            reasoning_tokens=reasoning_tokens,
+            input_cost_usd=float(input_cost),
+            output_cost_usd=float(output_cost),
+            cache_cost_usd=float(cache_cost),
+            total_cost_usd=float(total_cost),
+            model_id=model_id,
+            cost_source=cost_source,
+        )
+
+        # Authoritative billed-cost ledger: OpenRouter responses carrying a real
+        # billed ``usage.cost`` only.  Drives the v1.1.12 reconcile path as the
+        # headline authority (``get_openrouter_billed_total/tokens()``).
+        if provider == LLM_PROVIDER_OPENROUTER and cost_source == "openrouter_api":
+            _append_openrouter_billed_entry(
+                model_id=model_id,
+                total_cost_usd=float(total_cost),
+                input_tokens=int(prompt_tokens),
+                output_tokens=int(completion_tokens),
                 cached_tokens=int(cached_tokens),
-                input_cost=float(input_cost),
-                input_price=float(input_price),
+                reasoning_tokens=int(reasoning_tokens),
             )
-            if pricing_known
-            else 0.0
-        )
-        total_cost = input_cost + output_cost - cache_savings if pricing_known else 0.0
+    except Exception:
+        pass
 
-        if pricing_known:
-            ctx_data = {
-                "input_tokens": int(prompt_tokens),
-                "output_tokens": int(completion_tokens),
-                "total_tokens": int(total_tokens),
-                "cached_tokens": int(cached_tokens),
-                "reasoning_tokens": 0,
-                "input_cost_usd": float(input_cost),
-                "output_cost_usd": float(output_cost),
-                "cache_cost_usd": float(cache_savings),
-                "total_cost_usd": float(total_cost),
-                "model_id": str(model_id),
-                "cost_source": "crewai_metrics_with_pricing",
-                "llm_provider": resolved_provider,
-            }
-        else:
-            ctx_data = {
-                "input_tokens": int(prompt_tokens),
-                "output_tokens": int(completion_tokens),
-                "total_tokens": int(total_tokens),
-                "cached_tokens": int(cached_tokens),
-                "reasoning_tokens": 0,
-                "input_cost_usd": 0.0,
-                "output_cost_usd": 0.0,
-                "cache_cost_usd": 0.0,
-                "total_cost_usd": 0.0,
-                "model_id": str(model_id),
-                "cost_source": "estimated",
-                "llm_provider": resolved_provider,
-            }
-        records = list(_OPENROUTER_USAGE_RECORDS.get([]))
-        records.append(dict(ctx_data))
-        _OPENROUTER_USAGE_RECORDS.set(records)
-        _OPENROUTER_USAGE_CONTEXT.set(ctx_data)
-    except Exception as exc:
-        # Billing/usage extraction must never crash a run, but a fully silent
-        # swallow makes cost-discrepancy bugs invisible.  Emit a single
-        # diagnostic line so the failure shows up in logs.  Use stderr (rather
-        # than runtime_logging) so this stays usable during very early bootstrap
-        # before the runtime logger is wired up.
+
+def _record_litellm_success(kwargs: Any, response_obj: Any) -> None:
+    """LiteLLM success-callback adapter → the shared ``_record_llm_usage`` sink.
+
+    Fallback path: fires only for calls that actually route through
+    ``litellm.completion`` (crucible's native ``OpenAICompletion`` does not).
+    """
+    try:
+        if not isinstance(kwargs, dict):
+            kwargs = {}
+        usage = _usage_obj_to_dict(getattr(response_obj, "usage", None))
+        if not usage:
+            usage = _usage_obj_to_dict(kwargs.get("usage"))
         try:
-            print(
-                f"[WARN] extract_and_set_usage_from_crew failed: "
-                f"{type(exc).__name__}: {exc}",
-                file=sys.stderr,
-            )
+            resp_id = str(getattr(response_obj, "id", "") or "")
+        except Exception:
+            resp_id = ""
+        _record_llm_usage(
+            response_id=resp_id,
+            model=(kwargs.get("model") or getattr(response_obj, "model", "")),
+            usage=usage,
+            response_cost=kwargs.get("response_cost"),
+            response_obj=response_obj,
+        )
+    except Exception:
+        pass
+
+
+def _on_crewai_llm_call_completed(source: Any, event: Any) -> None:
+    """CrewAI ``LLMCallCompletedEvent`` listener — PRIMARY cost capture (v1.2.3).
+
+    crucible's LLM is CrewAI's native ``OpenAICompletion`` (OpenAI SDK, often
+    streaming), which bypasses LiteLLM entirely — so the LiteLLM callback never
+    fires for it.  CrewAI emits this event once per completed call (streaming and
+    non-streaming) carrying token usage + model + the provider generation id; the
+    OpenRouter ``usage.cost`` it normally drops is restored by
+    ``_install_crewai_usage_cost_passthrough``.
+    """
+    try:
+        usage = _usage_obj_to_dict(getattr(event, "usage", None))
+        response_id = (
+            str(getattr(event, "response_id", "") or "").strip()
+            or str(getattr(event, "call_id", "") or "").strip()
+            or str(getattr(event, "event_id", "") or "").strip()
+        )
+        _record_llm_usage(
+            response_id=response_id,
+            model=str(getattr(event, "model", "") or ""),
+            usage=usage,
+        )
+    except Exception:
+        pass
+
+
+_LITELLM_USAGE_LOGGER: Optional[Any] = None
+
+try:
+    from litellm.integrations.custom_logger import CustomLogger as _LiteLLMCustomLogger
+
+    class _LiteLLMUsageLogger(_LiteLLMCustomLogger):
+        """Sole cost/usage recorder — fires once per completed LiteLLM call."""
+
+        def log_success_event(self, kwargs, response_obj, start_time, end_time):  # noqa: D401,ANN001
+            _record_litellm_success(kwargs, response_obj)
+
+        async def async_log_success_event(self, kwargs, response_obj, start_time, end_time):  # noqa: D401,ANN001
+            _record_litellm_success(kwargs, response_obj)
+
+    _LITELLM_USAGE_LOGGER = _LiteLLMUsageLogger()
+except Exception:  # pragma: no cover - litellm is always present in practice
+    _LiteLLMUsageLogger = None  # type: ignore[assignment,misc]
+    _LITELLM_USAGE_LOGGER = None
+
+
+def get_litellm_usage_logger() -> Optional[Any]:
+    return _LITELLM_USAGE_LOGGER
+
+
+def ensure_litellm_usage_logger_registered() -> bool:
+    """Idempotently register the usage logger into ``litellm.callbacks``.
+
+    Safe to call on every LLM build; returns True once the logger is live.
+    """
+    logger = _LITELLM_USAGE_LOGGER
+    if logger is None:
+        return False
+    try:
+        import litellm
+
+        callbacks = getattr(litellm, "callbacks", None)
+        if not isinstance(callbacks, list):
+            litellm.callbacks = [logger]
+            return True
+        if logger not in callbacks:
+            callbacks.append(logger)
+        return True
+    except Exception:
+        return False
+
+
+# ── CrewAI native-provider cost/usage capture (v1.2.3 — the PRIMARY path) ─────
+# crucible's LLM is CrewAI's native ``OpenAICompletion`` (OpenAI SDK, not
+# LiteLLM), so the LiteLLM callback above never fires for it.  CrewAI DOES emit a
+# per-call ``LLMCallCompletedEvent`` (streaming and non-streaming) on its event
+# bus — that is the one reliable, provider-agnostic capture point.  Two module
+# flags guarantee the two pieces are installed EXACTLY ONCE; re-subscribing the
+# listener would make every event record N times (the classic event-bus
+# double-count), so idempotency here is a hard invariant pinned by tests.
+_CREWAI_USAGE_LISTENER_REGISTERED: bool = False
+_CREWAI_COST_PASSTHROUGH_INSTALLED: bool = False
+
+
+def _install_crewai_usage_cost_passthrough() -> bool:
+    """Preserve OpenRouter's ``usage.cost`` through CrewAI's usage extractor.
+
+    CrewAI's ``OpenAICompletion._extract_*_token_usage`` copies only token counts
+    into the usage dict it emits on ``LLMCallCompletedEvent`` — it drops the
+    ``cost`` field OpenRouter returns (which survives openai-SDK parsing as a
+    pydantic extra on ``response.usage``).  Without ``cost`` the headline USD
+    would fall back to a local pricing estimate.  This wraps the extractor(s) to
+    re-attach ``cost`` so the event carries the authoritative billed amount.
+
+    Idempotent and fail-soft: if the (version-specific) method is renamed in a
+    future CrewAI, the wrap simply isn't installed and USD degrades gracefully to
+    the pricing-table estimate — never a crash.  A structural test pins that the
+    extractor methods still exist so the silent degrade is caught at test time.
+    """
+    global _CREWAI_COST_PASSTHROUGH_INSTALLED
+    if _CREWAI_COST_PASSTHROUGH_INSTALLED:
+        return True
+    try:
+        from crewai.llms.providers.openai.completion import OpenAICompletion
+    except Exception:
+        return False
+
+    def _make_wrapper(orig: Any) -> Any:
+        def _wrapped(self: Any, response: Any, *args: Any, **kwargs: Any) -> Any:
+            result = orig(self, response, *args, **kwargs)
+            try:
+                if isinstance(result, dict) and "cost" not in result:
+                    usage_obj = getattr(response, "usage", None)
+                    cost = None
+                    if usage_obj is not None:
+                        cost = getattr(usage_obj, "cost", None)
+                        if cost is None:
+                            extra = getattr(usage_obj, "model_extra", None)
+                            if isinstance(extra, dict):
+                                cost = extra.get("cost")
+                    if cost is not None:
+                        result["cost"] = cost
+            except Exception:
+                pass
+            return result
+
+        _wrapped._crucible_cost_wrapped = True  # type: ignore[attr-defined]
+        return _wrapped
+
+    installed_any = False
+    for meth_name in ("_extract_openai_token_usage", "_extract_responses_token_usage"):
+        orig = getattr(OpenAICompletion, meth_name, None)
+        if orig is None or getattr(orig, "_crucible_cost_wrapped", False):
+            continue
+        try:
+            setattr(OpenAICompletion, meth_name, _make_wrapper(orig))
+            installed_any = True
         except Exception:
             pass
+    _CREWAI_COST_PASSTHROUGH_INSTALLED = True
+    return installed_any
+
+
+def ensure_crewai_usage_listener_registered() -> bool:
+    """Idempotently subscribe the CrewAI cost listener (v1.2.3 — PRIMARY capture).
+
+    Registers ``_on_crewai_llm_call_completed`` for ``LLMCallCompletedEvent``
+    exactly once per process (guarded by ``_CREWAI_USAGE_LISTENER_REGISTERED``).
+    Double-subscription would record every call twice — the invariant a structural
+    test pins.  Also installs the cost-passthrough wrap.  Returns True once live.
+    """
+    global _CREWAI_USAGE_LISTENER_REGISTERED
+    if _CREWAI_USAGE_LISTENER_REGISTERED:
+        return True
+    try:
+        from crewai.events import crewai_event_bus
+        from crewai.events.types.llm_events import LLMCallCompletedEvent
+    except Exception:
+        return False
+    try:
+        _install_crewai_usage_cost_passthrough()
+        crewai_event_bus.register_handler(
+            LLMCallCompletedEvent, _on_crewai_llm_call_completed
+        )
+        _CREWAI_USAGE_LISTENER_REGISTERED = True
+        return True
+    except Exception:
+        return False
 
 
 def inject_openrouter_usage_extra_body(llm_kwargs: Dict[str, Any]) -> Dict[str, Any]:
@@ -1670,120 +2024,16 @@ def inject_openrouter_usage_extra_body(llm_kwargs: Dict[str, Any]) -> Dict[str, 
     return llm_kwargs
 
 
-try:
-    from langchain_core.callbacks import BaseCallbackHandler
-
-    class OpenRouterUsageCallbackHandler(BaseCallbackHandler):
-        def on_llm_end(self, response: Any, **kwargs: Any) -> None:
-            try:
-                llm_output = getattr(response, "llm_output", None) or {}
-                usage = llm_output.get("token_usage", {}) if isinstance(llm_output, dict) else {}
-
-                if not usage:
-                    for attr in ("usage", "response_metadata"):
-                        if hasattr(response, attr):
-                            candidate = getattr(response, attr, None)
-                            if isinstance(candidate, dict) and "prompt_tokens" in candidate:
-                                usage = candidate
-                                break
-
-                model_id = ""
-                if hasattr(response, "model"):
-                    model_id = getattr(response, "model", "") or ""
-                elif isinstance(llm_output, dict):
-                    model_id = llm_output.get("model_name", "") or llm_output.get("model", "") or ""
-
-                if usage:
-                    set_openrouter_usage(usage, model_id)
-            except Exception:
-                pass
-
-    _OPENROUTER_CALLBACK_HANDLER = OpenRouterUsageCallbackHandler()
-
-except ImportError:
-
-    class OpenRouterUsageCallbackHandler:
-        pass
-
-    _OPENROUTER_CALLBACK_HANDLER = None
-
-
-def get_openrouter_callback_handler() -> Optional[Any]:
-    return _OPENROUTER_CALLBACK_HANDLER
-
-
-try:
-    from crewai.llms.hooks.base import BaseInterceptor
-
-    class OpenRouterUsageHTTPInterceptor(BaseInterceptor[httpx.Request, httpx.Response]):
-        def on_outbound(self, message: httpx.Request) -> httpx.Request:
-            return message
-
-        def on_inbound(self, message: httpx.Response) -> httpx.Response:
-            # v1.1.3 — Force-load the body before delegating to the sync
-            # capture helper.  Crewai's HTTPTransport runs ``on_inbound``
-            # with the response stream still unread; the capture helper
-            # then calls ``response.json()`` synchronously, which raises
-            # ``ResponseNotRead`` on async responses (silently swallowed
-            # by the helper's broad except).  ``read()`` is idempotent
-            # on already-loaded bodies, so this is a no-op when the
-            # stream is sync-readable and a body-loader otherwise.
-            try:
-                content_type = ""
-                headers = getattr(message, "headers", None)
-                if headers is not None:
-                    try:
-                        content_type = str(headers.get("content-type", "") or "").lower()
-                    except Exception:
-                        content_type = ""
-                if not content_type or "event-stream" not in content_type:
-                    try:
-                        message.read()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            _capture_openrouter_usage_from_http_response(message)
-            return message
-
-        async def aon_outbound(self, message: httpx.Request) -> httpx.Request:
-            return message
-
-        async def aon_inbound(self, message: httpx.Response) -> httpx.Response:
-            # v1.1.3 — Same body-load fix as on_inbound, but via aread()
-            # for the async transport path.  Without aread(), the body
-            # is still streamed and the sync ``response.json()`` inside
-            # the capture helper raises ResponseNotRead.
-            try:
-                content_type = ""
-                headers = getattr(message, "headers", None)
-                if headers is not None:
-                    try:
-                        content_type = str(headers.get("content-type", "") or "").lower()
-                    except Exception:
-                        content_type = ""
-                if not content_type or "event-stream" not in content_type:
-                    try:
-                        await message.aread()
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-            _capture_openrouter_usage_from_http_response(message)
-            return message
-
-    _OPENROUTER_HTTP_INTERCEPTOR = OpenRouterUsageHTTPInterceptor()
-
-except ImportError:
-
-    class OpenRouterUsageHTTPInterceptor:
-        pass
-
-    _OPENROUTER_HTTP_INTERCEPTOR = None
-
-
-def get_openrouter_http_interceptor() -> Optional[Any]:
-    return _OPENROUTER_HTTP_INTERCEPTOR
+# ── v1.2.3 — CrewAI/langchain cost hooks removed ─────────────────────────────
+# The langchain ``BaseCallbackHandler`` and CrewAI ``BaseInterceptor`` cost hooks
+# that used to live here were dead in real runs: crewai 1.14.x ``LLM.__init__``
+# silently drops the ``callbacks=`` / ``interceptor=`` kwargs they were wired
+# through, so neither ever fired and cost/tokens fell back to the lossy CrewAI
+# usage-metrics path (the multi-x inflation).  Cost/usage is now captured solely
+# by the LiteLLM success callback (``_LiteLLMUsageLogger`` /
+# ``ensure_litellm_usage_logger_registered``), the one chokepoint CrewAI actually
+# routes through.  The ``inject_openrouter_usage_extra_body`` opt-in above stays:
+# it makes OpenRouter return the authoritative billed ``usage.cost``.
 
 
 def _cost_trace(stage: str, **fields: Any) -> None:
@@ -1813,45 +2063,18 @@ def _record_cost(
     use_openrouter_usage: bool = True,
     clear_usage_after_record: bool = True,
 ) -> None:
-    try:
-        usage_data = get_last_openrouter_usage() if use_openrouter_usage else None
+    """Deprecated no-op (v1.2.3).
 
-        if usage_data and usage_data.total_tokens > 0:
-            accountant = get_cost_accountant()
-            accountant.record(
-                agent_name=agent_name,
-                stage=stage,
-                input_tokens=usage_data.input_tokens,
-                output_tokens=usage_data.output_tokens,
-                success=success,
-                cache_hit=usage_data.cached_tokens > 0,
-                retry_count=retry_count,
-                outcome=outcome,
-                cached_tokens=usage_data.cached_tokens,
-                reasoning_tokens=usage_data.reasoning_tokens,
-                input_cost_usd=usage_data.input_cost_usd,
-                output_cost_usd=usage_data.output_cost_usd,
-                cache_cost_usd=usage_data.cache_cost_usd,
-                total_cost_usd=usage_data.total_cost_usd,
-                model_id=usage_data.model_id,
-                cost_source=usage_data.cost_source,
-            )
-            if clear_usage_after_record:
-                clear_openrouter_usage()
-        else:
-            accountant = get_cost_accountant()
-            accountant.record(
-                agent_name=agent_name,
-                stage=stage,
-                input_tokens=input_tokens,
-                output_tokens=output_tokens,
-                success=success,
-                cache_hit=cache_hit,
-                retry_count=retry_count,
-                outcome=outcome,
-            )
-    except Exception:
-        pass
+    Cost/usage is now captured exclusively by the LiteLLM success callback
+    (``_record_litellm_success``), which fires once per completion at the
+    SDK chokepoint with real token counts and billed cost.  The old per-stage
+    path read an accumulating ContextVar and char-count estimates, which
+    double-counted against the callback and mis-attributed across CrewAI worker
+    threads.  This stub is retained so the ~30 existing call sites need not
+    change; it intentionally does nothing.  Stage attribution now flows through
+    ``set_cost_attribution`` around each crew kickoff.
+    """
+    return None
 
 
 def _coerce_json_dict(value: Any) -> Optional[dict]:

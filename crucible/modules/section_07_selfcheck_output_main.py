@@ -220,6 +220,9 @@ def _reset_pipeline_runtime_state() -> None:
     # Main can be called repeatedly inside one process via module_runtime; clear prior run state.
     clear_openrouter_usage()
     reset_openrouter_billed_ledger()  # v1.1.12 — authoritative billed-cost ledger (per-run)
+    reset_llm_usage_dedup()  # v1.2.3 — per-run response-dedup set (shared by both capture paths)
+    ensure_crewai_usage_listener_registered()  # v1.2.3 — PRIMARY capture (native OpenAICompletion)
+    ensure_litellm_usage_logger_registered()  # v1.2.3 — fallback capture (direct LiteLLM path)
     reset_cost_accountant()
     reset_circuit_breakers()
     clear_last_librarian_debug()
@@ -277,6 +280,31 @@ def _reconcile_cost_summary_with_billing(summary: Any) -> Any:
     reconciled["total_cost_usd_attributed"] = attributed
     reconciled["billed_request_count"] = billed_count
     reconciled["cost_source"] = "openrouter_api"
+
+    # v1.2.3 — also promote the authoritative TOKEN totals from the billed-cost
+    # ledger to the headline, mirroring the USD promotion above.  Every billed
+    # OpenRouter response contributes exactly one ledger row, so these equal the
+    # dashboard's token counts.  Without this, ``total_tokens`` kept coming from
+    # the per-stage accountant — which is why tokens could still read multiples of
+    # the real usage even after the USD headline was corrected in v1.1.12.  The
+    # pre-promotion figure is preserved as ``total_tokens_attributed``.
+    try:
+        billed_tokens = get_openrouter_billed_tokens()
+    except Exception:
+        billed_tokens = {}
+    billed_total_tokens = int(billed_tokens.get("total_tokens", 0) or 0)
+    if billed_total_tokens > 0:
+        try:
+            attributed_tokens = int(reconciled.get("total_tokens", 0) or 0)
+        except (TypeError, ValueError):
+            attributed_tokens = 0
+        reconciled["total_tokens"] = billed_total_tokens
+        reconciled["total_tokens_billed"] = billed_total_tokens
+        reconciled["total_tokens_attributed"] = attributed_tokens
+        reconciled["total_input_tokens"] = int(billed_tokens.get("input_tokens", 0) or 0)
+        reconciled["total_output_tokens"] = int(billed_tokens.get("output_tokens", 0) or 0)
+        reconciled["cached_tokens"] = int(billed_tokens.get("cached_tokens", 0) or 0)
+        reconciled["reasoning_tokens"] = int(billed_tokens.get("reasoning_tokens", 0) or 0)
     return reconciled
 
 
@@ -2002,6 +2030,11 @@ def main() -> None:
                 print(
                     "Cost Source: OpenRouter token pricing estimate "
                     "(OpenRouter returned tokens without billed cost)"
+                )
+            elif cost_source == "litellm_computed":
+                print(
+                    "Cost Source: LiteLLM-computed cost "
+                    "(provider returned tokens without a billed cost field)"
                 )
             elif cost_source == "crewai_metrics_with_pricing":
                 print("Cost Source: CrewAI usage metrics with model pricing estimate")

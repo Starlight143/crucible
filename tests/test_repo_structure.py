@@ -305,7 +305,7 @@ class TestRepoStructure(unittest.TestCase):
             "def _summarize_cost_source(records: List[AgentCostRecord]) -> str:",
             "float(x.get(\"total_cost_usd\", 0.0) or 0.0)",
             "int(x.get(\"total_tokens\", 0) or 0)",
-            "\"models_used\": list(set(r.model_id for r in self._records if r.model_id))",
+            "\"models_used\": list(set(r.model_id for r in records if r.model_id))",
             "def reset_cost_accountant() -> None:",
         )
         for marker in accounting_markers:
@@ -588,7 +588,6 @@ class TestRepoStructure(unittest.TestCase):
             "def _merge_usage_cost_source(existing_source: str, new_source: str) -> str:",
             "def _merge_usage_model_ids(existing_model_id: str, new_model_id: str) -> str:",
             "def _direction_debug_llm_model_id(llm: Any) -> str:",
-            "def _capture_openrouter_usage_from_http_response(response: Any) -> bool:",
             "def set_openrouter_usage(",
             'cost_source = "openrouter_tokens_with_pricing"',
             'cost_source = "alibaba_coding_plan_tokens_only"',
@@ -597,13 +596,27 @@ class TestRepoStructure(unittest.TestCase):
             "def _get_model_pricing(model_id: str) -> Tuple[float, float]:",
             '"llm_model_id": _direction_debug_llm_model_id(llm),',
             '"direction_judge_model_id": _direction_debug_llm_model_id(direction_judge_llm),',
-            "records.append(dict(ctx_data))",
-            '            "cost_source": "crewai_metrics_with_pricing",',
-            '            "cost_source": _token_only_cost_source,',
-            "def get_openrouter_http_interceptor() -> Optional[Any]:",
+            # v1.2.3 — LiteLLM-native capture replaced the crewai interceptor /
+            # langchain callback / crewai usage-metrics path.
+            "def _record_litellm_success(kwargs: Any, response_obj: Any) -> None:",
+            "def ensure_litellm_usage_logger_registered() -> bool:",
+            "class _LiteLLMUsageLogger",
+            "def _append_openrouter_billed_entry(",
+            "def get_openrouter_billed_tokens() -> Dict[str, int]:",
         )
         for marker in critical_markers:
             self.assertIn(marker, modules_bootstrap)
+
+        # v1.2.3 — the crewai/langchain cost hooks were hard-removed.
+        for removed in (
+            "def _capture_openrouter_usage_from_http_response(",
+            "def get_openrouter_http_interceptor(",
+            "def extract_and_set_usage_from_crew(",
+            "from crewai.llms.hooks.base import BaseInterceptor",
+            "from langchain_core.callbacks import BaseCallbackHandler",
+        ):
+            self.assertNotIn(removed, modules_bootstrap,
+                             msg=f"crewai/langchain cost hook must stay removed: {removed}")
 
         removed_broken_markers = (
             "cached_tokens * total_cost / total_tokens",

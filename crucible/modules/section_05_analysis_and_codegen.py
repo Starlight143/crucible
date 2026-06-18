@@ -195,17 +195,12 @@ def _make_codegen_llm(main_llm: Any) -> Any:
             provider_tag = str(getattr(main_llm, "_quant_llm_provider", "") or "").strip().lower()
             if provider_tag == LLM_PROVIDER_OPENROUTER:
                 inject_openrouter_usage_extra_body(kwargs)
-                callback_handler = get_openrouter_callback_handler()
-                if callback_handler is not None:
-                    existing_callbacks = kwargs.get("callbacks")
-                    if isinstance(existing_callbacks, list):
-                        if callback_handler not in existing_callbacks:
-                            existing_callbacks.append(callback_handler)
-                    else:
-                        kwargs["callbacks"] = [callback_handler]
-                http_interceptor = get_openrouter_http_interceptor()
-                if http_interceptor is not None and "interceptor" not in kwargs:
-                    kwargs["interceptor"] = http_interceptor
+            # v1.2.3 — cost/usage is captured by the LiteLLM success callback;
+            # register it once (idempotent).  Replaces the dead crewai
+            # ``interceptor=`` / langchain ``callbacks=`` wiring that crewai 1.14.x
+            # silently dropped — codegen is the largest cost sink, so this is what
+            # makes its spend actually land in the summary.
+            ensure_litellm_usage_logger_registered()
         except Exception:
             pass
 
@@ -5851,67 +5846,18 @@ def _record_codegen_usage_slice(
     fallback_input_tokens: int,
     fallback_output_tokens: int,
 ) -> None:
-    if usage_records:
-        merged_model_id = ""
-        merged_cost_source = "estimated"
-        total_input_tokens = 0
-        total_output_tokens = 0
-        total_cached_tokens = 0
-        total_reasoning_tokens = 0
-        total_input_cost_usd = 0.0
-        total_output_cost_usd = 0.0
-        total_cache_cost_usd = 0.0
-        total_cost_usd = 0.0
-        cache_hit = False
+    """Deprecated no-op (v1.2.3).
 
-        for usage in usage_records:
-            total_input_tokens += int(getattr(usage, "input_tokens", 0) or 0)
-            total_output_tokens += int(getattr(usage, "output_tokens", 0) or 0)
-            total_cached_tokens += int(getattr(usage, "cached_tokens", 0) or 0)
-            total_reasoning_tokens += int(getattr(usage, "reasoning_tokens", 0) or 0)
-            total_input_cost_usd += float(getattr(usage, "input_cost_usd", 0.0) or 0.0)
-            total_output_cost_usd += float(getattr(usage, "output_cost_usd", 0.0) or 0.0)
-            total_cache_cost_usd += float(getattr(usage, "cache_cost_usd", 0.0) or 0.0)
-            total_cost_usd += float(getattr(usage, "total_cost_usd", 0.0) or 0.0)
-            cache_hit = cache_hit or bool(getattr(usage, "cached_tokens", 0) or 0)
-            merged_model_id = _merge_usage_model_ids(
-                merged_model_id, str(getattr(usage, "model_id", "") or "")
-            )
-            merged_cost_source = _merge_usage_cost_source(
-                merged_cost_source,
-                str(getattr(usage, "cost_source", "estimated") or "estimated"),
-            )
-
-        get_cost_accountant().record(
-            agent_name=agent_name,
-            stage=stage,
-            input_tokens=total_input_tokens,
-            output_tokens=total_output_tokens,
-            success=success,
-            cache_hit=cache_hit,
-            outcome=outcome,
-            cached_tokens=total_cached_tokens,
-            reasoning_tokens=total_reasoning_tokens,
-            input_cost_usd=total_input_cost_usd,
-            output_cost_usd=total_output_cost_usd,
-            cache_cost_usd=total_cache_cost_usd,
-            total_cost_usd=total_cost_usd,
-            model_id=merged_model_id,
-            cost_source=merged_cost_source,
-        )
-        clear_openrouter_usage()
-        return
-
-    _record_cost(
-        stage=stage,
-        agent_name=agent_name,
-        input_tokens=fallback_input_tokens,
-        output_tokens=fallback_output_tokens,
-        success=success,
-        outcome=outcome,
-        use_openrouter_usage=False,
-        clear_usage_after_record=False,
-    )
+    Codegen cost/usage is now captured by the single ``_record_llm_usage``
+    chokepoint via the CrewAI ``LLMCallCompletedEvent`` listener (and the LiteLLM
+    fallback).  This per-stage path read the ``_OPENROUTER_USAGE_*`` ContextVars,
+    which no longer have any writer, so it was already inert — but it still called
+    ``get_cost_accountant().record`` directly, i.e. a SECOND feeder that a future
+    change could accidentally revive into a double count.  Neutralised so
+    ``_record_llm_usage`` is the sole accountant feeder (pinned by a structural
+    test); kept as a stub so the two call sites need not change.
+    """
+    return None
 
 
 def build_codegen_crew(

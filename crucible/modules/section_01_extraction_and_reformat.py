@@ -116,17 +116,11 @@ def _make_formatter_llm(main_llm: Any, max_tokens: Optional[int] = None) -> Any:
             provider_tag = str(getattr(main_llm, "_quant_llm_provider", "") or "").strip().lower()
             if provider_tag == LLM_PROVIDER_OPENROUTER:
                 inject_openrouter_usage_extra_body(kwargs)
-                callback_handler = get_openrouter_callback_handler()
-                if callback_handler is not None:
-                    existing_callbacks = kwargs.get("callbacks")
-                    if isinstance(existing_callbacks, list):
-                        if callback_handler not in existing_callbacks:
-                            existing_callbacks.append(callback_handler)
-                    else:
-                        kwargs["callbacks"] = [callback_handler]
-                http_interceptor = get_openrouter_http_interceptor()
-                if http_interceptor is not None and "interceptor" not in kwargs:
-                    kwargs["interceptor"] = http_interceptor
+            # v1.2.3 — cost/usage is captured by the LiteLLM success callback;
+            # register it once (idempotent).  Replaces the dead crewai
+            # ``interceptor=`` / langchain ``callbacks=`` wiring that crewai 1.14.x
+            # silently dropped, so the formatter LLM's calls are now billed too.
+            ensure_litellm_usage_logger_registered()
         except Exception:
             pass
 

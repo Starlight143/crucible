@@ -5,6 +5,120 @@ Versioning follows [Semantic Versioning](https://semver.org/). The first public 
 
 ---
 
+## [v1.2.3] — 2026-06-17
+
+Cost-accuracy release: the run's token and USD totals now match the OpenRouter
+dashboard instead of reading several times too high (or zero). The cost/usage
+capture had silently stopped working because crucible's LLM is CrewAI's **native
+`OpenAICompletion` provider** — it talks to the OpenAI SDK directly and never
+routes through LiteLLM, so neither the old crewai `BaseInterceptor`/langchain
+callback (whose kwargs crewai 1.14.x silently drops) nor a LiteLLM callback ever
+fired for it. Accounting then fell back to CrewAI's cumulative usage-metrics path,
+which re-counts across worker threads and retries → the multi-fold inflation.
+Capture is now done at the one chokepoint CrewAI always fires for every call,
+native or not — its per-call **`LLMCallCompletedEvent`** — funnelled into a single
+recorder with cross-source de-duplication. No env default, public schema, CLI
+flag, or ledger format changed.
+
+### Fixed
+- **Token *and* USD headline totals were wrong (many-fold inflated, or zero)
+  versus the OpenRouter bill.** crucible's LLM is CrewAI's native
+  `OpenAICompletion` provider, which uses the OpenAI SDK directly (often
+  streaming) and never routes through LiteLLM — so the crewai `BaseInterceptor` +
+  langchain `BaseCallbackHandler` (kwargs crewai 1.14.x silently drops) AND a
+  LiteLLM success callback all failed to fire for it. The authoritative billed
+  ledger therefore stayed empty, reconciliation was a no-op, and both numbers fell
+  back to CrewAI's cumulative usage-metrics path (`extract_and_set_usage_from_crew`)
+  whose ContextVar skip-guard fails across worker threads and re-counts
+  `crew.calculate_usage_metrics()` (cumulative across retries). v1.1.12 had
+  corrected the USD *reconciliation*, but the capture that feeds it never ran on
+  crucible's actual provider.
+- **`section_07._reconcile_cost_summary_with_billing` now also promotes the
+  authoritative token totals** (`total_tokens` / input / output / cached /
+  reasoning) from the billed-cost ledger to the headline, mirroring the existing
+  USD promotion. The pre-promotion figure is preserved as
+  `total_tokens_attributed` for diagnostics.
+- **Direction-comparator extraction failed when a judge emitted an out-of-range
+  score** (e.g. `composite_score = -3` against the `ge=0` field), surfacing as
+  repeated `_extract_pydantic_from_result lenient retry for
+  DirectionComparatorReport` debug spam and wasted reformat/salvage budget. The
+  strict `ge`/`le` field constraints rejected the whole item at construction, so
+  the report's `after`-normaliser (which already clamps every score) never ran. A
+  new `model_validator(mode="before")` on `DirectionComparatorItem`
+  (`crucible/modules/section_03_models_and_context.py`) clamps the seven score
+  fields into range *before* field validation, so every construction path
+  recovers. Same family as the v1.2.2 `DirectionDecision.options` coercion:
+  well-formed items pass through untouched, and a non-numeric score is still
+  rejected with a clear error.
+
+### Changed
+- **Primary capture: CrewAI's per-call `LLMCallCompletedEvent`** (listener
+  `_on_crewai_llm_call_completed`, subscribed idempotently via
+  `ensure_crewai_usage_listener_registered`). CrewAI emits it for every completed
+  call — native `OpenAICompletion` and LiteLLM-backed alike, streaming and not —
+  carrying token usage + model + the provider generation id. A small guard-tested
+  wrap (`_install_crewai_usage_cost_passthrough`) re-attaches the OpenRouter
+  `usage.cost` CrewAI's extractor otherwise drops (it survives openai-SDK parsing
+  as a pydantic extra), so USD stays authoritative; absent it, USD degrades to a
+  labelled pricing estimate rather than zero.
+- **Single recording chokepoint with cross-source de-dup: `_record_llm_usage`.**
+  Both the CrewAI listener (primary) and the LiteLLM callback (fallback, kept for
+  any direct-LiteLLM path) funnel through it; it dedups on the provider generation
+  id via one shared set, so a call seen by both paths is recorded exactly once. It
+  is the **only** feeder of `AgentCostAccountant` — `_record_cost` and the codegen
+  per-stage slice are now no-ops, and a structural test pins that no second feeder
+  can be added. Stage/agent attribution flows through `set_cost_attribution`
+  around each crew kickoff (`resilience`).
+- **Removed the dead crewai/langchain cost hooks:**
+  `OpenRouterUsageHTTPInterceptor` (crewai), `OpenRouterUsageCallbackHandler`
+  (langchain), `_capture_openrouter_usage_from_http_response`, and
+  `extract_and_set_usage_from_crew`, together with their wiring in section_01 /
+  section_02 / section_05.
+- `AgentCostAccountant` reads/writes are lock-guarded (the listener may fire from
+  CrewAI worker threads). The billed-cost ledger remains the headline authority:
+  `_reconcile_cost_summary_with_billing` promotes its exact USD **and** token
+  totals over the per-stage figures.
+
+### Tests
+- `tests/test_v1_2_3_cost_crewai_event_capture.py` (new): the event listener
+  records exact tokens + authoritative `usage.cost`, reads CrewAI's flattened
+  token keys, dedups by generation id, skips id-less calls (undercount-safe),
+  falls back to a labelled pricing estimate when cost is absent, the
+  cost-passthrough wrap re-attaches `usage.cost`, the real event bus delivers to
+  the listener once, reconcile stays the headline authority — plus **anti-double-count
+  structural guards**: exactly one `accountant.record` feeder, per-stage feeders
+  are no-ops, the listener is wired at run start and registered idempotently, and
+  the CrewAI extractor target still exists.
+- `tests/test_v1_2_3_cost_litellm_capture.py` (new): the fallback LiteLLM path
+  records once (dedup), exact tokens/cost, provider + cost-source priority, Alibaba
+  token-only, the reconcile token override reproducing the 7M→4600 / $1.03→$0.132
+  symptom, the real LiteLLM `mock_response` firing path, and structural pins that
+  the crewai/langchain hooks are gone.
+- `tests/test_v1_1_12_cost_reconciliation.py` rewritten to feed the ledger through
+  the new callback (ledger guards, thread-safety, capture gating, USD + token
+  reconciliation preserved); obsolete interceptor-capture tests removed
+  (`tests/test_v1_1_3_openrouter_cost_capture.py` deleted; the
+  `extract_and_set_usage_from_crew` / `_record_cost`-feeding tests pruned).
+- `tests/test_direction_comparator_score_clamp.py` (new, 9 checks): negative
+  `composite_score` and out-of-range sub-scores clamp into range, the no-ceiling
+  `composite_score` is preserved, well-formed items are untouched, non-numeric
+  scores still raise, and the full `extract_direction_comparator_report` path
+  recovers the production failure shape without debug spam.
+
+### Validation
+- `python -m pytest tests -q -p no:cacheprovider` → **3384 passed, 2 skipped**.
+  `smoke_test.py` and `run_crucible.py --self-check` OK.
+- `pyproject.toml` and `crucible.__version__` bumped to `1.2.3` in lock-step.
+
+### Compatibility
+- Drop-in for v1.2.2. No env-var default flipped; no public API / CLI flag /
+  ledger schema changed. Runs that never bill OpenRouter (Alibaba coding-plan,
+  fully-estimated) keep token-only accounting via the same listener. All prior
+  invariants preserved (4-stream ledger, canonical JSON via `_V8FloatJSONEncoder`,
+  cross-process sidecar locks, two-sided permutation default, `BACKTEST_REQUIRE_REAL_DATA=1`).
+
+---
+
 ## [v1.2.2] — 2026-06-17
 
 Fixes a direction-debate extraction failure where the Judge model emitted the

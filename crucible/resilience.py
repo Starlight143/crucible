@@ -677,35 +677,48 @@ def kickoff_crew_with_retry(
         crew,
         log_fields=log_fields,
     )
-    result = execute_with_retry(
-        crew.kickoff,
-        operation_name=f"{resolved_name}.kickoff",
-        max_attempts=settings["max_attempts"],
-        backoff_seconds=settings["backoff_seconds"],
-        retryable_exceptions=(Exception,),
-        retryable_exception_filter=is_transient_retryable_error,
-        circuit_breaker_name=breaker_name,
-        max_backoff_seconds=float(kickoff_defaults["max_backoff_seconds"]),
-        jitter_ratio=float(kickoff_defaults["jitter_ratio"]),
-        logger=logger,
-        log_fields=log_fields,
-    )
+
+    # v1.2.3 — tag every LLM call this kickoff makes with (stage, agent) so the
+    # LiteLLM cost callback can attribute it to the right stage in the per-stage
+    # breakdown.  Best-effort and set BEFORE the kickoff so worker-thread/async
+    # contexts spawned by CrewAI inherit it; missing attribution is harmless
+    # (the row lands under ``unattributed`` and headline totals stay exact).
+    _attr_rt = None
+    _attr_token = None
     if __package__ == "crucible":
-        # Usage extraction uses a relative import that only works inside the package.
-        # Skip entirely in direct-script mode rather than relying on except ImportError
-        # to silently swallow real import errors from inside get_runtime() itself.
         try:
             from .module_runtime import get_runtime
 
-            rt = get_runtime()
-            model_id = _resolve_crew_model_id(crew)
-            rt.extract_and_set_usage_from_crew(crew, model_id=model_id)
-        except _OperationCancelledError:
-            # Cooperative cancellation must propagate — do not swallow it as a
-            # usage-extraction failure.
-            raise
-        except Exception as _usage_exc:
-            LOGGER.debug("Failed to extract usage after kickoff: %s", _usage_exc)
+            _attr_rt = get_runtime()
+            _attr_stage = ""
+            if isinstance(log_fields, dict):
+                _attr_stage = str(log_fields.get("stage", "") or "")
+            _attr_stage = _attr_stage or resolved_name
+            _attr_token = _attr_rt.set_cost_attribution(_attr_stage, resolved_name)
+        except Exception:
+            _attr_rt = None
+            _attr_token = None
+
+    try:
+        result = execute_with_retry(
+            crew.kickoff,
+            operation_name=f"{resolved_name}.kickoff",
+            max_attempts=settings["max_attempts"],
+            backoff_seconds=settings["backoff_seconds"],
+            retryable_exceptions=(Exception,),
+            retryable_exception_filter=is_transient_retryable_error,
+            circuit_breaker_name=breaker_name,
+            max_backoff_seconds=float(kickoff_defaults["max_backoff_seconds"]),
+            jitter_ratio=float(kickoff_defaults["jitter_ratio"]),
+            logger=logger,
+            log_fields=log_fields,
+        )
+    finally:
+        if _attr_rt is not None and _attr_token is not None:
+            try:
+                _attr_rt.reset_cost_attribution(_attr_token)
+            except Exception:
+                pass
     return result
 
 

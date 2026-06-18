@@ -19,6 +19,12 @@ globals().update({k: v for k, v in _prev_02.__dict__.items() if not k.startswith
 # here; the import is cheap and only used by the new schemas below.
 from typing import Literal
 
+# v1.2.3 — ``AgentCostAccountant`` is now written from the LiteLLM success
+# callback, which CrewAI may invoke from worker threads.  Guard every mutation
+# and read with a lock so concurrent ``record()`` calls and a concurrent
+# ``get_summary()`` snapshot can never race on the underlying lists/dicts.
+import threading as _threading
+
 
 class Experiment(BaseModel):
     goal: str = Field(..., description="驗證目標")
@@ -1095,6 +1101,45 @@ class EvidenceAuditReport(BaseModel):
             return report.dict()
 
 
+# Declared bounds for ``DirectionComparatorItem`` score fields, used by the
+# before-validator to clamp out-of-range LLM output prior to strict field
+# validation.  ``None`` upper bound = no ceiling (``composite_score`` is ``ge=0``
+# only).  Keep in lock-step with the ``Field(ge=..., le=...)`` declarations below
+# and the post-construction clamps in ``_normalize_direction_comparator_items``.
+_COMPARATOR_SCORE_BOUNDS: Dict[str, Tuple[int, Optional[int]]] = {
+    "feasibility_score": (0, 5),
+    "reversibility_score": (0, 5),
+    "speed_to_test_score": (0, 5),
+    "evidence_strength_score": (0, 5),
+    "downside_severity_score": (0, 5),
+    "unresolved_unknown_dependency_score": (0, 5),
+    "composite_score": (0, None),
+}
+
+
+def _clamp_comparator_score(raw: Any, low: int, high: Optional[int]) -> Optional[int]:
+    """Coerce ``raw`` to ``int`` and clamp to ``[low, high]``.
+
+    Returns ``None`` when ``raw`` is not numeric, so the caller can leave it in
+    place for the field validator to reject with a clear error (mirrors the
+    "leave malformed items for the schema" stance of ``_coerce_options_shape``).
+    """
+    if isinstance(raw, bool):
+        raw = int(raw)
+    if isinstance(raw, int):
+        val = raw
+    else:
+        try:
+            val = int(float(raw))
+        except (TypeError, ValueError):
+            return None
+    if val < low:
+        val = low
+    if high is not None and val > high:
+        val = high
+    return val
+
+
 class DirectionComparatorItem(BaseModel):
     key: str = Field(..., description='Direction key "A" | "B" | "C" | "D" | "E" | "F" | "G"')
     feasibility_score: int = Field(default=0, ge=0, le=5, description="Execution feasibility score")
@@ -1125,6 +1170,40 @@ class DirectionComparatorItem(BaseModel):
         default="production", description="production|exploration|conditional"
     )
     rationale: str = Field(default="", description="Short explanation for the ranking")
+
+    @model_validator(mode="before")
+    @classmethod
+    def _clamp_scores_in_range(cls, data: Any) -> Any:
+        """Clamp out-of-range score fields BEFORE strict field validation.
+
+        Reasoning-class judges occasionally emit a score outside its declared
+        bound — most commonly a negative ``composite_score`` (e.g. ``-3``), but
+        also a 0-5 sub-score above 5.  The ``ge``/``le`` field constraints would
+        reject the WHOLE item at construction, so ``DirectionComparatorItem(**d)``
+        raises and ``_extract_pydantic_from_result`` falls through to the
+        lenient-retry / salvage path (spamming the debug log) even though the
+        value is trivially recoverable.  Clamping here lets construction succeed;
+        the report's ``after`` normaliser
+        (``_normalize_direction_comparator_items``) re-applies the identical
+        bounds and owns dedup/ranking, so this is purely additive.
+
+        Only numeric, out-of-range values are rewritten — a well-formed item
+        passes through untouched, and a non-numeric score is left in place for
+        the field validator to reject with a clear error.
+        """
+        if not isinstance(data, dict):
+            return data
+        rebuilt: Optional[Dict[str, Any]] = None
+        for field_name, (low, high) in _COMPARATOR_SCORE_BOUNDS.items():
+            if field_name not in data:
+                continue
+            clamped = _clamp_comparator_score(data[field_name], low, high)
+            if clamped is None or clamped == data[field_name]:
+                continue
+            if rebuilt is None:
+                rebuilt = dict(data)
+            rebuilt[field_name] = clamped
+        return rebuilt if rebuilt is not None else data
 
 
 def _normalize_direction_comparator_items(
@@ -3397,6 +3476,7 @@ class AgentCostRecord(BaseModel):
 _BILLING_AWARE_COST_SOURCES: Tuple[str, ...] = (
     "openrouter_api",
     "openrouter_tokens_with_pricing",
+    "litellm_computed",
     "crewai_metrics_with_pricing",
     "alibaba_coding_plan_tokens_only",
 )
@@ -3420,6 +3500,10 @@ class AgentCostAccountant:
         self._records: List[AgentCostRecord] = []
         self._by_agent: Dict[str, List[AgentCostRecord]] = {}
         self._by_stage: Dict[str, List[AgentCostRecord]] = {}
+        # Written from the LiteLLM success callback (possibly off CrewAI worker
+        # threads); reads snapshot under this lock so iteration never races an
+        # append.  Re-entrant so a read helper may call another while held.
+        self._lock = _threading.RLock()
 
     def record(
         self,
@@ -3465,12 +3549,14 @@ class AgentCostAccountant:
             cost_source=cost_source,
         )
 
-        self._records.append(record)
-        self._by_agent.setdefault(agent_name, []).append(record)
-        self._by_stage.setdefault(stage, []).append(record)
+        with self._lock:
+            self._records.append(record)
+            self._by_agent.setdefault(agent_name, []).append(record)
+            self._by_stage.setdefault(stage, []).append(record)
 
     def get_agent_cost(self, agent_name: str) -> Dict[str, Any]:
-        records = self._by_agent.get(agent_name, [])
+        with self._lock:
+            records = list(self._by_agent.get(agent_name, []))
         if not records:
             return {"agent": agent_name, "total_cost": 0, "total_cost_usd": 0.0, "executions": 0}
 
@@ -3494,7 +3580,8 @@ class AgentCostAccountant:
         }
 
     def get_stage_cost(self, stage: str) -> Dict[str, Any]:
-        records = self._by_stage.get(stage, [])
+        with self._lock:
+            records = list(self._by_stage.get(stage, []))
         if not records:
             return {"stage": stage, "total_cost": 0, "total_cost_usd": 0.0, "executions": 0}
 
@@ -3512,7 +3599,12 @@ class AgentCostAccountant:
         }
 
     def get_summary(self) -> Dict[str, Any]:
-        if not self._records:
+        with self._lock:
+            records = list(self._records)
+            agent_names = list(self._by_agent.keys())
+            stage_names = list(self._by_stage.keys())
+
+        if not records:
             return {
                 "total_cost": 0,
                 "total_cost_usd": 0.0,
@@ -3524,14 +3616,14 @@ class AgentCostAccountant:
                 "reasoning_tokens": 0,
             }
 
-        total_cost = sum(r.cost_units for r in self._records)
-        total_cost_usd = sum(r.total_cost_usd for r in self._records)
-        total_tokens = sum(r.total_tokens for r in self._records)
-        cached_tokens = sum(r.cached_tokens for r in self._records)
-        reasoning_tokens = sum(r.reasoning_tokens for r in self._records)
-        cache_hits = sum(1 for r in self._records if r.cache_hit)
-        successes = sum(1 for r in self._records if r.success)
-        cost_source = _summarize_cost_source(self._records)
+        total_cost = sum(r.cost_units for r in records)
+        total_cost_usd = sum(r.total_cost_usd for r in records)
+        total_tokens = sum(r.total_tokens for r in records)
+        cached_tokens = sum(r.cached_tokens for r in records)
+        reasoning_tokens = sum(r.reasoning_tokens for r in records)
+        cache_hits = sum(1 for r in records if r.cache_hit)
+        successes = sum(1 for r in records if r.success)
+        cost_source = _summarize_cost_source(records)
 
         return {
             "total_cost": total_cost,
@@ -3539,21 +3631,23 @@ class AgentCostAccountant:
             "total_tokens": total_tokens,
             "cached_tokens": cached_tokens,
             "reasoning_tokens": reasoning_tokens,
-            "total_executions": len(self._records),
-            "cache_hit_rate": cache_hits / len(self._records) if self._records else 0,
-            "success_rate": successes / len(self._records) if self._records else 1.0,
-            "input_cost_usd": sum(r.input_cost_usd for r in self._records),
-            "output_cost_usd": sum(r.output_cost_usd for r in self._records),
-            "cache_cost_usd": sum(r.cache_cost_usd for r in self._records),
+            "total_executions": len(records),
+            "cache_hit_rate": cache_hits / len(records) if records else 0,
+            "success_rate": successes / len(records) if records else 1.0,
+            "input_cost_usd": sum(r.input_cost_usd for r in records),
+            "output_cost_usd": sum(r.output_cost_usd for r in records),
+            "cache_cost_usd": sum(r.cache_cost_usd for r in records),
             "cost_source": cost_source,
-            "models_used": list(set(r.model_id for r in self._records if r.model_id)),
-            "by_agent": {name: self.get_agent_cost(name) for name in self._by_agent.keys()},
-            "by_stage": {stage: self.get_stage_cost(stage) for stage in self._by_stage.keys()},
+            "models_used": list(set(r.model_id for r in records if r.model_id)),
+            "by_agent": {name: self.get_agent_cost(name) for name in agent_names},
+            "by_stage": {stage: self.get_stage_cost(stage) for stage in stage_names},
         }
 
     def get_top_cost_agents(self, limit: int = 5) -> List[Dict[str, Any]]:
         """Get the top cost agents."""
-        agent_costs = [self.get_agent_cost(name) for name in self._by_agent.keys()]
+        with self._lock:
+            agent_names = list(self._by_agent.keys())
+        agent_costs = [self.get_agent_cost(name) for name in agent_names]
         return sorted(
             agent_costs,
             key=lambda x: (

@@ -552,44 +552,25 @@ class TestExecuteWithRetryCancellation(unittest.TestCase):
 
         self.assertEqual(call_count, 1, "kickoff must not be retried after cancellation")
 
-    def test_kickoff_crew_with_retry_propagates_cancellation_from_usage_extraction(
-        self,
-    ) -> None:
-        """
-        OperationCancelledError raised inside the post-kickoff usage-extraction
-        block must propagate out of kickoff_crew_with_retry.
+    def test_kickoff_crew_with_retry_sets_cost_attribution_around_kickoff(self) -> None:
+        """v1.2.3 — kickoff_crew_with_retry tags LLM calls with (stage, agent)
+        for the LiteLLM cost callback, and restores the prior attribution after
+        the kickoff (even on success).  Replaces the old post-kickoff
+        usage-extraction block (extract_and_set_usage_from_crew was removed)."""
+        import inspect
 
-        Previously `except Exception as _usage_exc: LOGGER.debug(...)` silently
-        swallowed any OperationCancelledError from extract_and_set_usage_from_crew,
-        causing the caller to receive the crew result as if cancellation never
-        occurred.  The fix adds an explicit `except _OperationCancelledError: raise`
-        guard before the broad handler.
-        """
-        import sys
-        from crucible.cancellation import OperationCancelledError
-        from unittest.mock import MagicMock, patch
+        src = inspect.getsource(kickoff_crew_with_retry)
+        self.assertIn("set_cost_attribution", src)
+        self.assertIn("reset_cost_attribution", src)
+        self.assertNotIn("extract_and_set_usage_from_crew", src)
 
         class _SuccessfulCrew:
             def kickoff(self) -> str:
                 return "done"
 
-        # Simulate extract_and_set_usage_from_crew raising OperationCancelledError.
-        # The function is imported dynamically inside a try block via
-        # `from .module_runtime import get_runtime`, so we inject a mock into
-        # sys.modules so the import resolves to our controlled object.
-        mock_rt = MagicMock()
-        mock_rt.extract_and_set_usage_from_crew.side_effect = OperationCancelledError(
-            "cancelled during usage extraction"
-        )
-        mock_module_runtime = MagicMock()
-        mock_module_runtime.get_runtime.return_value = mock_rt
-
-        with patch.dict(
-            sys.modules,
-            {"crucible.module_runtime": mock_module_runtime},
-        ):
-            with self.assertRaises(OperationCancelledError):
-                kickoff_crew_with_retry(_SuccessfulCrew(), default_max_attempts=1)
+        # Smoke: a successful kickoff still returns its result unchanged.
+        result = kickoff_crew_with_retry(_SuccessfulCrew(), default_max_attempts=1)
+        self.assertEqual(result, "done")
 
 
 class TestLogFieldsSanitisation(unittest.TestCase):

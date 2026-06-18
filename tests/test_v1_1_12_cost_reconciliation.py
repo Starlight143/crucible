@@ -1,136 +1,101 @@
-"""Regression tests for v1.1.12 — authoritative OpenRouter billed-cost ledger.
+"""Regression tests for the authoritative OpenRouter billed-cost ledger.
 
-Background
-----------
-Before v1.1.12 the headline ``total_cost_usd`` the operator saw (in the
-``--cost-report`` console output and in ``run_meta.json`` → WebUI dashboard)
-was reconstructed *solely* from ``AgentCostAccountant``, which is built by the
-per-stage ``_record_cost`` "accumulate-into-ContextVar → read → clear" dance.
+Originally v1.1.12 (HTTP-interceptor feeder).  In v1.2.3 the feeder changed to
+the LiteLLM success callback (``_record_litellm_success``) — the one chokepoint
+CrewAI actually routes through; the previous crewai ``BaseInterceptor`` never
+fired because crewai 1.14.x ``LLM`` silently drops the ``interceptor=`` kwarg, so
+the ledger stayed empty and the headline fell back to the lossy, multi-x-inflated
+CrewAI usage-metrics path.
 
-That dance is lossy:
-
-* Several ``crew.kickoff()`` call sites (section_01 reformat crews, the
-  section_02 direction-seed plan success path, section_04 problem-breakdown /
-  smart-queries, section_06 api-version analysis, the external Critic) have **no
-  matching ``_record_cost``**.  Their real OpenRouter cost is accumulated into
-  the usage ContextVar but is then either mis-attributed to an adjacent stage —
-  or **dropped entirely** when a ``clear_openrouter_usage()`` runs first (a
-  cache hit, a pipeline reset).  Net effect: the headline reads *lower* than the
-  OpenRouter dashboard.
-* The summed total blends actual (``openrouter_api``) rows with locally
-  estimated rows (``openrouter_tokens_with_pricing`` / ``crewai_metrics_with_pricing``
-  / ``estimated``) while labelling the whole thing "OpenRouter API (actual
-  billing)".  A stale/incomplete local pricing table then drags estimated rows
-  away from the real bill.
-
-The fix feeds an **authoritative billed-cost ledger** straight from the single
-correct chokepoint — the HTTP interceptor
-(``_capture_openrouter_usage_from_http_response``).  Every billed OpenRouter
-response contributes exactly one ledger row carrying the precise ``usage.cost``
-OpenRouter returned, idempotency-guarded, independent of stage attribution.
+The LEDGER and ``_reconcile_cost_summary_with_billing`` are otherwise unchanged
+(plus a v1.2.3 token override): every billed OpenRouter response contributes
+exactly one row carrying the precise ``usage.cost`` + tokens OpenRouter returned,
+deduped by response id, on a lock-guarded module global (NOT a ContextVar) so
+cross-thread writes are visible, reset only at run start.
 ``get_openrouter_billed_total()`` therefore equals the exact Σ(usage.cost) — the
-number on the dashboard.  The ledger is a lock-guarded module global (NOT a
-ContextVar) so cross-thread writes are visible, and it is reset only at run
-start, never by the per-stage ``clear_openrouter_usage()``.
-
-``section_07._reconcile_cost_summary_with_billing`` promotes the ledger sum to
-the headline whenever real billing was captured.
+number on the dashboard — and reconcile promotes both USD and tokens to the
+headline.  These tests pin the ledger guards, thread-safety, capture gating, and
+USD reconciliation; the token override + capture mechanics live in
+``test_v1_2_3_cost_litellm_capture.py``.
 """
-
 from __future__ import annotations
 
-import json
 import threading
 import unittest
 
-import httpx
-
+from crucible.module_runtime import get_runtime
 from crucible.modules.section_00_bootstrap_and_utils import (
     _append_openrouter_billed_entry,
-    _capture_openrouter_usage_from_http_response,
+    _record_litellm_success,
     clear_openrouter_usage,
     get_openrouter_billed_count,
     get_openrouter_billed_ledger,
     get_openrouter_billed_total,
-    get_openrouter_http_interceptor,
+    reset_llm_usage_dedup,
     reset_openrouter_billed_ledger,
 )
 from crucible.modules.section_07_selfcheck_output_main import (
     _reconcile_cost_summary_with_billing,
 )
 
+_OR_KWARGS = {"model": "openrouter/deepseek/deepseek-v4-flash",
+              "litellm_params": {"api_base": "https://openrouter.ai/api/v1"}}
+_ALIBABA_KWARGS = {"model": "dashscope/qwen",
+                   "litellm_params": {"api_base": "https://coding-intl.dashscope.aliyuncs.com/v1"}}
 
-def _build_openrouter_response(
-    cost: float = 0.00123,
-    prompt_tokens: int = 100,
-    completion_tokens: int = 50,
-    model: str = "deepseek/deepseek-v4-flash",
-    request_host: str = "openrouter.ai",
-    include_cost: bool = True,
-) -> httpx.Response:
-    """Build a mock OpenRouter chat-completion response (unread on construction)."""
-    usage: dict = {
-        "prompt_tokens": prompt_tokens,
-        "completion_tokens": completion_tokens,
-        "total_tokens": prompt_tokens + completion_tokens,
-    }
-    if include_cost:
+
+def _fake_response(resp_id, prompt, completion, *, cost=None, model="deepseek/deepseek-v4-flash"):
+    usage = {"prompt_tokens": prompt, "completion_tokens": completion,
+             "total_tokens": prompt + completion}
+    if cost is not None:
         usage["cost"] = cost
-    body = json.dumps(
-        {
-            "id": "chatcmpl-test",
-            "model": model,
-            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
-            "usage": usage,
-        }
-    ).encode("utf-8")
-    req = httpx.Request("POST", f"https://{request_host}/api/v1/chat/completions")
-    return httpx.Response(
-        status_code=200,
-        headers={"content-type": "application/json"},
-        content=body,
-        request=req,
+    ns = type("Resp", (), {})()
+    ns.id = resp_id
+    ns.model = model
+    ns.usage = usage
+    return ns
+
+
+def _feed(resp_id, *, cost=0.00123, prompt_tokens=100, completion_tokens=50,
+          model="deepseek/deepseek-v4-flash", kwargs=None):
+    """Drive one completion through the real LiteLLM-callback feeder → ledger."""
+    _record_litellm_success(
+        kwargs if kwargs is not None else dict(_OR_KWARGS, model=f"openrouter/{model}"),
+        _fake_response(resp_id, prompt_tokens, completion_tokens, cost=cost, model=model),
     )
 
 
 class _LedgerIsolatedTestCase(unittest.TestCase):
-    """Reset the process-global ledger (and per-stage usage) around every test
-    so the module-global state never leaks between cases."""
+    """Reset the process-global ledger / dedup / usage around every test."""
 
     def setUp(self) -> None:
+        get_runtime()  # ensure cross-module namespace sync so the feeder resolves
         reset_openrouter_billed_ledger()
+        reset_llm_usage_dedup()
         clear_openrouter_usage()
 
     def tearDown(self) -> None:
         reset_openrouter_billed_ledger()
+        reset_llm_usage_dedup()
         clear_openrouter_usage()
 
 
 class TestBilledLedgerBasics(_LedgerIsolatedTestCase):
     def test_single_response_records_exact_cost(self) -> None:
-        interceptor = get_openrouter_http_interceptor()
-        self.assertIsNotNone(interceptor)
-        interceptor.on_inbound(_build_openrouter_response(cost=0.004200))
+        _feed("g1", cost=0.004200)
         self.assertEqual(get_openrouter_billed_count(), 1)
         self.assertAlmostEqual(get_openrouter_billed_total(), 0.004200, places=9)
 
     def test_multiple_responses_sum_exactly(self) -> None:
-        interceptor = get_openrouter_http_interceptor()
         costs = [0.001, 0.0025, 0.5, 0.000003]
-        for c in costs:
-            # fresh response objects (idempotency sentinel is per-response)
-            interceptor.on_inbound(_build_openrouter_response(cost=c))
+        for i, c in enumerate(costs):
+            _feed(f"g{i}", cost=c)
         self.assertEqual(get_openrouter_billed_count(), len(costs))
         self.assertAlmostEqual(get_openrouter_billed_total(), sum(costs), places=9)
 
     def test_ledger_rows_carry_model_and_tokens(self) -> None:
-        interceptor = get_openrouter_http_interceptor()
-        interceptor.on_inbound(
-            _build_openrouter_response(
-                cost=0.01, prompt_tokens=321, completion_tokens=123,
-                model="deepseek/deepseek-v4-flash",
-            )
-        )
+        _feed("g1", cost=0.01, prompt_tokens=321, completion_tokens=123,
+              model="deepseek/deepseek-v4-flash")
         rows = get_openrouter_billed_ledger()
         self.assertEqual(len(rows), 1)
         self.assertAlmostEqual(rows[0]["total_cost_usd"], 0.01, places=9)
@@ -147,19 +112,14 @@ class TestBilledLedgerBasics(_LedgerIsolatedTestCase):
 
 
 class TestLedgerSurvivesPerStageClear(_LedgerIsolatedTestCase):
-    """THE core invariant: the per-stage ``clear_openrouter_usage()`` (called
-    after every ``_record_cost``) must NOT wipe the authoritative billed
-    ledger.  This is exactly the boundary at which orphan-kickoff costs used to
-    be dropped from the headline."""
+    """The per-stage ``clear_openrouter_usage()`` must NOT wipe the authoritative
+    billed ledger — the boundary at which orphan-kickoff costs used to be lost."""
 
     def test_clear_openrouter_usage_does_not_touch_billed_ledger(self) -> None:
-        interceptor = get_openrouter_http_interceptor()
-        interceptor.on_inbound(_build_openrouter_response(cost=0.0150))
+        _feed("g1", cost=0.0150)
         self.assertAlmostEqual(get_openrouter_billed_total(), 0.0150, places=9)
-        # Simulate a per-stage record's clear, then another stage's clear.
         clear_openrouter_usage()
         clear_openrouter_usage()
-        # The authoritative ledger is unaffected.
         self.assertEqual(get_openrouter_billed_count(), 1)
         self.assertAlmostEqual(get_openrouter_billed_total(), 0.0150, places=9)
 
@@ -177,39 +137,28 @@ class TestBilledLedgerRejectsBadInput(_LedgerIsolatedTestCase):
         self.assertEqual(get_openrouter_billed_count(), 0)
 
     def test_response_without_cost_field_not_recorded(self) -> None:
-        interceptor = get_openrouter_http_interceptor()
-        # usage present but no `cost` key → token capture still happens but the
-        # billed ledger (actual-billing only) stays empty.
-        interceptor.on_inbound(_build_openrouter_response(include_cost=False))
+        # usage present but no `cost` key → tokens still tracked, but the billed
+        # ledger (actual-billing only) stays empty.
+        _feed("g1", cost=None)
         self.assertEqual(get_openrouter_billed_count(), 0)
 
-    def test_non_openrouter_host_not_recorded(self) -> None:
-        interceptor = get_openrouter_http_interceptor()
-        # Alibaba coding-plan host: provider != OpenRouter → not in billed ledger.
-        interceptor.on_inbound(
-            _build_openrouter_response(
-                cost=0.01, request_host="coding-intl.dashscope.aliyuncs.com",
-            )
-        )
+    def test_non_openrouter_provider_not_recorded(self) -> None:
+        # Alibaba coding-plan: provider != OpenRouter, cost forced 0 → not billed.
+        _feed("ali", cost=0.01, model="qwen", kwargs=_ALIBABA_KWARGS)
         self.assertEqual(get_openrouter_billed_count(), 0)
 
 
 class TestIdempotency(_LedgerIsolatedTestCase):
-    def test_same_response_captured_once(self) -> None:
-        interceptor = get_openrouter_http_interceptor()
-        resp = _build_openrouter_response(cost=0.02)
-        interceptor.on_inbound(resp)
-        interceptor.on_inbound(resp)  # second call on the SAME response object
-        interceptor.on_inbound(resp)
+    def test_same_response_id_captured_once(self) -> None:
+        for _ in range(3):
+            _feed("same-id", cost=0.02)  # same response id every time
         self.assertEqual(get_openrouter_billed_count(), 1)
         self.assertAlmostEqual(get_openrouter_billed_total(), 0.02, places=9)
 
 
 class TestThreadSafety(_LedgerIsolatedTestCase):
     """The ledger is a lock-guarded module global, NOT a ContextVar — so writes
-    from worker threads are visible to the reader.  This pins both the lock
-    correctness and the cross-thread visibility that motivated abandoning a
-    ContextVar for the authoritative total."""
+    from worker threads are visible to the reader."""
 
     def test_concurrent_appends_are_lossless(self) -> None:
         n_threads = 8
@@ -244,14 +193,14 @@ class TestReconciliation(_LedgerIsolatedTestCase):
         self.assertIsNone(_reconcile_cost_summary_with_billing(None))
 
     def test_billed_total_overrides_headline_and_scales_breakdown(self) -> None:
-        _append_openrouter_billed_entry(total_cost_usd=1.0)
+        _append_openrouter_billed_entry(total_cost_usd=1.0, input_tokens=1000, output_tokens=500)
         summary = {
             "total_cost_usd": 0.5,
             "input_cost_usd": 0.2,
             "output_cost_usd": 0.3,
             "cache_cost_usd": 0.0,
             "cost_source": "crewai_metrics_with_pricing",
-            "total_tokens": 1500,
+            "total_tokens": 9_999_999,
         }
         out = _reconcile_cost_summary_with_billing(summary)
         self.assertAlmostEqual(out["total_cost_usd"], 1.0, places=9)
@@ -259,18 +208,17 @@ class TestReconciliation(_LedgerIsolatedTestCase):
         self.assertAlmostEqual(out["total_cost_usd_attributed"], 0.5, places=9)
         self.assertEqual(out["billed_request_count"], 1)
         self.assertEqual(out["cost_source"], "openrouter_api")
-        # breakdown scaled by billed/attributed == 2.0
+        # USD breakdown scaled by billed/attributed == 2.0
         self.assertAlmostEqual(out["input_cost_usd"], 0.4, places=9)
         self.assertAlmostEqual(out["output_cost_usd"], 0.6, places=9)
-        # input + output parts sum to the authoritative headline
         self.assertAlmostEqual(
             out["input_cost_usd"] + out["output_cost_usd"], out["total_cost_usd"], places=9
         )
-        # non-cost fields preserved
+        # v1.2.3 — tokens are promoted from the ledger too (1500, not the 9.9M)
         self.assertEqual(out["total_tokens"], 1500)
+        self.assertEqual(out["total_tokens_attributed"], 9_999_999)
 
     def test_zero_attributed_still_sets_headline(self) -> None:
-        # Orphan-only run: accountant recorded nothing, but billing was captured.
         _append_openrouter_billed_entry(total_cost_usd=0.0731)
         summary = {"total_cost_usd": 0.0, "input_cost_usd": 0.0, "output_cost_usd": 0.0}
         out = _reconcile_cost_summary_with_billing(summary)
@@ -280,17 +228,11 @@ class TestReconciliation(_LedgerIsolatedTestCase):
 
 
 class TestOrphanKickoffRecovered(_LedgerIsolatedTestCase):
-    """End-to-end pin for the actual bug: a billed OpenRouter response captured
-    by the interceptor with NO matching ``_record_cost`` (an orphan kickoff)
-    still lands in the authoritative total, so the headline no longer reads
-    lower than the OpenRouter dashboard."""
+    """A billed OpenRouter response with NO matching per-stage record still lands
+    in the authoritative total, so the headline never reads below the dashboard."""
 
     def test_orphan_cost_is_recovered_by_billed_total(self) -> None:
-        interceptor = get_openrouter_http_interceptor()
-        # An orphan kickoff: HTTP response intercepted, but the caller never
-        # invoked _record_cost, so the accountant has no row for it.
-        interceptor.on_inbound(_build_openrouter_response(cost=0.0123))
-        # Accountant-derived summary (as if no _record_cost ran for this call).
+        _feed("orphan", cost=0.0123)
         accountant_summary = {"total_cost_usd": 0.0, "cost_source": "estimated"}
         reconciled = _reconcile_cost_summary_with_billing(accountant_summary)
         self.assertAlmostEqual(reconciled["total_cost_usd"], 0.0123, places=9)
