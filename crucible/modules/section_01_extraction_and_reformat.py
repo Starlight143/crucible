@@ -201,10 +201,18 @@ def _extract_pydantic_from_result(
     model_cls: Any,
     required_keys: Tuple[str, ...],
     attr_order: Tuple[str, ...] = ("json_dict", "output", "raw"),
+    reject_if: Optional[Callable[[Dict[str, Any]], bool]] = None,
 ) -> Optional[Any]:
     def _try_build(candidate: Any) -> Optional[Any]:
         d = _coerce_json_dict(candidate)
         if not isinstance(d, dict):
+            return None
+        # ``reject_if`` lets a caller veto a structurally-ambiguous payload that
+        # satisfies ``required_keys`` but actually belongs to a *different*
+        # schema (e.g. the final AnalysisReport shares consensus/disagreement/
+        # experiments with GateDecision).  Rejecting here lets extraction fall
+        # through to the correct task output instead of silently mis-binding.
+        if reject_if is not None and reject_if(d):
             return None
         if required_keys and not all(k in d for k in required_keys):
             return None
@@ -907,11 +915,32 @@ def extract_research_context(result: Any) -> Optional["ResearchContext"]:
     return _stabilize_research_context(parsed)
 
 
+def _looks_like_analysis_report_not_gate(d: Dict[str, Any]) -> bool:
+    """Reject an AnalysisReport payload from being parsed as a GateDecision.
+
+    The analysis crew's final task emits an AnalysisReport that shares
+    ``consensus`` / ``disagreement`` / ``experiments`` with GateDecision but
+    renames ``overall_score`` -> ``score`` and drops the gate-control fields.
+    Because ``_extract_pydantic_from_result`` prefers the *final* crew payload,
+    a GateDecision was being rebuilt from that report: pydantic ignored the
+    unknown ``score`` so ``overall_score`` silently defaulted to 0 and
+    ``codegen_scope`` to ``"production"``, which spuriously tripped the
+    pre-codegen floor (``overall_score=0 < 60``) and skipped CodeGen even on a
+    genuinely high-scoring run.  A real GateDecision always carries
+    ``overall_score`` (never a bare ``score``), so ``score``-without-
+    ``overall_score`` is an unambiguous "this is the AnalysisReport" marker that
+    lets extraction fall through to the arbiter task output where the true
+    GateDecision lives.
+    """
+    return "score" in d and "overall_score" not in d
+
+
 def _extract_gate_decision_raw(result: Any) -> Optional["GateDecision"]:
     return _extract_pydantic_from_result(
         result,
         GateDecision,
         ("consensus", "disagreement", "experiments"),
+        reject_if=_looks_like_analysis_report_not_gate,
     )
 
 

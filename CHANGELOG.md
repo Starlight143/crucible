@@ -5,6 +5,34 @@ Versioning follows [Semantic Versioning](https://semver.org/). The first public 
 
 ---
 
+## [v1.2.4] — 2026-06-23
+
+Gate-control correctness fix: a run that scored well enough could still be
+denied CodeGen by the pre-codegen quality floor. The Gate Controller's decision
+was being reconstructed from the wrong crew output, which zeroed its score and
+reset its scope. Single-file change, additive, no env/schema/API change.
+
+### Fixed
+- **CodeGen was skipped with `Pre-codegen gate floor: overall_score=0 < 60` even
+  when the analysis genuinely scored ≥ 60.** `extract_gate_decision`
+  (`crucible/modules/section_01_extraction_and_reformat.py`) rebuilt the
+  `GateDecision` from the analysis crew's *final* task output — the
+  `AnalysisReport` — which shares `consensus`/`disagreement`/`experiments` with
+  `GateDecision` but renames `overall_score` → `score` and drops the gate-control
+  fields. Pydantic ignored the unknown `score`, so `overall_score` defaulted to 0
+  and `codegen_scope` to `"production"`; the floor then tripped and (scope no
+  longer being `validation`) refused CodeGen — while the Crew Completion box still
+  showed the true 65/validation in the nested `gate_context_snapshot`. Extraction
+  now rejects an `AnalysisReport`-shaped payload (a bare `score` with no
+  `overall_score`) as a `GateDecision`, falling through to the arbiter task output
+  where the real decision lives. A well-formed `GateDecision` is unaffected.
+
+### Validation
+- pytest: 3400 passed, 2 skipped (`-p no:cacheprovider`; the 2 skips are the
+  optional `SyntheticGoldenRun` fixture and the `h2` package).
+- `crucible/smoke_test.py`: 5/5 OK.
+- `run_crucible.py --self-check`: OK.
+
 ## [v1.2.3] — 2026-06-17
 
 Cost-accuracy release: the run's token and USD totals now match the OpenRouter
