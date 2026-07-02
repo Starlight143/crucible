@@ -375,10 +375,34 @@ class TestFCSettingsSync:
 
 class TestFAFrontendBehaviour:
     def test_run_button_gate(self):
-        assert "_modeHasLiveSession" in _APP_JS
-        assert "_runBtn.disabled = _modeHasLiveSession" in _APP_JS
+        # v1.2.5: the gate is capacity-based (live count vs _MAX_SESSIONS), not
+        # "any live session" — up to _MAX_SESSIONS concurrent runs per mode.
+        assert "_modeLiveSessionCount" in _APP_JS
+        assert (
+            "_runBtn.disabled = _modeLiveSessionCount(sess.mode) >= _MAX_SESSIONS"
+            in _APP_JS
+        )
+        # the old single-live-session gate (capped concurrency at 1) is gone
+        assert "_runBtn.disabled = _modeHasLiveSession" not in _APP_JS
+        assert "function _modeHasLiveSession" not in _APP_JS
         # the old immediate re-enable after run_id is gone
         assert "sess.run_id = data.run_id;\n    runBtn.disabled = false;" not in _APP_JS
+
+    def test_concurrent_run_slots_up_to_max_sessions(self):
+        # idea AND project modes share this code path, so both gain concurrency.
+        assert re.search(r"const _MAX_SESSIONS\s*=\s*6\b", _APP_JS)
+        assert "function _modeLiveSessionCount(mode)" in _APP_JS
+        # the shared per-mode run button id covers both idea and project
+        assert "`btn-run-${sess.mode}`" in _APP_JS
+
+    def test_eviction_never_kills_a_live_session(self):
+        # the pre-fix loop unconditionally shift()'d the oldest session — even a
+        # still-streaming run — to make room.  That line must be gone.
+        assert "const oldest = State.sessions[mode].shift();" not in _APP_JS
+        # startRun refuses to start (toast) when the mode is already full of
+        # live runs, and the trim loop skips live sessions.
+        assert re.search(r"_modeLiveSessionCount\(mode\)\s*>=\s*_MAX_SESSIONS", _APP_JS)
+        assert "_old.status === 'running' || _old.status === 'starting'" in _APP_JS
 
     def test_no_blocking_alert_validation(self):
         assert "alert('Please enter a project path.')" not in _APP_JS

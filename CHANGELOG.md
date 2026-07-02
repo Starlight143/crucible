@@ -5,6 +5,33 @@ Versioning follows [Semantic Versioning](https://semver.org/). The first public 
 
 ---
 
+## [v1.2.5] — 2026-07-03
+
+WebUI concurrency fix: the per-mode "run" button was disabled as soon as one
+session went live, silently capping concurrent runs at 1 despite the 6-session
+limit. Affected both idea and project modes. Frontend-only, additive, no
+env/schema/API change.
+
+### Fixed
+- **Only one pipeline could run at a time per mode.** The shared per-mode run
+  button (`webui/static/js/app.js`) gated on `_modeHasLiveSession` — disabled
+  whenever *any* session in the mode was starting/running — so idea and project
+  modes were both capped at a single concurrent run even though `_MAX_SESSIONS`
+  is 6. The gate now counts live sessions (`_modeLiveSessionCount`) and only
+  disables at the `_MAX_SESSIONS` cap, letting up to 6 runs start concurrently.
+  The companion session-eviction loop, which previously `shift()`'d the oldest
+  session even while it was still streaming, now evicts only terminal sessions
+  and refuses to start (with a toast) when every slot is a live run — so making
+  room can no longer kill a running pipeline. The backend concurrent-execution
+  cap (`CRUCIBLE_WEBUI_MAX_CONCURRENT_RUNS`, default 4) is unchanged; runs beyond
+  it queue as before.
+
+### Validation
+- pytest: 3406 passed, 2 skipped (`-p no:cacheprovider`; the 2 skips are the
+  optional `SyntheticGoldenRun` fixture and the `h2` package).
+- `crucible/smoke_test.py`: 5/5 OK.
+- `run_crucible.py --self-check`: OK.
+
 ## [v1.2.4] — 2026-06-23
 
 Gate-control correctness fix: a run that scored well enough could still be

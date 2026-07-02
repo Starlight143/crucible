@@ -946,13 +946,15 @@ const _STATUS_LABELS = {
 function _statusLabel(status) {
   return _STATUS_LABELS[status] || status;
 }
-// True while the given mode has a session that has not yet reached a terminal
-// state.  Gates the run button (prevents a double-submit spawning a second
-// pipeline) and decides whether ■ Stop needs a confirm.  (v1.1.11 F-A1)
-function _modeHasLiveSession(mode) {
-  return (State.sessions[mode] || []).some(
+// Count sessions in a mode that have not yet reached a terminal state.  Gates
+// the per-mode run button on CAPACITY (v1.2.5): the button stays enabled until
+// the mode already has _MAX_SESSIONS live runs, so up to _MAX_SESSIONS pipelines
+// can run concurrently (the old _modeHasLiveSession gate disabled the button on
+// the FIRST live session, silently capping concurrency at 1 — the reported bug).
+function _modeLiveSessionCount(mode) {
+  return (State.sessions[mode] || []).filter(
     s => s.status === 'starting' || s.status === 'running'
-  );
+  ).length;
 }
 
 // Recompute the global topbar run-status pill from ALL sessions across both
@@ -1221,12 +1223,13 @@ function _setSessionStatus(sessId, status, returncode = null) {
   const pill = `<span class="status-pill status-${status}"><span class="pulse"></span>${_statusLabel(status)}</span>`;
   if (el) el.innerHTML = pill;
   if (inlineEl) inlineEl.innerHTML = pill;
-  // v1.1.11 (F-A1): single chokepoint for the per-mode run button — it stays
-  // disabled while this mode still has a starting/running session and
-  // re-enables only when every session in the mode is terminal.  Prevents the
-  // double-submit the old "re-enable right after the POST" path allowed.
+  // v1.2.5: single chokepoint for the per-mode run button — it re-enables the
+  // moment the mode has fewer than _MAX_SESSIONS live runs, so operators can
+  // launch up to _MAX_SESSIONS concurrent pipelines (idea AND project).  Only a
+  // full slate of live runs disables it.  (Was: disabled on ANY live session,
+  // which silently capped concurrency at 1 — the reported bug.)
   const _runBtn = document.getElementById(`btn-run-${sess.mode}`);
-  if (_runBtn) _runBtn.disabled = _modeHasLiveSession(sess.mode);
+  if (_runBtn) _runBtn.disabled = _modeLiveSessionCount(sess.mode) >= _MAX_SESSIONS;
   // v1.1.11 (F-B7): keep the global topbar run pill in sync.
   if (typeof _updateGlobalRunPill === 'function') _updateGlobalRunPill();
 }
@@ -1923,10 +1926,28 @@ async function startRun(mode) {
     payload = { mode:'idea', analysis_type:analysisType, idea, flags };
   }
 
+  // v1.2.5: allow up to _MAX_SESSIONS concurrent runs per mode.  Refuse to
+  // start when every slot is already a live run — rather than silently killing
+  // one (the pre-fix loop shift()'d the oldest even while it was still
+  // streaming, which could kill a running pipeline to make room).
+  if (_modeLiveSessionCount(mode) >= _MAX_SESSIONS) {
+    showToast(
+      (typeof CURRENT_LANG !== 'undefined' && CURRENT_LANG === 'zh')
+        ? `此模式已有 ${_MAX_SESSIONS} 個工作階段執行中，請等其中一個完成後再啟動。`
+        : `Already running ${_MAX_SESSIONS} sessions in this mode — wait for one to finish.`,
+      'warn'
+    );
+    return;
+  }
   const sess = _newSession(mode, analysisType);
-  while (State.sessions[mode].length >= _MAX_SESSIONS) {
-    const oldest = State.sessions[mode].shift();
-    _closeEvtSource(oldest.id); _stopElapsedTimer(oldest.id);
+  // Keep the list bounded by _MAX_SESSIONS, evicting only TERMINAL sessions
+  // (oldest first).  Live (starting/running) runs are never evicted.
+  for (let _i = 0; _i < State.sessions[mode].length
+                   && State.sessions[mode].length >= _MAX_SESSIONS; ) {
+    const _old = State.sessions[mode][_i];
+    if (_old.status === 'running' || _old.status === 'starting') { _i++; continue; }
+    State.sessions[mode].splice(_i, 1);
+    _closeEvtSource(_old.id); _stopElapsedTimer(_old.id);
   }
   State.sessions[mode].push(sess);
   _setActiveSession(mode, sess.id);
@@ -1948,11 +1969,10 @@ async function startRun(mode) {
     if (data.error) throw new Error(data.error);
     if (!data.run_id) throw new Error('Server returned no run_id — cannot stream output.');
     sess.run_id = data.run_id;
-    // v1.1.11 (F-A1): keep the run button DISABLED while this run streams —
-    // re-enabling here let a second click spawn another pipeline and the
-    // _MAX_SESSIONS cap would then silently kill the oldest still-running
-    // session.  _setSessionStatus() re-enables it once this mode has no live
-    // session left.
+    // v1.2.5: don't touch the run button here — the _setSessionStatus() render
+    // chokepoint recomputes its disabled state from the live-session count, so
+    // it re-enables while the mode has fewer than _MAX_SESSIONS live runs
+    // (allowing further concurrent launches) and only locks at the cap.
     _appendLine(sess.id, `$ ${data.cmd}`, 'dim');
     _appendLine(sess.id, '', 'dim');
     _setSessionStatus(sess.id, 'running');
