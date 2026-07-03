@@ -2523,15 +2523,15 @@ def save_project_output(
             os.path.join(project_dir, "run_snapshot.json"), to_json_str(run_snapshot)
         )
 
-    if dependency_versions:
-        _req_buf = _io.StringIO()
-        for key, version in dependency_versions.items():
-            name = DEPENDENCY_PIP_NAMES.get(key, key)
-            if version and version != "not_installed":
-                _req_buf.write(f"{name}=={version}\n")
-        _atomic_write_text(
-            os.path.join(project_dir, "requirements.txt"), _req_buf.getvalue()
-        )
+    # v1.2.6: the app's requirements.txt is NO LONGER written from
+    # ``dependency_versions`` (the Crucible pipeline's own venv snapshot:
+    # crewai/langchain-openai/pydantic/fastapi/uvicorn — none of which the
+    # generated app imports).  That snapshot poisoned ``pip install`` (clean
+    # container → ModuleNotFoundError) and made pip-audit report phantom CVEs.
+    # The real requirements.txt is generated from an AST scan of ``code/``
+    # AFTER the bundle is written (see write_requirements_for_code below).
+    # ``dependency_versions`` is kept purely as an environment annotation in
+    # run_meta.json and the README dependency-versions section.
 
     md_path = os.path.join(project_dir, "README.md")
     use_cjk = language_hint == "Traditional Chinese"
@@ -2684,6 +2684,28 @@ def save_project_output(
                     else f"[Warn] Skipped {expected_files - len(written)} code file(s) due to invalid or unsafe output paths."
                 )
                 print(warn_msg)
+
+            # v1.2.6: generate the app's requirements.txt from an AST scan of the
+            # code/ we just wrote — the authoritative source of the bundle's real
+            # dependencies.  This replaces the removed pipeline-venv snapshot so a
+            # clean container can ``pip install -r code/requirements.txt`` and
+            # dependency_auditor (which prefers code/requirements.txt) audits the
+            # app's actual deps, not phantom pipeline packages.  Best-effort.
+            try:
+                from ..features.code_lockfile_generator import write_requirements_for_code
+            except ImportError:  # flat-launcher mode (``python crucible/__main__.py``)
+                from features.code_lockfile_generator import (  # type: ignore[no-redef]
+                    write_requirements_for_code,
+                )
+            try:
+                if write_requirements_for_code(code_dir):
+                    print(
+                        "[依賴] 已依實際 import 產生 requirements.txt。"
+                        if use_cjk
+                        else "[Deps] Generated requirements.txt from actual imports."
+                    )
+            except Exception:
+                pass
 
     print_labels = _get_print_labels(use_cjk)
     print(f"\n{print_labels['project_saved_to']} {project_dir}")

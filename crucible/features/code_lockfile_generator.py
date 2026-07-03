@@ -93,6 +93,7 @@ _KNOWN_VERSIONS: Dict[str, str] = {
     "pydantic": "2.7.4",
     "httpx": "0.27.0",
     "requests": "2.32.3",
+    "flask": "3.0.3",
     "fastapi": "0.111.1",
     "uvicorn": "0.30.1",
     "sqlalchemy": "2.0.31",
@@ -261,16 +262,27 @@ def _detect_imports(code_dir: str) -> List[str]:
     """
     Walk all .py files in code_dir (recursively), parse with ast.parse, and
     return a sorted list of unique top-level package names after filtering
-    stdlib modules.
+    stdlib modules AND first-party (local) modules.
+
+    First-party modules — any import whose top-level name matches a ``.py`` stem
+    or a sub-directory inside ``code_dir`` — are excluded.  Without this, a
+    generated app's own modules (``config``, ``scraper``, ``main`` …) would be
+    emitted into requirements.txt as phantom PyPI packages, and
+    ``pip install -r requirements.txt`` would fail trying to fetch them.
     """
     found: Set[str] = set()
+    local: Set[str] = set()
     if not os.path.isdir(code_dir):
         return []
 
-    for dirpath, _dirs, filenames in os.walk(code_dir):
+    for dirpath, dirs, filenames in os.walk(code_dir):
+        for dname in dirs:
+            if dname != "__pycache__":
+                local.add(dname)          # sub-package / namespace dir is first-party
         for fname in filenames:
             if not fname.endswith(".py"):
                 continue
+            local.add(fname[:-3])         # module stem is a first-party name
             fpath = os.path.join(dirpath, fname)
             try:
                 with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
@@ -295,10 +307,12 @@ def _detect_imports(code_dir: str) -> List[str]:
                         if top and not top.startswith("_"):
                             found.add(top)
 
-    # Remove stdlib and built-in modules
+    # Remove stdlib, built-in, and first-party (local) modules
     result = sorted(
         pkg for pkg in found
-        if pkg not in _STDLIB_MODULES and pkg not in {"__builtins__", ""}
+        if pkg not in _STDLIB_MODULES
+        and pkg not in local
+        and pkg not in {"__builtins__", ""}
     )
     return result
 
@@ -478,6 +492,49 @@ def _is_quant_run(run_dir: str) -> bool:
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
+
+def write_requirements_for_code(code_dir: str) -> Optional[str]:
+    """Detect imports in ``code_dir`` (AST walk of every ``*.py``) and write a
+    pinned ``requirements.txt`` **into that directory**, reflecting the APP's
+    real third-party dependencies.
+
+    This is the lean entry point wired into the codegen save flow so the shipped
+    bundle's ``requirements.txt`` always mirrors what ``code/`` actually imports —
+    never the Crucible pipeline's own venv snapshot (crewai/langchain/fastapi/…),
+    which the app does not import and which poisons ``pip install`` and pip-audit.
+
+    Returns the written path, or ``None`` if ``code_dir`` is missing or the write
+    failed.  Never raises — a lockfile hiccup must not fail the run's output save.
+    """
+    if not os.path.isdir(code_dir):
+        return None
+
+    seen_packages: Set[str] = set()
+    deps: List[DetectedDependency] = []
+    for import_name in _detect_imports(code_dir):
+        dep = _resolve_package(import_name)
+        if dep.is_stdlib or dep.name in seen_packages:
+            continue
+        seen_packages.add(dep.name)
+        deps.append(dep)
+
+    content = _generate_requirements_txt(deps)
+    req_path = os.path.join(code_dir, "requirements.txt")
+    tmp_path = req_path + ".tmp"
+    try:
+        with open(tmp_path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        os.replace(tmp_path, req_path)
+    except OSError as exc:
+        _log.warning("write_requirements_for_code: failed to write %s: %s", req_path, exc)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return None
+    _log.info("write_requirements_for_code: wrote %s (%d deps)", req_path, len(deps))
+    return req_path
+
 
 def generate_lockfiles(
     run_dir: str,

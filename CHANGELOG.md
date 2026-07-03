@@ -5,6 +5,43 @@ Versioning follows [Semantic Versioning](https://semver.org/). The first public 
 
 ---
 
+## [v1.2.6] — 2026-07-03
+
+Generated-bundle dependency fix: the shipped `requirements.txt` listed the
+Crucible pipeline's own venv (crewai/langchain-openai/pydantic/fastapi/uvicorn)
+instead of the app's real imports, so a clean container's `pip install` crashed
+and pip-audit reported phantom CVEs. Additive, no env/schema/API change.
+
+### Fixed
+- **`requirements.txt` advertised the pipeline's dependencies, not the app's.**
+  `save_project_output` (`crucible/modules/section_07_selfcheck_output_main.py`)
+  wrote the bundle's `requirements.txt` from `collect_dependency_versions()` — an
+  `importlib.metadata` snapshot of the pipeline's own venv — so every generated
+  app declared crewai/langchain-openai/pydantic/fastapi/uvicorn regardless of
+  what it imported. A clean container then failed `pip install -r
+  requirements.txt` at first request (`ModuleNotFoundError`), and
+  `dependency_auditor` reported CVEs for phantom packages the app never imports.
+  The app's `requirements.txt` is now generated from an AST scan of `code/`
+  (`code_lockfile_generator.write_requirements_for_code`) immediately after the
+  bundle is written; the pipeline snapshot is retained only as an environment
+  note in `run_meta.json` / README. `flask` is now pinned in the known-versions
+  table.
+- **The AST detector emitted the app's own modules as PyPI packages.**
+  `_detect_imports` now excludes first-party modules (any import whose top-level
+  name matches a `.py` stem or sub-directory inside `code/`), so a generated
+  app's own `config`/`scraper`/`main` no longer leak into `requirements.txt` as
+  unfetchable phantom dependencies.
+
+### Validation
+- pytest: 3421 passed, 2 skipped (`-p no:cacheprovider`; the 2 skips are the
+  optional `SyntheticGoldenRun` fixture and the `h2` package).
+- `crucible/smoke_test.py`: 5/5 OK.
+- `run_crucible.py --self-check`: OK.
+- 7 new producer→consumer wiring tests in
+  `tests/test_v1_2_6_requirements_from_ast.py`; verified against the real failing
+  run — `requirements.txt` now = flask/openai/requests (+ real optional
+  sendgrid), no pipeline packages, no leaked local modules.
+
 ## [v1.2.5] — 2026-07-03
 
 WebUI concurrency fix: the per-mode "run" button was disabled as soon as one
