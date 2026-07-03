@@ -207,6 +207,54 @@ addopts = -v --tb=short
 """
 
 
+# ── Deterministic fallback (when the LLM yields no usable test) ───────────────
+
+def _module_import_name(rel_source: str) -> str:
+    """Convert a ``code/``-relative source path to its import name
+    (``pkg/mod.py`` → ``pkg.mod``).  ``conftest.py`` puts ``code/`` on
+    ``sys.path`` so this import name resolves at test time."""
+    no_ext = os.path.splitext(rel_source)[0]
+    return no_ext.replace("\\", "/").replace("/", ".").strip(".")
+
+
+def _safe_test_ident(name: str) -> str:
+    """Turn a module name into a valid Python test-function identifier fragment."""
+    ident = re.sub(r"\W", "_", name).strip("_")
+    if not ident or ident[0].isdigit():
+        ident = "mod_" + ident
+    return ident
+
+
+def _generate_fallback_smoke_test(rel_source: str) -> str:
+    """Deterministic baseline test emitted when the model returns no usable test.
+
+    Guarantees ``--generate-tests`` never silently produces ZERO tests for a
+    module: it verifies the module imports without error — the single most
+    valuable universal smoke check (catches syntax, missing-dependency, and
+    import-time failures).  Crucible-generated apps guard ``__main__`` so
+    importing has no side effects (the runtime smoke stage already imports them).
+    """
+    module = _module_import_name(rel_source)
+    ident = _safe_test_ident(module)
+    return (
+        "# Auto-generated fallback smoke test (deterministic).\n"
+        f"# The test-generation model returned no usable test for {rel_source!r};\n"
+        "# this baseline verifies the module imports cleanly. Replace it with\n"
+        "# real behavioural tests when you can.\n"
+        "import importlib\n"
+        "\n"
+        "import pytest\n"
+        "\n"
+        "\n"
+        f"def test_{ident}_importable():\n"
+        "    try:\n"
+        f"        module = importlib.import_module({module!r})\n"
+        "    except Exception as exc:  # noqa: BLE001 - any import failure is a real defect\n"
+        f'        pytest.fail(f"{module} failed to import: {{exc!r}}")\n'
+        "    assert module is not None\n"
+    )
+
+
 # ── Main entry point ──────────────────────────────────────────────────────────
 
 def generate_tests_for_run(
@@ -301,25 +349,26 @@ def generate_tests_for_run(
         prompt = _build_test_prompt(rel_source, api_summary, source_content[:1500])
 
         raw_output = _call_llm(llm, prompt)
-        if not raw_output or not raw_output.strip():
-            report.errors.append(f"LLM returned empty output for {rel_source}")
-            continue
+        cleaned = _strip_code_fences(raw_output) if raw_output and raw_output.strip() else ""
 
-        cleaned = _strip_code_fences(raw_output)
-
-        if not _is_valid_python(cleaned):
-            # One retry with explicit fix instruction
+        # One retry with an explicit fix instruction when the model returned
+        # syntactically-invalid Python.
+        if cleaned and not _is_valid_python(cleaned):
             retry_output = _call_llm(llm, _build_syntax_fix_prompt(cleaned))
             if retry_output:
                 cleaned = _strip_code_fences(retry_output)
-            if not _is_valid_python(cleaned):
-                detail = _syntax_error_detail(cleaned)
-                report.errors.append(
-                    f"Generated test for {rel_source} has persistent syntax errors"
-                    + (f" ({detail})" if detail else "")
-                    + "; skipped."
-                )
-                continue
+
+        # Deterministic fallback: if the model returned nothing usable (empty, or
+        # still-invalid Python after the retry), emit a minimal import smoke test
+        # so ``--generate-tests`` never silently produces ZERO tests for a module
+        # (the whole point of the flag).  Guarantees pytest collects a real test.
+        if not cleaned or not _is_valid_python(cleaned):
+            detail = _syntax_error_detail(cleaned) if cleaned else "empty response"
+            report.errors.append(
+                f"LLM produced no usable test for {rel_source} ({detail}); "
+                "wrote deterministic import-smoke fallback."
+            )
+            cleaned = _generate_fallback_smoke_test(rel_source)
 
         base_name = os.path.splitext(os.path.basename(source_path))[0]
         test_filename = f"test_{base_name}.py"

@@ -194,12 +194,18 @@ def _resolve_port(framework: str) -> str:
     return str(_find_free_port(preferred))
 
 
-def _make_framework_cmd(framework: str, port: str) -> str:
-    """Return the Docker CMD line appropriate for *framework* and *port*."""
+def _make_framework_cmd(framework: str, port: str, app_target: str = "main:app") -> str:
+    """Return the Docker CMD line appropriate for *framework* and *port*.
+
+    *app_target* is the ASGI/WSGI import target (``module:var``) for uvicorn /
+    gunicorn — derived from where the app object actually lives so a
+    package-structured app (``code/app/main.py`` → ``app.main:app``) boots
+    instead of crashing with ``ModuleNotFoundError: main``.
+    """
     if framework == "fastapi":
-        return f'CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "{port}"]'
+        return f'CMD ["uvicorn", "{app_target}", "--host", "0.0.0.0", "--port", "{port}"]'
     if framework == "flask":
-        return f'CMD ["gunicorn", "--bind", "0.0.0.0:{port}", "--workers", "2", "main:app"]'
+        return f'CMD ["gunicorn", "--bind", "0.0.0.0:{port}", "--workers", "2", "{app_target}"]'
     if framework == "django":
         return f'CMD ["gunicorn", "--bind", "0.0.0.0:{port}", "--workers", "2", "main.wsgi:application"]'
     if framework == "streamlit":
@@ -207,10 +213,90 @@ def _make_framework_cmd(framework: str, port: str) -> str:
     return 'CMD ["python", "-m", "main"]'
 
 
-def _generate_dockerfile(framework: str, python_version: str, port: str = "") -> str:
+_HEALTH_PATH_RE = re.compile(r"""['"](/[A-Za-z0-9_./-]*health[A-Za-z0-9_./-]*)['"]""")
+
+
+def _detect_health_path(code_dir: str) -> str:
+    """Return the app's actual health-check route (e.g. ``/healthz``) by scanning
+    the generated code for a route literal containing ``health``.
+
+    Falls back to ``/healthz`` — Crucible's codegen + runtime smoke-test
+    convention — when nothing is found.  Keeping deployment probes aligned with
+    the app's real endpoint stops containers/pods from being marked unhealthy
+    forever (apps serve ``/healthz`` but the templates used to hardcode
+    ``/health``).
+    """
+    candidates: List[str] = []
+    if os.path.isdir(code_dir):
+        for dirpath, _dirs, filenames in os.walk(code_dir):
+            for fname in filenames:
+                if not fname.endswith(".py"):
+                    continue
+                try:
+                    with open(
+                        os.path.join(dirpath, fname), "r", encoding="utf-8", errors="replace"
+                    ) as fh:
+                        candidates.extend(_HEALTH_PATH_RE.findall(fh.read()))
+                except OSError:
+                    continue
+    if not candidates:
+        return "/healthz"
+    for preferred in ("/healthz", "/health"):
+        if preferred in candidates:
+            return preferred
+    return min(candidates, key=len)
+
+
+_APP_DEF_RE = re.compile(
+    r"^\s*(\w+)\s*=\s*(?:\w+\.)?(?:FastAPI|Flask|Starlette|Quart)\s*\(", re.MULTILINE
+)
+
+
+def _detect_app_target(code_dir: str) -> Optional[str]:
+    """Locate the ASGI/WSGI application object (``app = FastAPI()`` / ``Flask()`` …)
+    and return its import target as ``module:var`` relative to ``code_dir`` — e.g.
+    ``app.main:app`` when the app lives at ``code/app/main.py``.
+
+    The Docker CMD must reference the app where it actually lives; hardcoding
+    ``main:app`` crashes package-structured apps once the Dockerfile copies
+    ``code/`` into ``/app``.  Returns None when no app object is found (the caller
+    keeps the ``main:app`` default).
+    """
+    if not os.path.isdir(code_dir):
+        return None
+    fallback: Optional[str] = None
+    for dirpath, _dirs, filenames in os.walk(code_dir):
+        for fname in filenames:
+            if not fname.endswith(".py"):
+                continue
+            try:
+                with open(
+                    os.path.join(dirpath, fname), "r", encoding="utf-8", errors="replace"
+                ) as fh:
+                    match = _APP_DEF_RE.search(fh.read())
+            except OSError:
+                continue
+            if not match:
+                continue
+            rel = os.path.relpath(os.path.join(dirpath, fname), code_dir).replace("\\", "/")
+            target = f"{os.path.splitext(rel)[0].replace('/', '.')}:{match.group(1)}"
+            if os.path.basename(rel) == "main.py":
+                return target       # conventional entrypoint wins
+            if fallback is None:
+                fallback = target
+    return fallback
+
+
+def _generate_dockerfile(
+    framework: str,
+    python_version: str,
+    port: str = "",
+    health_path: str = "/healthz",
+    app_target: str = "main:app",
+) -> str:
     if not port:
         port = _resolve_port(framework)
-    cmd = _make_framework_cmd(framework, port) if port else 'CMD ["python", "-m", "main"]'
+    cmd = _make_framework_cmd(framework, port, app_target) if port else 'CMD ["python", "-m", "main"]'
     expose_line = f"EXPOSE {port}\n" if port else ""
 
     # Use HTTP healthcheck for web frameworks with a known port; for headless
@@ -219,7 +305,7 @@ def _generate_dockerfile(framework: str, python_version: str, port: str = "") ->
     if port:
         healthcheck_cmd = (
             f"HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \\\n"
-            f"    CMD curl -f http://localhost:{port}/health 2>/dev/null \\\n"
+            f"    CMD curl -f http://localhost:{port}{health_path} 2>/dev/null \\\n"
             f"        || exit 1\n"
         )
     else:
@@ -241,8 +327,8 @@ def _generate_dockerfile(framework: str, python_version: str, port: str = "") ->
         f"COPY requirements.txt ./\n"
         f"RUN pip install --no-cache-dir --upgrade pip \\\n"
         f"    && pip install --no-cache-dir -r requirements.txt\n\n"
-        f"# ── Application code ───────────────────────────────────────────────\n"
-        f"COPY . .\n\n"
+        f"# ── Application code (build context = run root; app lives in code/) ─\n"
+        f"COPY code/ ./\n\n"
         f"# ── Security: non-root user ─────────────────────────────────────────\n"
         f"RUN useradd --no-create-home --shell /bin/false appuser \\\n"
         f"    && chown -R appuser:appuser /app\n"
@@ -302,8 +388,8 @@ def _generate_docker_compose(
         f"services:\n"
         f"  app:\n"
         f"    build:\n"
-        f"      context: .\n"
-        f"      dockerfile: Dockerfile\n"
+        f"      context: ..\n"
+        f"      dockerfile: deployment/Dockerfile\n"
         f"    env_file:\n"
         f"      - .env\n"
         f"    environment:\n"
@@ -455,6 +541,7 @@ def _generate_k8s_deployment(
     framework: str,
     python_version: str,
     port: str = "",
+    health_path: str = "/healthz",
 ) -> str:
     if not port:
         port = _resolve_port(framework)
@@ -469,13 +556,13 @@ def _generate_k8s_deployment(
         readiness_block = (
             f"          readinessProbe:\n"
             f"            httpGet:\n"
-            f"              path: /health\n"
+            f"              path: {health_path}\n"
             f"              port: {port}\n"
             f"            initialDelaySeconds: 10\n"
             f"            periodSeconds: 15\n"
             f"          livenessProbe:\n"
             f"            httpGet:\n"
-            f"              path: /health\n"
+            f"              path: {health_path}\n"
             f"              port: {port}\n"
             f"            initialDelaySeconds: 15\n"
             f"            periodSeconds: 30\n"
@@ -574,6 +661,7 @@ def _generate_helm_values(
     project_name: str,
     framework: str,
     port: str = "",
+    health_path: str = "/healthz",
 ) -> str:
     if not port:
         port = _resolve_port(framework)
@@ -617,7 +705,7 @@ def _generate_helm_values(
         f"    cpu: 500m\n"
         f"    memory: 512Mi\n\n"
         f"healthCheck:\n"
-        f"  path: /health\n"
+        f"  path: {health_path}\n"
         f"  initialDelaySeconds: 10\n"
         f"  periodSeconds: 15\n"
     )
@@ -719,6 +807,8 @@ def generate_deployment_artifacts(run_dir: str) -> DeploymentArtifactReport:
     framework = _detect_framework(imports)
     has_orm = _detect_orm(imports)
     python_version = _get_python_version(run_dir)
+    health_path = _detect_health_path(code_dir)
+    app_target = _detect_app_target(code_dir) or "main:app"
 
     # Resolve the host port ONCE so all generated artifacts use the same port.
     # _resolve_port() finds a free port on the local machine starting from the
@@ -750,7 +840,12 @@ def generate_deployment_artifacts(run_dir: str) -> DeploymentArtifactReport:
                 pass
             errors.append(f"{filename}: {exc}")
 
-    _write("Dockerfile", _generate_dockerfile(framework, python_version, port=host_port))
+    _write(
+        "Dockerfile",
+        _generate_dockerfile(
+            framework, python_version, port=host_port, health_path=health_path, app_target=app_target
+        ),
+    )
     _write("docker-compose.yml", _generate_docker_compose(framework, has_orm, project_name, port=host_port))
     _write(".env.example", _generate_env_example(framework, has_orm, port=host_port))
 
@@ -773,7 +868,7 @@ def generate_deployment_artifacts(run_dir: str) -> DeploymentArtifactReport:
 
     _write(
         "deployment.yaml",
-        _generate_k8s_deployment(k8s_name, framework, python_version, port=host_port),
+        _generate_k8s_deployment(k8s_name, framework, python_version, port=host_port, health_path=health_path),
         subdir="k8s",
     )
     _write(
@@ -784,7 +879,7 @@ def generate_deployment_artifacts(run_dir: str) -> DeploymentArtifactReport:
 
     # Helm chart
     _write("Chart.yaml", _generate_helm_chart(k8s_name), subdir="helm")
-    _write("values.yaml", _generate_helm_values(k8s_name, framework, port=host_port), subdir="helm")
+    _write("values.yaml", _generate_helm_values(k8s_name, framework, port=host_port, health_path=health_path), subdir="helm")
     _write(
         "deployment.yaml",
         _generate_helm_deployment_template(k8s_name, framework, port=host_port),

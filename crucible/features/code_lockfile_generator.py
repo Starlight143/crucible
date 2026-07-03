@@ -22,9 +22,10 @@ import ast
 import json
 import logging
 import os
+import re
 import sys
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 _log = logging.getLogger(__name__)
 
@@ -79,6 +80,12 @@ class LockfileResult:
 
 # ── Hardcoded known package versions ─────────────────────────────────────────
 
+# Single source of truth for the generated project's *dev* Python version, so the
+# ``.python-version`` file and pyproject's mypy config never drift apart.  (The
+# ``requires-python`` floor in ``LockfileConfig.python_version`` is deliberately
+# looser — ``>=3.9`` — as a compatibility floor, not the dev target.)
+_DEFAULT_DEV_PYTHON = "3.11"
+
 _KNOWN_VERSIONS: Dict[str, str] = {
     "yfinance": "0.2.51",
     "ccxt": "4.3.95",
@@ -120,6 +127,8 @@ _KNOWN_VERSIONS: Dict[str, str] = {
     "redis": "5.0.7",
     "celery": "5.4.0",
     "psycopg2-binary": "2.9.9",
+    "asyncpg": "0.29.0",
+    "aiosqlite": "0.20.0",
     "pymongo": "4.8.0",
     "boto3": "1.34.144",
     "langchain": "0.2.6",
@@ -183,6 +192,10 @@ _IMPORT_TO_PACKAGE: Dict[str, str] = {
     # Utilities
     "celery": "celery",
     "pydantic": "pydantic",
+    "pydantic_settings": "pydantic-settings",
+    "jwt": "PyJWT",
+    "jose": "python-jose",
+    "prometheus_client": "prometheus-client",
     "httpx": "httpx",
     "requests": "requests",
     "tqdm": "tqdm",
@@ -258,6 +271,42 @@ _STDLIB_MODULES: Set[str] = _get_stdlib_modules()
 
 # ── Import detection ──────────────────────────────────────────────────────────
 
+def _top_level_imports_in_source(source: str, filename: str = "<source>") -> Set[str]:
+    """Return the top-level absolute-import package names in one source string.
+
+    ``import a.b`` / ``from a.b import c`` → ``a``; relative imports (``level>0``)
+    and dunder/underscore roots are skipped.  Never raises on a ``SyntaxError``
+    (returns an empty set) so one unparseable file cannot abort detection.
+    """
+    names: Set[str] = set()
+    try:
+        tree = ast.parse(source, filename=filename)
+    except SyntaxError:
+        return names
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                if top and not top.startswith("_"):
+                    names.add(top)
+        elif isinstance(node, ast.ImportFrom):
+            if node.module and node.level == 0:   # absolute import
+                top = node.module.split(".")[0]
+                if top and not top.startswith("_"):
+                    names.add(top)
+    return names
+
+
+def _filter_third_party(found: Set[str], local: Set[str]) -> List[str]:
+    """Drop stdlib, built-in, and first-party (local) module names; return sorted."""
+    return sorted(
+        pkg for pkg in found
+        if pkg not in _STDLIB_MODULES
+        and pkg not in local
+        and pkg not in {"__builtins__", ""}
+    )
+
+
 def _detect_imports(code_dir: str) -> List[str]:
     """
     Walk all .py files in code_dir (recursively), parse with ast.parse, and
@@ -289,32 +338,120 @@ def _detect_imports(code_dir: str) -> List[str]:
                     source = fh.read()
             except OSError:
                 continue
+            found |= _top_level_imports_in_source(source, fpath)
 
-            try:
-                tree = ast.parse(source, filename=fpath)
-            except SyntaxError:
+    return _filter_third_party(found, local)
+
+
+def detect_imports_from_sources(sources: Iterable[Tuple[str, str]]) -> List[str]:
+    """In-memory twin of :func:`_detect_imports` for a code bundle that has not
+    been written to disk yet.
+
+    ``sources`` is an iterable of ``(relpath, source_text)`` pairs.  First-party
+    names are derived from the relpaths (``.py`` stems + directory segments), so
+    a bundle's own modules are filtered exactly as the on-disk path filters them.
+    """
+    found: Set[str] = set()
+    local: Set[str] = set()
+    for relpath, source in sources:
+        segs = str(relpath or "").replace("\\", "/").split("/")
+        for seg in segs[:-1]:
+            if seg and seg != "__pycache__":
+                local.add(seg)
+        base = segs[-1]
+        if not base.endswith(".py"):
+            continue
+        local.add(base[:-3])
+        found |= _top_level_imports_in_source(source or "", relpath or "<source>")
+    return _filter_third_party(found, local)
+
+
+def _resolve_third_party_deps(imports: Iterable[str]) -> List[DetectedDependency]:
+    """Resolve import names → deduped, non-stdlib :class:`DetectedDependency` list."""
+    seen: Set[str] = set()
+    deps: List[DetectedDependency] = []
+    for import_name in imports:
+        dep = _resolve_package(import_name)
+        if dep.is_stdlib or dep.name in seen:
+            continue
+        seen.add(dep.name)
+        deps.append(dep)
+    return deps
+
+
+# ── DB-driver inference (drivers referenced only in connection strings) ───────
+
+_DRIVER_PACKAGES: Dict[str, str] = {
+    "asyncpg": "asyncpg",
+    "psycopg2": "psycopg2-binary",
+    "psycopg": "psycopg",
+    "pg8000": "pg8000",
+    "aiomysql": "aiomysql",
+    "pymysql": "pymysql",
+    "mysqldb": "mysqlclient",
+    "aiosqlite": "aiosqlite",
+    "asyncmy": "asyncmy",
+    "pyodbc": "pyodbc",
+    "oracledb": "oracledb",
+}
+
+# SQLAlchemy-style ``dialect+driver://`` — captures the driver token.
+_CONN_DRIVER_RE = re.compile(r"[a-z0-9]+\+([a-z0-9_]+)://", re.IGNORECASE)
+
+
+def _read_sources(code_dir: str) -> List[Tuple[str, str]]:
+    """Return ``(relpath, content)`` pairs for every ``*.py`` under ``code_dir``."""
+    out: List[Tuple[str, str]] = []
+    if not os.path.isdir(code_dir):
+        return out
+    for dirpath, _dirs, filenames in os.walk(code_dir):
+        for fname in filenames:
+            if not fname.endswith(".py"):
                 continue
+            fpath = os.path.join(dirpath, fname)
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="replace") as fh:
+                    out.append((os.path.relpath(fpath, code_dir), fh.read()))
+            except OSError:
+                continue
+    return out
 
-            for node in ast.walk(tree):
-                if isinstance(node, ast.Import):
-                    for alias in node.names:
-                        top = alias.name.split(".")[0]
-                        if top and not top.startswith("_"):
-                            found.add(top)
-                elif isinstance(node, ast.ImportFrom):
-                    if node.module and node.level == 0:   # absolute import
-                        top = node.module.split(".")[0]
-                        if top and not top.startswith("_"):
-                            found.add(top)
 
-    # Remove stdlib, built-in, and first-party (local) modules
-    result = sorted(
-        pkg for pkg in found
-        if pkg not in _STDLIB_MODULES
-        and pkg not in local
-        and pkg not in {"__builtins__", ""}
-    )
-    return result
+def _add_connection_drivers(
+    deps: List[DetectedDependency], sources: Iterable[Tuple[str, str]]
+) -> None:
+    """Append DB-driver packages referenced only via SQLAlchemy-style
+    ``dialect+driver://`` connection strings (e.g. ``postgresql+asyncpg://`` →
+    ``asyncpg``).  These are genuine runtime deps the app never ``import``s, so
+    AST detection misses them and a clean ``pip install`` fails at startup.
+    Mutates ``deps`` in place; skips drivers already present.  The whitelist
+    prevents false positives (``git+ssh://`` etc. resolve to nothing)."""
+    have = {d.name for d in deps}
+    for _relpath, source in sources:
+        for driver in _CONN_DRIVER_RE.findall(source or ""):
+            pkg = _DRIVER_PACKAGES.get(driver.lower())
+            if not pkg or pkg in have:
+                continue
+            have.add(pkg)
+            deps.append(
+                DetectedDependency(
+                    name=pkg,
+                    import_name=pkg,
+                    pinned_version=_KNOWN_VERSIONS.get(pkg),
+                    category="core",
+                    is_stdlib=False,
+                )
+            )
+
+
+def requirements_text_from_sources(sources: Iterable[Tuple[str, str]]) -> str:
+    """Return pinned ``requirements.txt`` content synthesised from in-memory
+    ``(relpath, content)`` source pairs — imports (AST) plus DB drivers inferred
+    from connection strings.  Header-only if no third-party deps."""
+    src_list = list(sources)
+    deps = _resolve_third_party_deps(detect_imports_from_sources(src_list))
+    _add_connection_drivers(deps, src_list)
+    return _generate_requirements_txt(deps)
 
 
 # ── Package resolution ────────────────────────────────────────────────────────
@@ -392,7 +529,7 @@ def _generate_pyproject_toml(
         "[project]",
         f'name = "{project_name}"',
         'version = "0.1.0"',
-        'description = "Auto-generated trading strategy — Crucible"',
+        'description = "Auto-generated project — Crucible"',
         f'requires-python = "{config.python_version}"',
         "dependencies = [",
     ]
@@ -429,7 +566,7 @@ def _generate_pyproject_toml(
         'target-version = "py39"',
         "",
         "[tool.mypy]",
-        'python_version = "3.11"',
+        f'python_version = "{_DEFAULT_DEV_PYTHON}"',
         "strict = false",
         "ignore_missing_imports = true",
         "",
@@ -509,15 +646,8 @@ def write_requirements_for_code(code_dir: str) -> Optional[str]:
     if not os.path.isdir(code_dir):
         return None
 
-    seen_packages: Set[str] = set()
-    deps: List[DetectedDependency] = []
-    for import_name in _detect_imports(code_dir):
-        dep = _resolve_package(import_name)
-        if dep.is_stdlib or dep.name in seen_packages:
-            continue
-        seen_packages.add(dep.name)
-        deps.append(dep)
-
+    deps = _resolve_third_party_deps(_detect_imports(code_dir))
+    _add_connection_drivers(deps, _read_sources(code_dir))
     content = _generate_requirements_txt(deps)
     req_path = os.path.join(code_dir, "requirements.txt")
     tmp_path = req_path + ".tmp"
@@ -578,6 +708,13 @@ def generate_lockfiles(
             continue
         seen_packages.add(dep.name)
         result.detected_deps.append(dep)
+
+    # v1.2.7: include DB drivers referenced only in connection strings (asyncpg
+    # etc.) so this --lockfile-gen path matches ``write_requirements_for_code``.
+    # Otherwise the lockfile overwrite drops the drivers the section_07 run-root
+    # mirror added, leaving code/requirements.txt inconsistent with the run-root
+    # requirements.txt (and missing a runtime dep → clean pip install fails).
+    _add_connection_drivers(result.detected_deps, _read_sources(code_dir))
 
     # Derive project name from run_dir basename
     project_name = os.path.basename(run_dir).replace(" ", "_").replace("-", "_")
@@ -642,7 +779,7 @@ def generate_lockfiles(
     _tmp_lf = pv_path + ".tmp"
     try:
         with open(_tmp_lf, "w", encoding="utf-8") as fh:
-            fh.write("3.11\n")
+            fh.write(f"{_DEFAULT_DEV_PYTHON}\n")
         os.replace(_tmp_lf, pv_path)
         result.python_version_path = pv_path
     except OSError as exc:

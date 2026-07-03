@@ -5,6 +5,48 @@ Versioning follows [Semantic Versioning](https://semver.org/). The first public 
 
 ---
 
+## [v1.2.7] — 2026-07-03
+
+Generated-bundle correctness follow-up to v1.2.6, hardened across four
+end-to-end idea-mode runs: the app's dependencies install cleanly in a fresh
+container, the generated deployment artifacts build and boot, and the quality
+loop no longer gives up on dependency-declaration noise. Additive, no
+env/schema/API change.
+
+### Fixed
+- **Deployment build regressed by v1.2.6.** v1.2.6 removed the run-root
+  `requirements.txt`, but the default-on deployment Dockerfile `COPY`s it from
+  the run-root build context. `save_project_output` now mirrors the AST-derived
+  manifest to BOTH `code/requirements.txt` and the run root (identical content).
+- **Quality loop gave up on undeclared dependencies.** When the LLM omitted or
+  under-specified `requirements.txt`, the runtime cross-reference lint failed
+  every round (`QUALITY_LOOP_GAVE_UP`) on otherwise-fine code. `run_quality_loop`
+  now synthesises the manifest from the bundle's imports each round and
+  backfills any package an incomplete LLM manifest omitted.
+- **Generated deployment artifacts were non-functional.** `deployment_artifacts`
+  now derives the health-probe path from the app's actual route (was a hardcoded
+  `/health` while apps serve `/healthz`), builds from the run-root context with
+  `COPY code/ ./`, and derives the container `CMD` entrypoint from where the app
+  object lives (`app.main:app` for package layouts — the hardcoded `main:app`
+  crashed on boot).
+- **`requirements.txt` missed runtime DB drivers and mislabelled packages.**
+  `code_lockfile_generator` now infers SQLAlchemy `dialect+driver://` drivers
+  (e.g. `asyncpg`) that are never `import`ed, keeps both requirements generators
+  (`write_requirements_for_code` and `--lockfile-gen`) byte-identical, filters
+  first-party modules, and maps import→package names (`jwt`→`PyJWT`,
+  `prometheus_client`→`prometheus-client`, `pydantic_settings`→`pydantic-settings`).
+- **`--generate-tests` could produce zero tests.** When the LLM returned empty
+  or invalid output, `test_generator` skipped the file entirely; it now writes a
+  deterministic import-smoke fallback so pytest always collects a real test.
+- **pyproject description** no longer hardcodes "Auto-generated trading strategy"
+  for non-quant projects; the dev Python version now has a single source of truth.
+
+### Validation
+- pytest: 3473 passed, 2 skipped (`-p no:cacheprovider`).
+- `crucible/smoke_test.py`: 5/5 OK. `run_crucible.py --self-check`: OK.
+- Verified across four end-to-end SaaS idea-mode runs (real OpenRouter) plus new
+  regression tests in five `tests/test_v1_2_*` files.
+
 ## [v1.2.6] — 2026-07-03
 
 Generated-bundle dependency fix: the shipped `requirements.txt` listed the

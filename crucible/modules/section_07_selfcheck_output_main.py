@@ -2687,10 +2687,13 @@ def save_project_output(
 
             # v1.2.6: generate the app's requirements.txt from an AST scan of the
             # code/ we just wrote — the authoritative source of the bundle's real
-            # dependencies.  This replaces the removed pipeline-venv snapshot so a
-            # clean container can ``pip install -r code/requirements.txt`` and
-            # dependency_auditor (which prefers code/requirements.txt) audits the
-            # app's actual deps, not phantom pipeline packages.  Best-effort.
+            # dependencies (replaces the removed pipeline-venv snapshot).  Written
+            # to BOTH code/requirements.txt (dependency_auditor prefers it; it
+            # lives with the app) AND the run root — the default-on deployment
+            # Dockerfile runs ``COPY requirements.txt`` with the run root as its
+            # build context, and the run root is the conventional project-root
+            # manifest location.  Same AST content in both.  Best-effort: a
+            # lockfile hiccup must never fail the run's output save.
             try:
                 from ..features.code_lockfile_generator import write_requirements_for_code
             except ImportError:  # flat-launcher mode (``python crucible/__main__.py``)
@@ -2698,7 +2701,14 @@ def save_project_output(
                     write_requirements_for_code,
                 )
             try:
-                if write_requirements_for_code(code_dir):
+                _req_written = write_requirements_for_code(code_dir)
+                if _req_written:
+                    with open(_req_written, "r", encoding="utf-8") as _rf:
+                        _req_text = _rf.read()
+                    # Mirror to the run root for the deployment Dockerfile / convention.
+                    _atomic_write_text(
+                        os.path.join(project_dir, "requirements.txt"), _req_text
+                    )
                     print(
                         "[依賴] 已依實際 import 產生 requirements.txt。"
                         if use_cjk

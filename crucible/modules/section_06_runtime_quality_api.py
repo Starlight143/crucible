@@ -2619,6 +2619,86 @@ def build_conditional_codegen_context(
     )
 
 
+def _ensure_bundle_requirements(bundle: CodeBundle) -> None:
+    """Synthesise a ``requirements.txt`` into *bundle* (in place) if it lacks a
+    real one, declaring the app's actual imports.
+
+    The cross-reference lint (``mode_validation_matrix``) flags framework imports
+    that are not declared in any requirements file.  When the LLM output omits
+    ``requirements.txt`` that issue repeats every round until the quality loop
+    gives up (``QUALITY_LOOP_GAVE_UP``) on otherwise-fine code.  Declaring
+    dependencies from imports is a deterministic, mechanical transform, so we do
+    it here rather than asking the LLM to hand-maintain it every round.
+
+    Called before each runtime-validation round so it survives fix rounds that
+    replace the bundle.  Best-effort — a hiccup must never break the loop.
+    """
+    try:
+        files = list(getattr(bundle, "files", None) or [])
+
+        def _dep_lines(text: str) -> List[str]:
+            return [
+                ln for ln in text.splitlines()
+                if ln.strip() and not ln.strip().startswith("#")
+            ]
+
+        def _pkg_name(line: str) -> str:
+            head = re.split(r"[<>=!~;,\[\(\s]", line.strip(), 1)[0]
+            return head.strip().lower().replace("_", "-")
+
+        try:
+            from ..features.code_lockfile_generator import requirements_text_from_sources
+        except ImportError:  # flat-launcher mode (``python crucible/__main__.py``)
+            from features.code_lockfile_generator import (  # type: ignore[no-redef]
+                requirements_text_from_sources,
+            )
+        sources = [
+            (str(getattr(gf, "path", "") or ""), str(getattr(gf, "content", "") or ""))
+            for gf in files
+        ]
+        synth = requirements_text_from_sources(sources)
+        synth_lines = _dep_lines(synth)
+        if not synth_lines:
+            return  # no third-party deps detected — nothing to declare
+
+        req_gf = next(
+            (
+                gf for gf in files
+                if os.path.basename(str(getattr(gf, "path", "") or "")).lower()
+                == "requirements.txt"
+            ),
+            None,
+        )
+        existing = str(getattr(req_gf, "content", "") or "") if req_gf is not None else ""
+
+        if req_gf is None or not _dep_lines(existing):
+            # No real manifest → drop in the full synthesised one.
+            kept = [
+                gf for gf in files
+                if os.path.basename(str(getattr(gf, "path", "") or "")).lower()
+                != "requirements.txt"
+            ]
+            kept.append(GeneratedFile(path="requirements.txt", content=synth))
+            bundle.files = kept
+            return
+
+        # An LLM manifest exists — BACKFILL any detected package it omitted rather
+        # than blindly trusting it (an incomplete manifest is the common failure
+        # mode: e.g. it imports ``starlette`` directly but never declares it, so
+        # the cross-reference lint keeps failing the loop).
+        declared = {_pkg_name(ln) for ln in _dep_lines(existing)}
+        missing = [ln for ln in synth_lines if _pkg_name(ln) and _pkg_name(ln) not in declared]
+        if not missing:
+            return  # already complete
+        new_content = existing.rstrip("\n") + "\n" + "\n".join(missing) + "\n"
+        bundle.files = [
+            GeneratedFile(path=req_gf.path, content=new_content) if gf is req_gf else gf
+            for gf in files
+        ]
+    except Exception:
+        return
+
+
 def run_quality_loop(
     user_problem: str,
     analysis_report: Optional[AnalysisReport],
@@ -2687,6 +2767,11 @@ def run_quality_loop(
             runtime_issues = []
             runtime_log = "Runtime validation skipped by validation_scope=skip."
         else:
+            # v1.2.7: declare the app's real dependencies deterministically before
+            # each validation round so the cross-reference lint stops flagging
+            # "framework imported but not declared" on bundles whose LLM output
+            # omitted requirements.txt — the cause of spurious QUALITY_LOOP_GAVE_UP.
+            _ensure_bundle_requirements(current_code)
             runtime_ok, runtime_issues, runtime_log = run_runtime_validation(
                 current_code,
                 user_problem=user_problem,

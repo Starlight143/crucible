@@ -115,25 +115,31 @@ def test_write_requirements_returns_none_for_missing_dir() -> None:
 
 
 def test_requirements_source_is_ast_not_env_snapshot() -> None:
-    """save_project_output must no longer write requirements.txt from the
-    pipeline dependency_versions snapshot — the write to project root and the
-    DEPENDENCY_PIP_NAMES mapping it used are gone."""
+    """save_project_output must no longer build requirements.txt from the pipeline
+    dependency_versions snapshot.  The snapshot mechanism (the DEPENDENCY_PIP_NAMES
+    map + the _req_buf write loop) is gone; any requirements.txt it writes — to
+    code/ or the run root — is now fed by the AST helper, not importlib.metadata."""
     src = inspect.getsource(_s07.save_project_output)
-    assert 'os.path.join(project_dir, "requirements.txt")' not in src, (
-        "save_project_output still writes the pipeline-snapshot requirements.txt "
-        "to the run root"
-    )
     assert "DEPENDENCY_PIP_NAMES" not in src, (
         "the pipeline pip-name mapping is only used by the removed snapshot write"
     )
+    assert "_req_buf" not in src, (
+        "the pipeline-snapshot requirements write loop (_req_buf) is gone"
+    )
+    # Whatever requirements.txt the run receives must come from the AST helper.
+    assert "write_requirements_for_code(code_dir)" in src
 
 
 def test_save_project_output_wires_ast_requirements() -> None:
-    """The AST generator must actually be called in the save flow (§9.6:
-    assert the wire-up code exists, not just that the producer is correct)."""
+    """The AST generator must be called in the save flow AND its output mirrored to
+    the run root (§9.6: assert the wire-up and the deployment consumer's manifest
+    location, not just that the producer is correct)."""
     src = inspect.getsource(_s07.save_project_output)
     assert "write_requirements_for_code(code_dir)" in src
     assert "code_lockfile_generator import write_requirements_for_code" in src
+    # The run root gets a mirror so the deployment Dockerfile's
+    # ``COPY requirements.txt`` (build context = run root) finds the app's deps.
+    assert 'os.path.join(project_dir, "requirements.txt")' in src
 
 
 def test_dependency_audit_targets_code_requirements() -> None:
