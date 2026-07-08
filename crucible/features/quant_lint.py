@@ -1185,7 +1185,18 @@ _DEFAULT_IGNORE_DIRS = {
 def analyse_quant_lint_from_files(files: List[Tuple[str, str]]) -> QuantLintReport:
     issues: List[QuantLintIssue] = []
     for path, source in files:
-        issues.extend(_analyse_one_file(path, source))
+        try:
+            issues.extend(_analyse_one_file(path, source))
+        except RecursionError:
+            # v1.2.9: every rule's visitor is a recursive ast.NodeVisitor, so a
+            # pathologically deep single file (e.g. a many-hundred-branch
+            # elif-chain or a long chained arithmetic expression) can exceed
+            # Python's recursion limit mid-traversal. Degrade gracefully for
+            # this one file rather than let it crash the whole batch and take
+            # the quality loop down with it — same "one bad file never sinks
+            # the report" philosophy as the OSError guard in
+            # analyse_quant_lint's directory walk below.
+            continue
     return QuantLintReport(
         passes=not issues,
         issues=issues,

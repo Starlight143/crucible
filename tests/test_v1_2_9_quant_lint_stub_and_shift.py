@@ -172,3 +172,52 @@ def test_clean_strategy_passes():
     report = analyse_quant_lint_from_files([("s.py", src)])
     assert report.passes
     assert report.issues == []
+
+
+# ─── robustness: pathologically deep files must degrade, never crash ────────
+#
+# Every Q00N rule's visitor is a recursive ast.NodeVisitor (Q005's
+# _LookaheadShiftVisitor and Q006's _StubImplementationVisitor included). A
+# many-hundred-branch elif-chain -- plausible if an LLM emits a per-symbol /
+# per-regime dispatch as elif instead of a lookup table -- nests ~1 `If` AST
+# node per branch (`If(orelse=[If(...)])`), which exceeds Python's default
+# recursion limit mid-traversal and used to raise an uncaught RecursionError
+# out of analyse_quant_lint_from_files, crashing the whole quality-loop
+# invocation instead of yielding a lint report.
+
+
+def _long_elif_chain_source(n: int) -> str:
+    lines = ["def dispatch(regime):", "    if regime == 0:", "        return 0"]
+    for i in range(1, n):
+        lines.append(f"    elif regime == {i}:")
+        lines.append(f"        return {i}")
+    lines.append("    else:")
+    lines.append("        return -1")
+    return "\n".join(lines) + "\n"
+
+
+def test_deep_elif_chain_does_not_crash_the_batch():
+    src = _long_elif_chain_source(500)
+    report = analyse_quant_lint_from_files([("dispatch.py", src)])
+    # Degrades gracefully: no crash, and (since the pathological file could
+    # not be fully analysed) it contributes no issues rather than a partial
+    # or corrupted result.
+    assert report.issues == []
+
+
+def test_deep_elif_chain_does_not_lose_other_files_in_the_same_batch():
+    pathological = _long_elif_chain_source(500)
+    clean_with_real_issue = "signal = df['close'].shift(-1)\n"
+    report = analyse_quant_lint_from_files(
+        [("dispatch.py", pathological), ("strategy.py", clean_with_real_issue)]
+    )
+    assert report.files_scanned == 2
+    rules = [i.rule for i in report.issues]
+    assert rules == ["Q005-lookahead-shift"]
+    assert report.issues[0].file == "strategy.py"
+
+
+def test_deep_binop_chain_does_not_crash():
+    src = "x = " + "1 + " * 800 + "1\n"
+    report = analyse_quant_lint_from_files([("s.py", src)])
+    assert report.issues == []

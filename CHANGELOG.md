@@ -5,6 +5,28 @@ Versioning follows [Semantic Versioning](https://semver.org/). The first public 
 
 ---
 
+## [v1.2.10] — 2026-07-08
+
+Robustness fix for the Quant-lint pass: a pathologically deep source file no
+longer crashes the quality loop. Additive, no env/schema/API change.
+
+### Fixed
+- **`analyse_quant_lint_from_files` could crash on a pathologically deep AST.**
+  Every Quant-lint rule (Q001–Q006) walks the tree with a recursive
+  `ast.NodeVisitor`, so a single file with a many-hundred-branch `elif` chain
+  (or a long chained arithmetic expression) could exceed Python's recursion
+  limit mid-traversal and raise an uncaught `RecursionError` — taking down the
+  whole quality-loop invocation (which gates on `passes = not issues`). The
+  per-file analysis is now guarded so one pathological file degrades gracefully
+  (skipped) instead of sinking the batch, mirroring the existing `OSError`
+  guard in the directory walk.
+
+### Validation
+- pytest: 3500 passed, 2 skipped (`-p no:cacheprovider`).
+- `crucible/smoke_test.py`: 5/5 OK. `run_crucible.py --self-check`: OK.
+
+---
+
 ## [v1.2.9] — 2026-07-08
 
 Two deterministic Quant-lint rules plus a prompt-cache regression alarm,
