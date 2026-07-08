@@ -2021,6 +2021,23 @@ def main() -> None:
             print(f"Cache Hit Rate: {cost_summary['cache_hit_rate'] * 100:.1f}%")
             print(f"Success Rate: {cost_summary['success_rate'] * 100:.1f}%")
 
+            # v1.2.9: a 0% cache-hit rate across multiple LLM calls means the
+            # static system/tool prefix is being re-billed in full every call —
+            # usually a silent regression (the primary model changed, or the
+            # prompt prefix became non-deterministic).  Printed metrics go to
+            # stdout which is unread in headless/batch runs, so also emit a
+            # WARNING to the log stream where an operator will actually see it.
+            _cache_hit_rate = cost_summary.get("cache_hit_rate", 0) or 0
+            _total_exec = cost_summary.get("total_executions", 0) or 0
+            if _total_exec > 1 and _cache_hit_rate <= 0:
+                LOGGER.warning(
+                    "Prompt cache hit rate is 0%% across %d executions — the static "
+                    "system/tool prefix is being re-billed in full every call. If the "
+                    "primary model recently changed or the prompt prefix became "
+                    "non-deterministic, prompt caching may have silently regressed.",
+                    _total_exec,
+                )
+
             if cost_summary.get("models_used"):
                 print(f"Models Used: {', '.join(cost_summary['models_used'])}")
 

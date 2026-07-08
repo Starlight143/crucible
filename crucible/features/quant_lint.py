@@ -40,6 +40,21 @@ Rules
   but the only assignment to ``slippage`` is a constant — the dynamic path
   was advertised but never implemented.
 
+- ``Q005-lookahead-shift`` (MEDIUM) — a *negative* ``.shift(...)`` result is
+  assigned into a trading-*signal* column (``signal``, ``position``, …). A
+  negative shift pulls a future bar's value into the current row, so a column
+  that drives entries/exits sees data it could not have observed. Supervised-
+  learning *labels* (``y`` / ``label`` / ``target``) are intentionally NOT
+  flagged — shifting a label backwards is legitimate.
+
+- ``Q006-stub-implementation`` (MEDIUM) — a function whose entire body (after
+  any docstring) is a single ``raise NotImplementedError`` or ``...``
+  (Ellipsis), or a comment that admits a shortcut ("in a real implementation",
+  "placeholder implementation", "for now, return", …). Catches the "AI wrote a
+  hollow stub instead of the real strategy" failure that an LLM reviewer flags
+  in prose but the fix-loop never fixes.  ``@abstractmethod`` / ``@overload``
+  stubs and the common ``pass`` / ``return None`` bodies are NOT flagged.
+
 Each rule emits one issue per offending site, never per file. The check is
 purely AST-based — no imports, no exec, safe on any compileable bundle.
 
@@ -754,6 +769,278 @@ class _TradeSpreadVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
+# ─── Q005 — look-ahead via negative .shift() into a signal column ────────────
+
+
+_TRADING_SIGNAL_NAMES: Set[str] = {
+    "signal",
+    "signals",
+    "entry_signal",
+    "trade_signal",
+    "long_signal",
+    "short_signal",
+    "position",
+    "positions",
+    "trade_action",
+    "action",
+}
+
+
+def _is_negative_shift_call(node: ast.AST) -> bool:
+    """True iff *node* is ``X.shift(k)`` with ``k`` a negative int constant
+    (positional or ``periods=`` keyword).
+
+    ``df['x'].shift(-1)`` is the canonical future-function: it pulls the *next*
+    row's value into the current row.  A non-negative shift (past data) is fine.
+    """
+    if not isinstance(node, ast.Call):
+        return False
+    func = node.func
+    if not (isinstance(func, ast.Attribute) and func.attr == "shift"):
+        return False
+    arg: Optional[ast.AST] = None
+    if node.args:
+        arg = node.args[0]
+    else:
+        for kw in node.keywords:
+            if kw.arg == "periods":
+                arg = kw.value
+                break
+    if arg is None:
+        return False
+    # ``-1`` parses as ``UnaryOp(USub, Constant(1))``; a literal ``Constant(-1)``
+    # only arises from hand-built ASTs but is handled for completeness.
+    if isinstance(arg, ast.UnaryOp) and isinstance(arg.op, ast.USub):
+        inner = arg.operand
+        return isinstance(inner, ast.Constant) and isinstance(inner.value, int) and inner.value > 0
+    if isinstance(arg, ast.Constant) and isinstance(arg.value, int) and not isinstance(arg.value, bool):
+        return arg.value < 0
+    return False
+
+
+def _assign_target_names(node: ast.Assign) -> List[str]:
+    """Lower-cased names for ``Name`` / ``df['name']`` / ``obj.name`` targets."""
+    names: List[str] = []
+    for target in node.targets:
+        if isinstance(target, ast.Name):
+            names.append(target.id.lower())
+        elif isinstance(target, ast.Attribute):
+            names.append(target.attr.lower())
+        elif isinstance(target, ast.Subscript):
+            s = target.slice
+            if isinstance(s, ast.Index):  # py < 3.9 fallback
+                s = s.value  # type: ignore[attr-defined]
+            if isinstance(s, ast.Constant) and isinstance(s.value, str):
+                names.append(s.value.lower())
+    return names
+
+
+class _LookaheadShiftVisitor(ast.NodeVisitor):
+    """Q005 — a negative ``.shift()`` assigned into a trading-signal column."""
+
+    def __init__(self, file: str, noqa_lines: Set[int]) -> None:
+        self.file = file
+        self.noqa_lines = noqa_lines
+        self.issues: List[QuantLintIssue] = []
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        if node.lineno in self.noqa_lines:
+            self.generic_visit(node)
+            return
+        if _is_negative_shift_call(node.value):
+            for name in _assign_target_names(node):
+                if name in _TRADING_SIGNAL_NAMES:
+                    self.issues.append(
+                        QuantLintIssue(
+                            severity="medium",
+                            category="bug",
+                            description=(
+                                f"Look-ahead bias: '{name}' is assigned a *negative* "
+                                "`.shift(...)`, which pulls a future bar's value into "
+                                "the current row. A column that drives entries/exits "
+                                "must never see the future."
+                            ),
+                            file=os.path.basename(self.file),
+                            line=node.lineno,
+                            suggestion=(
+                                "Use a non-negative shift (past data only), e.g. "
+                                "`.shift(1)`. If this is a supervised-learning *label* "
+                                "rather than a trading signal, name it `label`/`target`/"
+                                "`y`, or add `# noqa: Q005`."
+                            ),
+                            rule="Q005-lookahead-shift",
+                        )
+                    )
+                    break
+        self.generic_visit(node)
+
+
+# ─── Q006 — stub / shortcut-admission detection ──────────────────────────────
+
+
+_STUB_ADMISSION_PHRASES: Tuple[str, ...] = (
+    "in a real implementation",
+    "in a real system",
+    "in production, you would",
+    "in production you would",
+    "for now, return",
+    "for now, just return",
+    "for now, we return",
+    "placeholder implementation",
+    "this is a stub",
+    "stub implementation",
+    "dummy implementation",
+    "simplified implementation",
+    "replace this with a real",
+    "replace with actual",
+    "you would implement",
+    "left as an exercise",
+    "mock implementation",
+    "not implemented yet",
+    "todo: implement",
+    "fixme: implement",
+)
+
+
+def _is_abstract_or_overload(node: Any) -> bool:
+    """True if the function is decorated ``@abstractmethod`` / ``@overload`` and
+    is therefore *legitimately* empty."""
+    for dec in getattr(node, "decorator_list", []):
+        name: Optional[str] = None
+        if isinstance(dec, ast.Name):
+            name = dec.id
+        elif isinstance(dec, ast.Attribute):
+            name = dec.attr
+        elif isinstance(dec, ast.Call):
+            f = dec.func
+            name = f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute) else None)
+        if name in {"abstractmethod", "abstractproperty", "overload"}:
+            return True
+    return False
+
+
+def _function_body_without_docstring(node: Any) -> List[ast.stmt]:
+    body = list(node.body)
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        body = body[1:]
+    return body
+
+
+class _StubImplementationVisitor(ast.NodeVisitor):
+    """Q006 — a function whose whole body is ``raise NotImplementedError`` or
+    ``...``.  ``pass`` / ``return None`` are deliberately NOT flagged (too
+    common in legitimate code); abstract/overload stubs are excluded."""
+
+    def __init__(self, file: str, noqa_lines: Set[int]) -> None:
+        self.file = file
+        self.noqa_lines = noqa_lines
+        self.issues: List[QuantLintIssue] = []
+
+    def _check(self, node: Any) -> None:
+        if _is_abstract_or_overload(node):
+            return
+        body = _function_body_without_docstring(node)
+        if len(body) != 1:
+            return
+        stmt = body[0]
+        # Honour ``# noqa: Q006`` on either the ``def`` line or the stub line
+        # (the offending ``raise`` / ``...`` is where an operator will put it).
+        if node.lineno in self.noqa_lines or getattr(stmt, "lineno", node.lineno) in self.noqa_lines:
+            return
+        is_stub = False
+        if isinstance(stmt, ast.Raise):
+            exc = stmt.exc
+            exc_name: Optional[str] = None
+            if isinstance(exc, ast.Name):
+                exc_name = exc.id
+            elif isinstance(exc, ast.Call):
+                f = exc.func
+                exc_name = f.id if isinstance(f, ast.Name) else (f.attr if isinstance(f, ast.Attribute) else None)
+            elif isinstance(exc, ast.Attribute):
+                exc_name = exc.attr
+            if exc_name == "NotImplementedError":
+                is_stub = True
+        elif (
+            isinstance(stmt, ast.Expr)
+            and isinstance(stmt.value, ast.Constant)
+            and stmt.value.value is Ellipsis
+        ):
+            is_stub = True
+        if not is_stub:
+            return
+        self.issues.append(
+            QuantLintIssue(
+                severity="medium",
+                category="bug",
+                description=(
+                    f"Stub implementation: function '{node.name}' has no body beyond "
+                    "`raise NotImplementedError` / `...`. Generated strategy code must "
+                    "be fully implemented — a hollow signal/backtest function silently "
+                    "produces no edge while looking complete."
+                ),
+                file=os.path.basename(self.file),
+                line=node.lineno,
+                suggestion=(
+                    f"Implement '{node.name}' with real logic. If it is a genuine "
+                    "abstract method, decorate it `@abstractmethod`; otherwise add "
+                    "`# noqa: Q006` only if the stub is truly intentional."
+                ),
+                rule="Q006-stub-implementation",
+            )
+        )
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        self._check(node)
+        self.generic_visit(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        self._check(node)
+        self.generic_visit(node)
+
+
+def _scan_stub_admission_phrases(
+    path: str, source: str, noqa_lines: Set[int]
+) -> List[QuantLintIssue]:
+    """Flag comments that admit a shortcut ("in a real implementation", …).
+
+    Only the ``#``-comment portion of each line is scanned, so legitimate
+    string literals without a ``#`` never match.  Phrases are multi-word to
+    keep precision high; ``# noqa: Q006`` suppresses.
+    """
+    issues: List[QuantLintIssue] = []
+    for lineno, line in enumerate(source.splitlines(), start=1):
+        if lineno in noqa_lines or "#" not in line:
+            continue
+        comment = line.split("#", 1)[1].lower()
+        for phrase in _STUB_ADMISSION_PHRASES:
+            if phrase in comment:
+                issues.append(
+                    QuantLintIssue(
+                        severity="medium",
+                        category="bug",
+                        description=(
+                            f'Shortcut admission: a comment says "{phrase}", indicating '
+                            "the code was deliberately left incomplete / stubbed rather "
+                            "than fully implemented."
+                        ),
+                        file=os.path.basename(path),
+                        line=lineno,
+                        suggestion=(
+                            "Replace the placeholder with a complete implementation. "
+                            "If this is a false positive, add `# noqa: Q006`."
+                        ),
+                        rule="Q006-stub-implementation",
+                    )
+                )
+                break
+    return issues
+
+
 # ─── Module-level entry points ───────────────────────────────────────────────
 
 
@@ -798,6 +1085,8 @@ def _analyse_one_file(path: str, source: str) -> List[QuantLintIssue]:
     noqa_q002 = _collect_noqa_lines(source, rule_id="Q002-range-off-by-one")
     noqa_q003 = _collect_noqa_lines(source, rule_id="Q003-trade-spread-zero")
     noqa_q004 = _collect_noqa_lines(source, rule_id="Q004-fixed-slippage")
+    noqa_q005 = _collect_noqa_lines(source, rule_id="Q005-lookahead-shift")
+    noqa_q006 = _collect_noqa_lines(source, rule_id="Q006-stub-implementation")
 
     # Q001 / Q002 — round 3 (final): scan once for module-level functions that
     # return an open-shaped read of one of their parameters; the LookaheadVisitor
@@ -862,6 +1151,17 @@ def _analyse_one_file(path: str, source: str) -> List[QuantLintIssue]:
                     rule="Q004-fixed-slippage",
                 )
             )
+
+    # Q005 — negative .shift() into a trading-signal column (look-ahead bias).
+    shift = _LookaheadShiftVisitor(path, noqa_lines=noqa_q005)
+    shift.visit(tree)
+    issues.extend(shift.issues)
+
+    # Q006 — stub bodies + shortcut-admission comments.
+    stub = _StubImplementationVisitor(path, noqa_lines=noqa_q006)
+    stub.visit(tree)
+    issues.extend(stub.issues)
+    issues.extend(_scan_stub_admission_phrases(path, source, noqa_q006))
 
     return issues
 

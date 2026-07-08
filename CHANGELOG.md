@@ -5,6 +5,35 @@ Versioning follows [Semantic Versioning](https://semver.org/). The first public 
 
 ---
 
+## [v1.2.9] — 2026-07-08
+
+Two deterministic Quant-lint rules plus a prompt-cache regression alarm,
+distilled from the research notes (AI-laziness / look-ahead pitfalls,
+prompt-cache observability). Additive, no env/schema/API change.
+
+### Added
+- **`Q005-lookahead-shift` (Quant lint).** Flags a negative `.shift(...)`
+  assigned into a trading-*signal* column (`signal`, `position`, …) — a future
+  bar leaking into a column that drives entries/exits. Supervised-learning
+  labels (`y`/`label`/`target`) are intentionally NOT flagged; `# noqa: Q005`
+  suppresses.
+- **`Q006-stub-implementation` (Quant lint).** Flags hollow function bodies
+  (sole `raise NotImplementedError` / `...`) and shortcut-admission comments
+  ("in a real implementation", "placeholder implementation", …) — the "LLM
+  wrote a stub instead of the strategy" failure an LLM reviewer flags in prose
+  but the fix-loop never fixes. `@abstractmethod`/`@overload` stubs and the
+  common `pass`/`return None` bodies are NOT flagged (precision-first, since any
+  lint issue gates the quality loop); `# noqa: Q006` suppresses.
+- **Prompt-cache regression alarm.** When the prompt-cache hit rate is 0% across
+  more than one LLM call, a `WARNING` is logged (not just printed to stdout) so
+  a silent caching regression is visible in headless/batch runs.
+
+### Validation
+- pytest: 3497 passed, 2 skipped (`-p no:cacheprovider`).
+- `crucible/smoke_test.py`: 5/5 OK. `run_crucible.py --self-check`: OK.
+
+---
+
 ## [v1.2.8] — 2026-07-08
 
 Added a WebUI liveness probe so a deployed instance can be monitored.
