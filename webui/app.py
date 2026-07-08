@@ -1783,6 +1783,17 @@ def index() -> str:
     )
 
 
+@app.route("/health")
+def health() -> Any:
+    # Liveness probe: 200 as long as the Flask process can serve a request.
+    # Deliberately unauthenticated and dependency-free — no .env read, no
+    # pipeline import, no DB touch — so uptime monitors / k8s / load
+    # balancers can check the process is alive without exercising anything
+    # that could fail independently of the web server.  GET on a non-/api/
+    # path, so the CSRF gate (and any future WebUI auth) pass it through.
+    return jsonify({"status": "ok"}), 200
+
+
 # ── Env ───────────────────────────────────────────────────────────────────────
 
 @app.route("/api/env", methods=["GET"])

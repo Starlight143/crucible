@@ -5,6 +5,26 @@ Versioning follows [Semantic Versioning](https://semver.org/). The first public 
 
 ---
 
+## [v1.2.8] — 2026-07-08
+
+Added a WebUI liveness probe so a deployed instance can be monitored.
+Additive, no env/schema/API change.
+
+### Added
+- **`GET /health` liveness endpoint.** The WebUI now answers `GET /health`
+  with `200 {"status": "ok"}` (JSON) so uptime monitors, container
+  orchestrators, and load balancers can confirm the Flask process is alive.
+  Deliberately unauthenticated and dependency-free — no `.env` read, no
+  pipeline import, no DB touch — and exempt from the CSRF state-change gate,
+  so it stays reachable independently of pipeline health and of any future
+  WebUI auth layer.
+
+### Validation
+- pytest: 3475 passed, 2 skipped (`-p no:cacheprovider`).
+- `crucible/smoke_test.py`: 5/5 OK. `run_crucible.py --self-check`: OK.
+
+---
+
 ## [v1.2.7] — 2026-07-03
 
 Generated-bundle correctness follow-up to v1.2.6, hardened across four
